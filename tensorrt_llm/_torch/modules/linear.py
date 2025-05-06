@@ -353,7 +353,7 @@ class Linear(nn.Module):
                         input, self.input_scale)
                 else:
                     qinput = input
-                if self.use_llama4_qkv and (qinput.shape[0] <= 4):
+                if self.use_llama4_qkv and (qinput.shape[0] < 4):
                     # Kernel is only supported when M <= 8
                     output = torch.ops.trtllm.llama4_qkv_gemm(
                         qinput,
@@ -361,7 +361,7 @@ class Linear(nn.Module):
                         self.combined_scale,
                         position_ids,
                     )
-                elif self.use_llama4_qkv and (4 < qinput.shape[0] <= 8):
+                elif self.use_llama4_qkv and (4 <= qinput.shape[0] <= 8):
                     if position_ids is not None:
                         # Kernel is only supported when M <= 8
                         output = torch.ops.trtllm.llama4_qkv_gemm(
@@ -511,7 +511,7 @@ class Linear(nn.Module):
                                                self.weight,
                                                self.bias,
                                                position_ids=position_ids)
-                elif 4 < input.shape[0] <= 8 and position_ids is None:
+                elif 4 <= input.shape[0] <= 8 and position_ids is None:
                     output = self.apply_linear(input,
                                                self.trtllm_gen_weight,
                                                self.bias)

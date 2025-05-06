@@ -353,16 +353,17 @@ class Linear(nn.Module):
                         input, self.input_scale)
                 else:
                     qinput = input
-                if self.use_llama4_qkv and (qinput.shape[0] <= 4):
-                    # Kernel is only supported when M <= 8
-                    output = torch.ops.trtllm.llama4_qkv_gemm(
-                        qinput,
-                        weight.t(),
-                        self.combined_scale,
-                        position_ids,
-                    )
-                elif self.use_llama4_qkv and (4 < qinput.shape[0] <= 8):
-                    if position_ids is not None:
+                if self.use_llama4_qkv:
+                    # Llama4 QKV gemm kernel is used when token_length <= 8
+                    if qinput.shape[0] <= 8 and position_ids is None:
+                        output = torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
+                            qinput,
+                            weight,
+                            global_scale=self.combined_scale,
+                            out_dtype=torch.bfloat16,
+                            low_latency_kernel=True,
+                        )
+                    elif qinput.shape[0] <= 8 and position_ids is not None:
                         # Kernel is only supported when M <= 8
                         output = torch.ops.trtllm.llama4_qkv_gemm(
                             qinput,
@@ -371,13 +372,14 @@ class Linear(nn.Module):
                             position_ids,
                         )
                     else:
-                        output = torch.ops.trtllm.fp8_per_tensor_scaling_tllmg_gemm(
+                        # This op does not support bias now.
+                        output = torch.ops.trtllm.cublas_scaled_mm(
                             qinput,
-                            weight,
-                            global_scale=self.combined_scale,
-                            out_dtype=torch.bfloat16,
-                            low_latency_kernel=True,
-                            gated_silu=False,
+                            weight.t(),
+                            scale_a=self.input_scale,
+                            scale_b=self.weight_scale,
+                            bias=None,
+                            out_dtype=self.dtype or input.dtype,
                         )
                 elif self.use_llama4_fc_swiglu_kernel and qinput.shape[0] <= 4:
                     # Outputing fp8 even though self.dtype is bfloat16
@@ -506,12 +508,13 @@ class Linear(nn.Module):
                 output = self.apply_linear(input, self.weight, bias)
         elif self.tp_mode == TensorParallelMode.COLUMN:
             if self.use_llama4_qkv:
+                # Llama4 QKV gemm kernel is used when token_length <= 8
                 if input.shape[0] <= 8 and position_ids is not None:
                     output = self.apply_linear(input,
                                                self.weight,
                                                self.bias,
                                                position_ids=position_ids)
-                elif 4 < input.shape[0] <= 8 and position_ids is None:
+                elif input.shape[0] <= 8 and position_ids is None:
                     output = self.apply_linear(input,
                                                self.trtllm_gen_weight,
                                                self.bias)

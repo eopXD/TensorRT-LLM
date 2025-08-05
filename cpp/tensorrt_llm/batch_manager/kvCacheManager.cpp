@@ -1382,57 +1382,6 @@ void WindowBlockManager::storeBlocks(
     }
 }
 
-void BlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
-{
-    mWindowBlockManagers.at(windowSize).replaceSharedBlock(sequence, blockIdx);
-}
-
-void WindowBlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx)
-{
-    auto const requestId = sequence.getRequestId();
-    auto const beamWidth = sequence.getBeamWidth();
-    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
-
-    if (!allocatedBlocks.at((blockIdx + 1) * beamWidth - 1)->isShared())
-    {
-        return;
-    }
-    BlockKey blockKey = allocatedBlocks.at(blockIdx * beamWidth)->getBlockKey();
-    bool isFull = allocatedBlocks.at(blockIdx * beamWidth)->isFull();
-
-    // Free shared block
-    for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto block = allocatedBlocks.at(blockIdx * beamWidth + beamIdx);
-        block->decRefCount();
-        if (!block->hasRefs())
-        {
-            mEvictionPolicy->releaseBlock(block);
-            removeBlockFromHashMap(block);
-        }
-    }
-
-    // Allocate new blocks
-    TLLM_CHECK_WITH_INFO(hasFreeBlocks(beamWidth), "Can't allocate new blocks. No free blocks left.");
-    for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto block = getFreeBlock();
-        block->incRefCount();
-        if (sequence.getCacheBlockIds(mWindowSize).at(beamIdx).size() == 0)
-        {
-            block->setPrevBlockInSeq(nullptr);
-        }
-        else
-        {
-            block->setPrevBlockInSeq(mAllBlocksById.at(sequence.getCacheBlockIds(mWindowSize)[beamIdx].back()));
-        }
-        block->setBlockKey(blockKey, isFull);
-        block->setHash();
-        sequence.changeCacheBlock(mWindowSize, beamIdx, blockIdx, block->getBlockId());
-        allocatedBlocks.at(blockIdx * beamWidth + beamIdx) = block;
-    }
-}
-
 std::vector<KVCacheBlock::IdType> BlockManager::getNewlyAllocatedBlockIds(
     GenerationRequest const& sequence, SizeType32 windowSize) const
 {
@@ -1949,70 +1898,26 @@ void KVCacheManager::updateNewBlockPointer(GenerationRequest& sequence, SizeType
     }
 }
 
-void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
-{
-    auto currNumTokens = sequence.getNumTokens();
-
-    if (addToken)
-    {
-        sequence.addNewTokens(1);
-    }
-    else
-    {
-        sequence.removeTokens(1);
-    }
-
-    auto newNumTokens = sequence.getNumTokens();
-
-    if (!addToken)
-    {
-        std::swap(currNumTokens, newNumTokens);
-    }
-
-    for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
-    {
-        auto const maxTokenNum = metadata.maxTokenNum;
-        SizeType32 const cyclicTokenNum = maxTokenNum - mSinkBlockTokenLength;
-        SizeType32 const nextTokenIdxInCycle = (currNumTokens - mSinkBlockTokenLength) % cyclicTokenNum;
-        SizeType32 const nextTokenIdxInCache = mSinkBlockTokenLength + nextTokenIdxInCycle;
-
-        // (nextTokenIdxInCache - mSinkBlockTokenLength) % cyclicTokenNum == 0)
-        // <=> nextTokenIdxInCycle == 0
-        // <=> nextTokenIdxInCache == mSinkBlockTokenLength
-        // => nextTokenIdxInCache % getTokensPerBlock() == 0
-
-        // Check if require a new block
-        if (nextTokenIdxInCache % getTokensPerBlock() == 0)
-        {
-            if (newNumTokens <= maxTokenNum)
-            {
-                if (addToken)
-                {
-                    mBlockManager.allocateBlock(sequence, windowSize);
-                    cacheNewBlockOffsets(sequence, windowSize);
-                }
-                else
-                {
-                    mBlockManager.releaseLastBlock(sequence, windowSize);
-                }
-            }
-            else if (sequence.getBeamWidth() > 1)
-            {
-                TLLM_CHECK_WITH_INFO(addToken, "Remove token is not supported with beam search");
-                // Get next block index
-                SizeType32 nextBlockIdx = nextTokenIdxInCache / getTokensPerBlock();
-                // Replace the shared block with the unshared ones
-                mBlockManager.replaceSharedBlock(sequence, windowSize, nextBlockIdx);
-                updateNewBlockPointer(sequence, windowSize, nextBlockIdx);
-            }
-        }
-    }
-}
-
 void KVCacheManager::addToken(RequestIdType requestId)
 {
+    TLLM_CHECK_WITH_INFO(
+        mSinkBlockTokenLength == 0 && mSinkBubbleLength == 0, "streamLLM is not supported at the moment");
     auto& sequence = getSequence(requestId);
-    updateToken(sequence, true);
+    TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() == 1, "Beam search is not supported at the moment");
+    sequence.addNewTokens(1);
+    for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        SizeType32 const maxTokensInWindow = metadata.maxTokenNum;
+        SizeType32 const tokensInWindow = sequence.getNumTokens() % maxTokensInWindow;
+        // NOTE: If beam search is involved, added blocks should be shared.
+        // Please check out TODO(file MR number here) for utility function pruned.
+        if (tokensInWindow % getTokensPerBlock() == 0 && tokensInWindow <= maxTokensInWindow)
+        {
+            // Allocate a new block until the window is filled (plus one more extra block)
+            mBlockManager.allocateBlock(sequence, windowSize);
+            cacheNewBlockOffsets(sequence, windowSize);
+        }
+    }
 }
 
 std::optional<BlockKey> KVCacheManager::findNewContextBlock(
@@ -2434,15 +2339,24 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
 
 void KVCacheManager::removeToken(RequestIdType requestId)
 {
+    TLLM_CHECK_WITH_INFO(
+        mSinkBlockTokenLength == 0 && mSinkBubbleLength == 0, "streamLLM is not supported at the moment");
     auto& sequence = getSequence(requestId);
-    auto const beamWidth = sequence.getBeamWidth();
-
-    TLLM_CHECK_WITH_INFO(beamWidth == 1, "removeToken does not support beamWidth > 1");
+    TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() == 1, "removeToken does not support beamWidth > 1");
     if (sequence.getNumTokens() == 0)
     {
         return;
     }
-    updateToken(sequence, false);
+    sequence.removeTokens(1);
+    for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        SizeType32 const maxTokensInWindow = metadata.maxTokenNum;
+        SizeType32 const tokensInWindow = sequence.getNumTokens() % maxTokensInWindow;
+        if (tokensInWindow % getTokensPerBlock() == 0 && tokensInWindow <= maxTokensInWindow)
+        {
+            mBlockManager.releaseLastBlock(sequence, windowSize);
+        }
+    }
 }
 
 void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLengths)

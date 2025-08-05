@@ -914,12 +914,6 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
     }
 }
 
-void BlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
-    SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const
-{
-    mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
-}
-
 void WindowBlockManager::addBlockToHashMap(BlockPtr const& block)
 {
     if (!mEnableHashKey)
@@ -1843,7 +1837,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     return (numTotalBlocksPerBeam - numAllocBlocksPerBeam) * req.mSamplingConfig.beamWidth;
 }
 
-void KVCacheManager::cacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
+void BlockManager::cacheSequenceBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
 {
     auto const& cacheBlocks = sequence.getCacheBlockIds(windowSize);
     auto& cacheBlocksTensor = sequence.getCacheBlockIndices(windowSize);
@@ -1858,12 +1852,12 @@ void KVCacheManager::cacheBlockOffsets(GenerationRequest& sequence, SizeType32 w
         for (SizeType32 blockIdx = 0; blockIdx < static_cast<SizeType32>(beamCacheBlock.size()); ++blockIdx)
         {
             auto const blockId = beamCacheBlock.at(blockIdx);
-            mBlockManager.setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId, windowSize);
+            mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
         }
     }
 }
 
-void KVCacheManager::cacheNewBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
+void BlockManager::cacheNewBlockOffset(GenerationRequest& sequence, SizeType32 windowSize)
 {
     auto const& cacheBlocks = sequence.getCacheBlockIds(windowSize);
     auto& cacheBlocksTensor = sequence.getCacheBlockIndices(windowSize);
@@ -1877,15 +1871,15 @@ void KVCacheManager::cacheNewBlockOffsets(GenerationRequest& sequence, SizeType3
         auto const& beamCacheBlock = cacheBlocks[beamIdx];
         auto const blockId = beamCacheBlock.back();
         auto const blockIdx = static_cast<SizeType32>(beamCacheBlock.size() - 1);
-        mBlockManager.setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId, windowSize);
+        mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
     }
 }
 
 void KVCacheManager::addToken(RequestIdType requestId)
 {
+    auto& sequence = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(
         mSinkBlockTokenLength == 0 && mSinkBubbleLength == 0, "streamLLM is not supported at the moment");
-    auto& sequence = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() == 1, "Beam search is not supported at the moment");
     sequence.addNewTokens(1);
     for (auto const [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
@@ -1898,7 +1892,7 @@ void KVCacheManager::addToken(RequestIdType requestId)
         {
             // Allocate a new block until the window is filled (plus one more extra block)
             mBlockManager.allocateBlock(sequence, windowSize);
-            cacheNewBlockOffsets(sequence, windowSize);
+            mBlockManager.cacheNewBlockOffset(sequence, windowSize);
         }
     }
 }
@@ -1998,7 +1992,7 @@ void KVCacheManager::addSequence(
                 }
             }
         }
-        cacheBlockOffsets(sequence, windowSize);
+        mBlockManager.cacheSequenceBlockOffsets(sequence, windowSize);
     }
 
     if (llmRequest)
@@ -2322,9 +2316,9 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
 
 void KVCacheManager::removeToken(RequestIdType requestId)
 {
+    auto& sequence = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(
         mSinkBlockTokenLength == 0 && mSinkBubbleLength == 0, "streamLLM is not supported at the moment");
-    auto& sequence = getSequence(requestId);
     TLLM_CHECK_WITH_INFO(sequence.getBeamWidth() == 1, "removeToken does not support beamWidth > 1");
     if (sequence.getNumTokens() == 0)
     {

@@ -574,6 +574,12 @@ public:
     //! \brief Release last block in the sequence
     void releaseLastBlock(GenerationRequest& sequence);
 
+    //! \brief Cache offsets for blocks initiated from sequence
+    void cacheSequenceBlockOffsets(GenerationRequest& sequence);
+
+    //! \brief Cache offsets for new block
+    void cacheNewBlockOffset(GenerationRequest& sequence);
+
     [[nodiscard]] SizeType32 getWindowSize() const noexcept
     {
         return mWindowSize;
@@ -1661,10 +1667,6 @@ public:
     /// @return SizeType32 A maximum attention window in number of tokens.
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
-
-private:
-    void cacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-    void cacheNewBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
 
 private:
     // Maximum number of sequences

@@ -1843,10 +1843,10 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     return (numTotalBlocksPerBeam - numAllocBlocksPerBeam) * req.mSamplingConfig.beamWidth;
 }
 
-void KVCacheManager::cacheBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
+void WindowBlockManager::cacheBlockOffsets(GenerationRequest& sequence)
 {
-    auto const& cacheBlocks = sequence.getCacheBlockIds(windowSize);
-    auto& cacheBlocksTensor = sequence.getCacheBlockIndices(windowSize);
+    auto const& cacheBlocks = sequence.getCacheBlockIds(mWindowSize);
+    auto& cacheBlocksTensor = sequence.getCacheBlockIndices(mWindowSize);
     auto const beamWidth = sequence.getBeamWidth();
 
     auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
@@ -1858,15 +1858,15 @@ void KVCacheManager::cacheBlockOffsets(GenerationRequest& sequence, SizeType32 w
         for (SizeType32 blockIdx = 0; blockIdx < static_cast<SizeType32>(beamCacheBlock.size()); ++blockIdx)
         {
             auto const blockId = beamCacheBlock.at(blockIdx);
-            mBlockManager.setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId, windowSize);
+            setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
         }
     }
 }
 
-void KVCacheManager::cacheNewBlockOffsets(GenerationRequest& sequence, SizeType32 windowSize)
+void WindowBlockManager::cacheNewBlockOffsets(GenerationRequest& sequence)
 {
-    auto const& cacheBlocks = sequence.getCacheBlockIds(windowSize);
-    auto& cacheBlocksTensor = sequence.getCacheBlockIndices(windowSize);
+    auto const& cacheBlocks = sequence.getCacheBlockIds(mWindowSize);
+    auto& cacheBlocksTensor = sequence.getCacheBlockIndices(mWindowSize);
     auto const beamWidth = sequence.getBeamWidth();
 
     auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
@@ -1877,7 +1877,7 @@ void KVCacheManager::cacheNewBlockOffsets(GenerationRequest& sequence, SizeType3
         auto const& beamCacheBlock = cacheBlocks[beamIdx];
         auto const blockId = beamCacheBlock.back();
         auto const blockIdx = static_cast<SizeType32>(beamCacheBlock.size() - 1);
-        mBlockManager.setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId, windowSize);
+        setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
     }
 }
 
@@ -1899,7 +1899,7 @@ void KVCacheManager::addToken(RequestIdType requestId)
         {
             // Allocate a new block until the window is filled (plus one more extra block)
             mBlockManager.allocateBlock(sequence, windowSize);
-            cacheNewBlockOffsets(sequence, windowSize);
+            mBlockManager.mWindowBlockManager.at(windowSize).cacheNewBlockOffsets(sequence);
         }
     }
 }
@@ -1999,7 +1999,7 @@ void KVCacheManager::addSequence(
                 }
             }
         }
-        cacheBlockOffsets(sequence, windowSize);
+        mBlockManager.mWindowBlockManager.at(windowSize).cacheBlockOffsets(sequence);
     }
 
     if (llmRequest)

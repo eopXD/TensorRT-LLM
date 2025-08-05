@@ -558,8 +558,6 @@ public:
     //! \details Might free cached blocks if no free blocks are available.
     void allocateBlock(GenerationRequest& sequence, bool shareAmongBeams);
 
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx);
-
     //! \brief Get the ids of all newly allocated (not reused) blocks for the sequence.
     std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(GenerationRequest const& sequence) const;
 
@@ -887,8 +885,6 @@ public:
         GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize);
 
     void allocateBlock(GenerationRequest& sequence, SizeType32 windowSize);
-
-    void replaceSharedBlock(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx);
 
     std::vector<KVCacheBlock::IdType> getNewlyAllocatedBlockIds(
         GenerationRequest const& sequence, SizeType32 windowSize) const;
@@ -1670,7 +1666,6 @@ private:
     void cacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
     void cacheNewBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
     void updateNewBlockPointer(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
-    void updateToken(GenerationRequest& sequence, bool addToken);
 
 private:
     // Maximum number of sequences

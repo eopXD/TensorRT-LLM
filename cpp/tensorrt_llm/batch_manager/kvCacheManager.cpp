@@ -1191,12 +1191,16 @@ void WindowBlockManager::refreshBlocks()
     mTransferManager->syncTransfers();
 }
 
+// There are two versions of BlockManager::addSequence function.
+// This is called when block reuse is enabled.
 void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
     LlmRequest& llmRequest, SizeType32 windowSize)
 {
     mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest);
 }
 
+// There are two versions of BlockManager::addSequence function.
+// This is called when block reuse is enabled.
 void WindowBlockManager::addSequence(
     GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
 {
@@ -1234,12 +1238,16 @@ void WindowBlockManager::addSequence(
         inputLength, prepopulatedPromptLen);
 }
 
+// There are two versions of BlockManager::addSequence function.
+// This is called when block reuse is disabled.
 void BlockManager::addSequence(
     GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize)
 {
     mWindowBlockManagers.at(windowSize).addSequence(sequence, numBlocks, unsharedBlockIdx);
 }
 
+// There are two versions of BlockManager::addSequence function.
+// This is called when block reuse is disabled.
 void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx)
 {
     auto const requestId = sequence.getRequestId();

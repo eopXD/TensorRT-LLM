@@ -1665,7 +1665,6 @@ public:
 private:
     void cacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
     void cacheNewBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-    void updateNewBlockPointer(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
 
 private:
     // Maximum number of sequences

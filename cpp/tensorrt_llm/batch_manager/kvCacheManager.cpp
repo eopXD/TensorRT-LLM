@@ -1881,23 +1881,6 @@ void KVCacheManager::cacheNewBlockOffsets(GenerationRequest& sequence, SizeType3
     }
 }
 
-void KVCacheManager::updateNewBlockPointer(GenerationRequest& sequence, SizeType32 windowSize, SizeType32 blockIdx)
-{
-    auto const& cacheBlocks = sequence.getCacheBlockIds(windowSize);
-    auto& cacheBlocksTensor = sequence.getCacheBlockIndices(windowSize);
-    auto const beamWidth = sequence.getBeamWidth();
-
-    auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
-    auto const& offsetsShape = cacheBlocksTensor.getShape();
-
-    for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
-    {
-        auto const& beamCacheBlock = cacheBlocks[beamIdx];
-        auto const blockId = beamCacheBlock.at(blockIdx);
-        mBlockManager.setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId, windowSize);
-    }
-}
-
 void KVCacheManager::addToken(RequestIdType requestId)
 {
     TLLM_CHECK_WITH_INFO(

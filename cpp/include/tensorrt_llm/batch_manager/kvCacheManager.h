@@ -410,12 +410,6 @@ public:
         mCacheBlockIds.at(windowSize).at(beamIdx).push_back(blockId);
     }
 
-    void changeCacheBlock(
-        SizeType32 windowSize, SizeType32 beamIdx, SizeType32 pagedBlockIdx, KVCacheBlock::IdType blockId)
-    {
-        mCacheBlockIds.at(windowSize).at(beamIdx).at(pagedBlockIdx) = blockId;
-    }
-
     void clearCacheBlocks(SizeType32 windowSize)
     {
         for (auto& beamBlockIds : mCacheBlockIds.at(windowSize))

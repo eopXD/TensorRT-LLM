@@ -1804,7 +1804,8 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
 
 SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
 {
-
+    TLLM_CHECK_WITH_INFO(
+        mSinkBlockTokenLength == 0 && mSinkBubbleLength == 0, "streamLLM is not supported at the moment");
     if (isCrossKv())
     {
         if (req.isContextInitState() && req.getContextCurrentPosition() == 0)
@@ -1815,14 +1816,9 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         return 0; // cross KV cache doesn't grow after the initial context phase
     }
 
-    auto const temporaryAttentionWindow = mBlockManager.getWindowSizeMetadata(windowSize).temporaryAttentionWindow;
+    SizeType32 const numContextBlocks = req.mPromptLen / getTokensPerBlock();
 
-    SizeType32 const numContextBlocks
-        = (std::min(req.mPromptLen, windowSize + temporaryAttentionWindow) + mSinkBubbleLength) / getTokensPerBlock();
-
-    SizeType32 const numTotalBlocksPerBeam = tc::ceilDiv(
-        std::min(req.mPromptLen + req.mMaxNewTokens, windowSize + temporaryAttentionWindow) + mSinkBubbleLength,
-        getTokensPerBlock());
+    SizeType32 const numTotalBlocksPerBeam = tc::ceilDiv(req.mPromptLen + req.mMaxNewTokens, getTokensPerBlock());
 
     SizeType32 const numGenBlocksPerBeam = numTotalBlocksPerBeam - numContextBlocks;
 
@@ -1944,7 +1940,7 @@ void KVCacheManager::addSequence(
         auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
 
         // Consider the temporaryAttentionWindow when allocating blocks.
-        auto const effectiveInputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
+        auto const effectiveInputLength = inputLength;
         auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
         if (!sequence.isCyclic() && mEnableBlockReuse)
         {

@@ -531,11 +531,37 @@ std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
         0.0, [](auto sum, auto const& windowSize) { return sum + windowSize.second; });
 
     std::map<SizeType32, float> windowSizeToShare;
-    for (auto const& [windowSize, windowSizeSum] : windowSizeToContribution)
+    if (auto envStr = std::getenv("TRTLLM_WINDOW_SIZE_SHARES"))
     {
-        float const fraction = windowSizeSum / windowSizesTotalSum;
-        TLLM_CHECK(0.0f < fraction && fraction <= 1.0f);
-        windowSizeToShare[windowSize] = fraction;
+        std::stringstream ss(envStr);
+        std::vector<float> shares;
+        float share;
+        while (ss >> share)
+        {
+            shares.push_back(share);
+            if (ss.peek() == ',')
+                ss.ignore();
+        }
+
+        TLLM_CHECK_WITH_INFO(shares.size() == windowSizeToLayers.size(),
+            "Number of shares in TRTLLM_WINDOW_SIZE_SHARES (%ld) must match number of window sizes (%ld)",
+            shares.size(), windowSizeToLayers.size());
+
+        size_t i = 0;
+        for (auto const& [windowSize, _] : windowSizeToLayers)
+        {
+            windowSizeToShare[windowSize] = shares[i++];
+        }
+    }
+    else
+    {
+        // NOTE: Righteously, blocks allocated should be proportional with
+        // regard to window size. Currently, we are first allocating identical
+        // number of blocks for all layers to achieve identical performance.
+        for (auto const& [windowSize, _] : windowSizeToLayers)
+        {
+            windowSizeToShare[windowSize] = 1.0f / windowSizeToLayers.size();
+        }
     }
     auto total = std::accumulate(windowSizeToShare.begin(), windowSizeToShare.end(), 0.0f,
         [](auto sum, auto const& windowSize) { return sum + windowSize.second; });

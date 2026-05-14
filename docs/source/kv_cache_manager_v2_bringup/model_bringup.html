@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KV Cache Manager V2 — Model Bring-Up Coverage</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1f2937;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --border-strong: #d1d5db;
+    --code-bg: #f3f4f6;
+    --code-fg: #111827;
+    --accent: #1f4e8c;
+    --accent-bg: #eef4fb;
+    --row-alt: #fafafa;
+    --green: #10b981;
+    --yellow: #f59e0b;
+    --red: #ef4444;
+    --blue: #3b82f6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.55;
+    font-size: 15px;
+  }
+  .layout { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+  nav.toc {
+    position: sticky; top: 0; align-self: start;
+    height: 100vh; overflow-y: auto;
+    border-right: 1px solid var(--border);
+    padding: 20px 18px;
+    background: #fbfbfd;
+    font-size: 13px;
+  }
+  nav.toc h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); margin: 0 0 10px;
+  }
+  nav.toc ol { list-style: none; padding: 0; margin: 0; }
+  nav.toc li { margin: 4px 0; }
+  nav.toc a {
+    color: var(--fg); text-decoration: none;
+    display: block; padding: 3px 6px; border-radius: 4px;
+  }
+  nav.toc a:hover { background: var(--accent-bg); color: var(--accent); }
+  nav.toc ol ol { padding-left: 14px; margin-top: 2px; }
+  nav.toc ol ol a { color: var(--muted); font-size: 12.5px; }
+  main {
+    padding: 36px 48px 80px;
+    max-width: 1100px;
+    width: 100%;
+  }
+  h1 { font-size: 28px; margin: 0 0 6px; }
+  h2 { font-size: 22px; margin: 38px 0 12px; padding-top: 8px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { font-size: 17px; margin: 26px 0 8px; }
+  h4 { font-size: 15px; margin: 20px 0 6px; color: var(--accent); }
+  p { margin: 8px 0 12px; }
+  ul, ol { margin: 8px 0 12px; padding-left: 24px; }
+  li { margin: 3px 0; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg);
+    color: var(--code-fg);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 0.92em;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    padding: 12px 14px;
+    border-radius: 6px;
+    overflow-x: auto;
+    font-size: 13px;
+  }
+  pre code { background: none; padding: 0; }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 12px 0 18px;
+    font-size: 13.5px;
+    display: block;
+    overflow-x: auto;
+  }
+  thead { background: var(--accent-bg); }
+  th, td {
+    border: 1px solid var(--border-strong);
+    padding: 8px 10px;
+    text-align: left;
+    vertical-align: top;
+  }
+  th { font-weight: 600; color: var(--accent); }
+  tbody tr:nth-child(even) { background: var(--row-alt); }
+  .chip {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: #fff;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    line-height: 1.6;
+  }
+  .chip.green  { background: var(--green); }
+  .chip.yellow { background: var(--yellow); }
+  .chip.red    { background: var(--red); }
+  .chip.blue   { background: var(--blue); }
+  .chip.muted  { background: var(--muted); }
+  .legend { margin: 8px 0 20px; font-size: 13px; color: var(--muted); }
+  .legend .chip { margin-right: 6px; }
+  .callout {
+    border-left: 4px solid var(--accent);
+    background: var(--accent-bg);
+    padding: 10px 14px;
+    margin: 12px 0 18px;
+    border-radius: 0 6px 6px 0;
+    font-size: 14px;
+  }
+  .callout.warn { border-left-color: var(--yellow); background: #fff7ed; }
+  .callout.bad  { border-left-color: var(--red);    background: #fef2f2; }
+  .subtle { color: var(--muted); font-size: 13px; }
+  .meta {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 18px;
+  }
+  hr { border: none; border-top: 1px solid var(--border); margin: 30px 0; }
+  a { color: var(--accent); }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    nav.toc { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--border); }
+    main { padding: 24px 18px 60px; }
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol>
+    <li><a href="#intro">Overview</a></li>
+    <li><a href="#sec1-0">1.0 V1 ↔ V2 deltas</a></li>
+    <li><a href="#sec1-5">1.5 V2 surface checklist</a></li>
+    <li><a href="#sec1">1. Feature Interactions</a>
+      <ol>
+        <li><a href="#sec1a">1a. Load-bearing</a></li>
+        <li><a href="#sec1b">1b. Orthogonal</a></li>
+        <li><a href="#sec1c">1c. Mutex / fallback</a></li>
+        <li><a href="#sec1d">1d. Backends</a></li>
+        <li><a href="#sec1e">1e. Coverage colors</a></li>
+      </ol>
+    </li>
+    <li><a href="#sec2">2. Phase 1 — GPT-OSS-120B</a>
+      <ol>
+        <li><a href="#sec2a">2a. Why this model</a></li>
+        <li><a href="#sec2b">2b. Audit — coverage today</a></li>
+        <li><a href="#sec2c">2c. Backend configuration</a></li>
+        <li><a href="#sec2d">2d. Inference configuration</a></li>
+        <li><a href="#sec2e">2e. Deployment configuration (B200)</a></li>
+        <li><a href="#sec2f">2f. Exit criteria</a></li>
+      </ol>
+    </li>
+    <li><a href="#sec3">3. Phase 2 — Multi-Modal</a></li>
+    <li><a href="#sec4">4. Phase 3 — Frontier</a></li>
+    <li><a href="#sec5">5. Known Issues</a></li>
+    <li><a href="#sec6">6. Tracking Table</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<h1 id="intro">KV Cache Manager V2 — Model Bring-Up Coverage</h1>
+<div class="meta">Model-centric coverage plan for <code>KVCacheManagerV2</code>. Complements the gap matrix (<code>kv_cache_v1_v2_gap_20260512.pdf</code>) by organizing work along model archetypes.</div>
+
+<p>This document tracks the model-centric coverage plan for <code>KVCacheManagerV2</code> (the pure-Python, mypyc-compilable replacement for the C++ <code>KVCacheManager</code>). It complements <code>kv_cache_v1_v2_gap_20260512.pdf</code> (the per-feature gap matrix) by organizing work along <strong>model archetypes</strong> rather than features, so we can land bring-up evidence one model at a time and surface integration bugs that the unit-level matrix misses.</p>
+
+<ul>
+  <li><strong>V1</strong>: <code>KVCacheManager</code> in <code>tensorrt_llm/_torch/pyexecutor/resource_manager.py:303</code> — wraps <code>tensorrt_llm.bindings.internal.batch_manager.KVCacheManager</code> (C++).</li>
+  <li><strong>V2</strong>: <code>KVCacheManagerV2</code> in <code>tensorrt_llm/_torch/pyexecutor/resource_manager.py:1807</code> — wraps <code>tensorrt_llm.runtime.kv_cache_manager_v2.KVCacheManager</code> (Python).</li>
+  <li><strong>Toggle</strong>: <code>KvCacheConfig.use_kv_cache_manager_v2</code> (see <code>llmapi/llm_args.py:2626</code>). V2 is auto-selected for Gemma4 hybrid (per-layer <code>head_dim</code>) regardless of the flag (<code>_torch/pyexecutor/_util.py:67</code>).</li>
+</ul>
+
+<hr>
+
+<h2 id="sec1-0">1.0 V1 ↔ V2 architectural deltas (lens for everything below)</h2>
+
+<p>The §1 feature matrix is a <em>what-is-supported</em> view. This subsection is the <em>what-is-architecturally-different</em> view. When a model works on V1 but regresses on V2 — or vice versa — the bug almost always lives on one of these axes, not in the model code itself. Cite this table from PR descriptions and bug reports so the reader can find the implicated subsystem fast.</p>
+
+<table>
+  <thead><tr><th>Surface</th><th>V1</th><th>V2</th><th>Why it matters for bring-up</th></tr></thead>
+  <tbody>
+    <tr><td>Implementation</td><td>C++ binding (<code>bindings.internal.batch_manager.KVCacheManager</code>)</td><td>Pure Python compiled with mypyc</td><td>Release vs <code>TLLM_KV_CACHE_MANAGER_V2_DEBUG=1</code> are <em>different binaries</em> with different assertions; reproduce in both before filing a V2 bug.</td></tr>
+    <tr><td>Sequence state machine</td><td>Implicit (begin/end of request)</td><td>Explicit <code>_KVCache._Status: ACTIVE / SUSPENDED / CLOSED</code> with <code>suspend()</code> / <code>resume()</code></td><td>V2 can fail in states V1 cannot (e.g. resume → no host tier → scheduler deadlock; see <a href="#sec5">§5.4</a>). Wrapper auto-provisions a host tier to mitigate (<code>resource_manager.py:1987-2005</code>).</td></tr>
+    <tr><td>Pool layout</td><td>One pool per cache type</td><td>One <strong>PoolGroup per LayerGroup</strong> (per-layer <code>head_dim</code>, per VSWA window, per attn-vs-SSM)</td><td>The reason Gemma4 hybrid (<code>head_dim</code> heterogeneous) is V2-only. Also why VSWA stresses the manager: more layer groups = more pools to balance.</td></tr>
+    <tr><td>Capacity planning</td><td>Bytes-of-pool oriented</td><td><code>constraints</code> (must-always-fit batches) + <code>typical_step</code> (init partitioning) + <code>clamp_max_seq_len_for_mem()</code></td><td>A V1-perf-comparable workload may be <strong>infeasible</strong> on V2 if <code>constraints</code> is wrong; conversely V2 can refuse a request V1 would silently OOM on.</td></tr>
+    <tr><td>Dynamic balance</td><td>None</td><td><code>KVCacheManager.adjust()</code> / <code>need_adjustment</code> rebalances quotas across pool groups online</td><td>Brand-new failure mode: a model can run a few thousand steps then re-balance and trip a bug. Watch under VSWA.</td></tr>
+    <tr><td>Quota resize at runtime</td><td>Static after construction</td><td><code>KVCacheManager.resize(level, quota, best_efforts=False)</code></td><td>Exposes a path that disagg/orchestrator code might call; V1 has no analogue.</td></tr>
+    <tr><td>Kernel / op contract</td><td>Implicit page-index layout</td><td>Explicit <code>PageIndexMode.SHARED</code> vs <code>PageIndexMode.PER_LAYER</code> + <code>PageIndexConverter</code> (<code>_core/_kv_cache_manager.py:122-178</code>)</td><td>Each attention backend exercises a different mode (TRTLLM-gen has an explicit V2 branch; FlashInfer reads internals directly). Mismatch = silent wrong output, not a crash.</td></tr>
+    <tr><td><code>tokens_per_block</code></td><td>Uniform across the model</td><td>Per-buffer <code>tokens_per_block_override</code> (<code>_config.py:89</code>)</td><td>NVFP4 block-scale buffers can have a <em>different</em> <code>tokens_per_block</code> than KV. Bring-up must confirm this path is exercised, not just configured.</td></tr>
+    <tr><td>Cache tiers</td><td>GPU + Host</td><td>GPU + Host + <strong>Disk</strong> in <em>core</em> (<code>DiskCacheTierConfig</code>) — <strong>but the runtime wrapper exposes only GPU+Host today</strong> (<code>resource_manager.py:1986-2005</code>)</td><td>A V2-core feature that bring-up cannot exercise through the public path; track as a wrapper gap, not a model gap.</td></tr>
+    <tr><td>Scratch / SWA scratch reuse</td><td>Implicit</td><td>Explicit <code>ScratchDesc</code> + opt-in <code>enable_swa_scratch_reuse</code> (<code>_config.py:215</code>)</td><td>A whole V2-only optimization, most relevant for disagg-prefill long-prompt. Unit-tested (<code>TestScratchReuse</code>) but no model-level coverage today.</td></tr>
+    <tr><td>GC / lifetime discipline</td><td>C++ owns the lifetime</td><td>Python <code>__del__</code> + <code>rawref</code> C extension (<code>rawref/</code>)</td><td>The CI-only teardown hang in <a href="#sec5">§5.4</a> lives here. V1 cannot hit it.</td></tr>
+    <tr><td>Multi-modal salting</td><td>n/a (managed in caller)</td><td><code>gen_multi_modal_tokens(vocab_size, digest, length)</code> mixes a Blake3 image/audio digest into the radix key (<code>_block_radix_tree.py:31</code>, used at <code>resource_manager.py:2594</code>)</td><td>Different from per-request "KV cache salting" (which is unsupported on V2 — see §1a). Conflating the two is a recurring doc bug.</td></tr>
+    <tr><td>SSM reuse</td><td>Not supported</td><td><code>ssm_reuse_interval</code> (default 512; must be a multiple of <code>tokens_per_block</code>) + <code>SsmLifeCycle</code> (<code>_config.py:209</code>, <code>_life_cycle_registry.py:51</code>)</td><td>The §1a row "SSM reuse: neither V1 nor V2" <em>used to</em> be true; on V2 it is now wrong. Hybrid-mamba bring-up should assert this works.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">A practical reading order for new readers: §1.0 (this) → <a href="#sec1-5">§1.5</a> (V2 surface checklist) → §1a–d (feature matrix) → §2–4 (model phases).</div>
+
+<hr>
+
+<h2 id="sec1-5">1.5 V2 surfaces — first-principles checklist</h2>
+
+<p>Walking down the model→feature path (the rest of §1 and §2–4) catches <em>which models</em> exercise V2. Walking down the <strong>V2 API surface → is-it-exercised</strong> path catches <em>which V2 abstractions remain unexercised at the model level</em>. Any row whose "Exercised by" column is empty is a coverage hole the model-side plan would not surface on its own.</p>
+
+<table>
+  <thead><tr><th>V2 surface (file:symbol)</th><th>What it controls</th><th>Exercised by (phase/step)</th></tr></thead>
+  <tbody>
+    <tr><td><code>_KVCache._Status</code> + <code>suspend()</code> / <code>resume()</code></td><td>Sequence state machine; resume requires a warm tier</td><td>Phase 1, <strong>new step 11</strong> (explicit suspend/resume cycle); implicit in step 10.</td></tr>
+    <tr><td><code>enable_swa_scratch_reuse</code> (<code>_config.py:215</code>)</td><td>SWA prefill memory reuse</td><td><span class="chip red">Hole</span> — unit-tested only. Add a Phase-2 or Phase-3 disagg-prefill step.</td></tr>
+    <tr><td><code>tokens_per_block_override</code> (<code>_config.py:89</code>)</td><td>Heterogeneous block size per buffer (NVFP4 block-scale)</td><td>Phase 1, <strong>new step 12</strong> (NVFP4 + override assertion).</td></tr>
+    <tr><td><code>DiskCacheTierConfig</code> (<code>_config.py:69</code>)</td><td>Cold tier for KV</td><td><span class="chip red">Hole at wrapper layer</span> — core supports it; wrapper exposes only GPU+Host (<code>resource_manager.py:1986</code>). Track as wrapper gap.</td></tr>
+    <tr><td><code>KVCacheManager.adjust()</code> / <code>need_adjustment</code></td><td>Online rebalance of pool-group quotas</td><td><span class="chip red">Hole</span> — not asserted anywhere. Most relevant under VSWA (Phase 3).</td></tr>
+    <tr><td><code>KVCacheManager.resize(level, quota, …)</code></td><td>Runtime quota change</td><td><span class="chip red">Hole</span> — no model-level path today. Possibly out of scope for bring-up.</td></tr>
+    <tr><td><code>PageIndexMode.{SHARED, PER_LAYER}</code> + <code>PageIndexConverter</code></td><td>Kernel/op contract for page indices</td><td>Implicit per attention backend in Phase 1 §2c cross-product; <strong>add an explicit assertion</strong> on which mode each backend uses.</td></tr>
+    <tr><td><code>KVCacheManagerConfig.constraints</code> / <code>typical_step</code></td><td>Capacity planner inputs</td><td>Phase 1, step 10 (capacity stress) — <strong>add an assertion</strong> that <code>constraints</code> was actually honored, not just configured.</td></tr>
+    <tr><td><code>clamp_max_seq_len_for_mem(batch_size, token_num_upper_bound)</code></td><td>Scheduler's max-seq-len trimmer</td><td>Indirect via step 10; <strong>add a direct unit-vs-model parity check</strong>.</td></tr>
+    <tr><td><code>ssm_reuse_interval</code> + <code>SsmLifeCycle</code></td><td>SSM prefix reuse</td><td>Phase 3 hybrids (Nemotron-H, Granite-Hybrid, Jamba); <strong>add an explicit HY-2 step</strong> asserting reuse-len &gt; 0 on the SSM half.</td></tr>
+    <tr><td><code>gen_multi_modal_tokens</code> (<code>_block_radix_tree.py:31</code>)</td><td>MM digest salt into radix key</td><td>Phase 2, MM-1 step.</td></tr>
+    <tr><td><code>rawref</code> + <code>__del__</code> discipline (<code>rawref/</code>)</td><td>Lifetime / teardown</td><td>Phase 1, step 10 — <strong>add a destructor-leak assertion</strong> (assert no live <code>_KVCache</code> after LLM exit).</td></tr>
+    <tr><td>mypyc release vs <code>TLLM_KV_CACHE_MANAGER_V2_DEBUG=1</code></td><td>Same code, different assertions</td><td><span class="chip red">Hole</span> — bring-up should run at least one full Phase-1 step under each. Cheap insurance against <code>if not NDEBUG</code> regressions.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">If a row stays a "hole" after Phase 1–3, surface it in §5 as a backlog item rather than silently leaving it uncovered.</div>
+
+<hr>
+
+<h2 id="sec1">1. Feature Interactions with the KV Cache Manager</h2>
+
+<p>The KV cache manager owns block allocation, eviction, prefix reuse, multi-tier storage, and per-sequence life-cycle. A feature interacts with the manager when it changes any of: pool layout, block size, life-cycle policy, the radix key, the eviction order, or the scheduler's view of free capacity.</p>
+
+<h3 id="sec1a">1a. Features that go <em>through</em> the KV cache manager (load-bearing)</h3>
+<p>These shape pool layout, lifetimes, or the radix key. Any bring-up must cover the subset that the model exercises.</p>
+
+<table>
+  <thead><tr><th>Category</th><th>Feature</th><th>How it shows up in the manager</th></tr></thead>
+  <tbody>
+    <tr><td>Reuse</td><td>Cross-request reuse (radix tree)</td><td><code>_block_radix_tree.py</code>; toggled by <code>enable_block_reuse</code>.</td></tr>
+    <tr><td>Reuse</td><td>Partial block reuse</td><td>Partial-match commit path inside <code>_block_radix_tree.py</code>.</td></tr>
+    <tr><td>Reuse</td><td>KV cache salting (per-request)</td><td>Caller-supplied per-request prefix tag mixed into the radix key. <strong>V2: not supported.</strong></td></tr>
+    <tr><td>Reuse</td><td>Multi-modal digest salt</td><td><code>gen_multi_modal_tokens(vocab_size, digest, length)</code> mixes a Blake3 hash of the image/audio bytes into the radix key (<code>_block_radix_tree.py:31</code>; used at <code>resource_manager.py:2594</code>). <strong>V2: supported.</strong> Distinct from the per-request salt above — do not conflate.</td></tr>
+    <tr><td>Eviction</td><td>LRU eviction</td><td><code>_eviction_controller/</code>.</td></tr>
+    <tr><td>Eviction</td><td>Priority / retention (<code>KvCacheRetentionConfig</code>)</td><td>Retention biases eviction.</td></tr>
+    <tr><td>Storage</td><td>Host offloading (CPU tier)</td><td><code>_storage_manager.py</code> + <code>_copy_engine.py</code>.</td></tr>
+    <tr><td>Storage</td><td>KV cache dtype (BF16/FP16/FP8/NVFP4)</td><td>Sets bytes/token; influences pool sizing.</td></tr>
+    <tr><td>Storage</td><td>KV cache connector</td><td>External tier (disk/NIXL/etc). <strong>V2: not supported.</strong></td></tr>
+    <tr><td>Life-cycle</td><td>Sliding window attention (uniform)</td><td><code>AttnLifeCycle</code> with window.</td></tr>
+    <tr><td>Life-cycle</td><td>Attention sinks</td><td>Sink-token field on <code>AttnLifeCycle</code>.</td></tr>
+    <tr><td>Life-cycle</td><td>VSWA (variable SWA, per-layer windows)</td><td>Distinct <code>LayerGroupId</code>s per window. <strong>V2: partial — IMA on several cases (owner: Yi Zhang).</strong></td></tr>
+    <tr><td>Layout</td><td>MLA (single latent vector)</td><td>Different bytes/token + custom workspace; known IMA when MLA workspace is sized from ISL only.</td></tr>
+    <tr><td>Layout</td><td>Hybrid attention (Gemma4 per-layer <code>head_dim</code>)</td><td>Separate pool groups; <strong>requires V2</strong> — V1 coerces to <code>max(head_dim)</code> and is wrong.</td></tr>
+    <tr><td>Layout</td><td>Hybrid Mamba/SSM</td><td>Mamba state in a separate cache (<code>mamba_cache_manager.py</code>); attention pool is V1/V2-managed. <strong>V2 also manages SSM-pool reuse</strong> via <code>SsmLifeCycle</code> and <code>ssm_reuse_interval</code> (default 512, must divide <code>tokens_per_block</code>; <code>_config.py:209</code>). <strong>V1</strong>: no SSM-pool reuse.</td></tr>
+    <tr><td>Layout</td><td>Sparse attention (Rocket, DSA)</td><td>Specialized subclasses (<code>RocketKVCacheManager</code>, <code>DSACacheManager</code>) extend V1 today.</td></tr>
+    <tr><td>Tokens</td><td>Multi-modal tokens</td><td><code>gen_multi_modal_tokens</code> in the radix path: image/audio token IDs must be salted into the key so prefix reuse stays correct.</td></tr>
+    <tr><td>Tokens</td><td>Chunked prefill</td><td>Uncommitted-page flow; commit on chunk boundary.</td></tr>
+    <tr><td>Spec dec</td><td>MTP / Eagle3 (one-model)</td><td>Draft tokens roll through same KV pool; draft-mask layer hooks.</td></tr>
+    <tr><td>Spec dec</td><td>Two-model speculative decoding</td><td>Separate draft manager. <strong>V2: won't do.</strong></td></tr>
+    <tr><td>Capacity</td><td>Capacity estimation + scheduler</td><td><code>max_util_for_resume</code> (V2 only); V2 currently uses <code>max_gpu_total_bytes</code> rather than <code>max_tokens</code>. <strong>Proper V2 scheduler in progress, PR #11307.</strong></td></tr>
+    <tr><td>Search</td><td>Beam search (<code>beam_width &gt; 1</code>)</td><td>Per-beam forks; <strong>V2: not supported.</strong></td></tr>
+    <tr><td>Serving</td><td>Disagg serving (cache transceiver)</td><td>KV blocks shipped across endpoints; <strong>V2: not supported.</strong></td></tr>
+    <tr><td>Serving</td><td>Helix parallelism</td><td>KV partitioned along sequence dim; <strong>V2: not supported.</strong></td></tr>
+    <tr><td>Serving</td><td>Star attention</td><td>Anchor + chunk reuse; <strong>V2: not supported.</strong></td></tr>
+    <tr><td>Observability</td><td>KV cache events (<code>event_buffer_max_size &gt; 0</code>)</td><td>Event stream consumed by serving. <strong>V2: not supported.</strong></td></tr>
+    <tr><td>Observability</td><td>KV cache stats</td><td>Metrics for tests/reports. <strong>V2: not supported.</strong></td></tr>
+  </tbody>
+</table>
+
+<h3 id="sec1b">1b. Features that are <em>orthogonal</em> to the manager (V1/V2 should be indistinguishable)</h3>
+<p>These run regardless of the choice of manager and should be <strong>tested for parity</strong> but not feared as a source of bring-up risk on their own:</p>
+<ul>
+  <li>LoRA (separate adapter system; manager only sees identical tokens).</li>
+  <li>CUDA graph capture / piecewise CUDA graph / <code>torch.compile</code>.</li>
+  <li>Tensor / Pipeline / Expert parallelism — except: <strong>V2 scheduler does not yet handle max-batch-size correctly under PP</strong> (known waive).</li>
+  <li>Weight-only / activation quantization (W4A16, FP8 weights, NVFP4 weights) when distinct from <em>KV cache</em> dtype.</li>
+  <li>Logprobs / top-k logprobs / structured output / guided decoding.</li>
+  <li>Overlap scheduler — except: <strong>gpt-oss-120b + Eagle3 + overlap scheduler has an H100 accuracy issue</strong> (known waive).</li>
+</ul>
+
+<h3 id="sec1c">1c. Mutual-exclusion / fallback rules currently encoded in code</h3>
+<p>From <code>_torch/pyexecutor/_util.py</code> (auto-fallback to V1 with a warning, or hard error):</p>
+
+<table>
+  <thead><tr><th>Combination</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>V2 + <code>kv_connector_manager</code></td><td>Falls back to V1. Hard error for Gemma4 hybrid.</td></tr>
+    <tr><td>V2 + <code>beam_width &gt; 1</code></td><td>Falls back to V1. Hard error for Gemma4 hybrid.</td></tr>
+    <tr><td>V2 + <code>event_buffer_max_size &gt; 0</code></td><td>Falls back to V1. Hard error for Gemma4 hybrid.</td></tr>
+    <tr><td>V2 + <code>cache_transceiver_config</code></td><td>Falls back to V1. Hard error for Gemma4 hybrid.</td></tr>
+    <tr><td>V2 + two-model spec dec</td><td>Asserts (won't do).</td></tr>
+    <tr><td>V1 + Gemma4 hybrid (per-layer head_dim)</td><td>Silently wrong — V1 coerces to max head_dim. Must use V2.</td></tr>
+    <tr><td>V1 hybrid-linear + block reuse + (disagg ∨ <code>TRTLLM_USE_CPP_MAMBA=1</code> ∨ one-model spec dec)</td><td>Warns: block reuse does not work for the mamba half.</td></tr>
+  </tbody>
+</table>
+
+<h3 id="sec1d">1d. Backends (execution / attention / MLA / MoE / sampling)</h3>
+<p>"Backend" in TRT-LLM means three different things. They sit at different layers and interact with the KV cache manager differently.</p>
+
+<h4>Execution backends (top-level)</h4>
+<table>
+  <thead><tr><th>Backend</th><th>V2 available?</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>PyTorch</strong> (default)</td><td><span class="chip green">Yes</span></td><td>The only path where V2 is wired in. All V2 bring-up happens here.</td></tr>
+    <tr><td><strong>AutoDeploy</strong> (beta)</td><td><span class="chip green">Yes — same toggle</span></td><td>Shares <code>PyExecutor</code> (<code>_torch/auto_deploy/shim/ad_executor.py</code>); the same <code>use_kv_cache_manager_v2</code> flag applies. Bring-up needs AD-side smoke coverage to catch shim regressions.</td></tr>
+    <tr><td><strong>TensorRT</strong> (legacy)</td><td><span class="chip red">No</span></td><td>Has its own C++ runtime (<code>trtllm.Executor</code>); does not consume <code>KVCacheManagerV2</code>. Out of scope — but if a user passes <code>use_kv_cache_manager_v2=True</code> with <code>backend="tensorrt"</code> the flag must be ignored, not error.</td></tr>
+  </tbody>
+</table>
+
+<h4>Attention backends (kernel layer, <code>TorchLlmArgs.attn_backend</code>)</h4>
+<p>Each backend reads the KV pool through its own view; the manager must expose a stable surface. Coupling points found in code:</p>
+<table>
+  <thead><tr><th>Backend</th><th>File</th><th>Coupling to KV manager</th><th>V2-readiness today</th></tr></thead>
+  <tbody>
+    <tr><td><strong>TRTLLM</strong> (default)</td><td><code>_torch/attention_backend/trtllm.py</code></td><td>Standard <code>kv_cache_manager</code> API via <code>AttentionMetadata</code>.</td><td>Default; expected to work but needs explicit V2 cross-check per model.</td></tr>
+    <tr><td><strong>TRTLLM-gen</strong></td><td><code>_torch/attention_backend/trtllm_gen.py</code></td><td>Has an explicit V1/V2 branch — "KVCacheManagerV2: contiguous per-layer tensor" (line 948).</td><td><span class="chip green">V2-aware</span> Lowest risk.</td></tr>
+    <tr><td><strong>FlashInfer</strong></td><td><code>_torch/attention_backend/flashinfer.py</code></td><td>Reads <code>self.kv_cache_manager.blocks_in_primary_pool</code> directly (line 237). FIXME at <code>resource_manager.py:428</code> noting this internal-attribute leak.</td><td><span class="chip red">Highest coupling risk</span> V2 must expose <code>blocks_in_primary_pool</code> or this backend silently breaks at pool resize. Phase-1 step is required, not optional.</td></tr>
+    <tr><td><strong>FlashAttention</strong></td><td><code>_torch/attention_backend/</code></td><td>Uses the same <code>AttentionMetadata</code> surface.</td><td>Cross-check needed.</td></tr>
+    <tr><td><strong>Vanilla</strong></td><td><code>_torch/attention_backend/vanilla.py</code></td><td>Reference torch implementation.</td><td>Useful as an accuracy anchor for V2 parity tests.</td></tr>
+    <tr><td><strong>Triton prefill</strong></td><td><code>_torch/attention_backend/triton_prefill.py</code></td><td>Prefill-only Triton kernels.</td><td>Cross-check needed.</td></tr>
+    <tr><td><strong>Star-FlashInfer</strong></td><td><code>_torch/attention_backend/star_flashinfer.py</code></td><td>Star attention — <strong>V1-only per the gap doc.</strong></td><td><span class="chip muted">Skip in V2 bring-up</span></td></tr>
+    <tr><td><strong>Sparse: Rocket</strong></td><td><code>_torch/attention_backend/sparse/rocket.py</code></td><td><code>RocketKVCacheManager</code> extends V1 directly (line 895); reads <code>blocks_in_primary_pool</code> (line 953).</td><td><span class="chip yellow">No V2 path today</span> Phase 3-or-later.</td></tr>
+    <tr><td><strong>Sparse: DSA</strong></td><td><code>_torch/attention_backend/sparse/dsa.py</code></td><td><code>DSACacheManager</code> extends V1 directly (line 2255); reads <code>blocks_in_primary_pool</code> (lines 801, 2311).</td><td><span class="chip yellow">No V2 path today</span> Required for DeepSeek V3.2 in Phase 3.</td></tr>
+  </tbody>
+</table>
+
+<h4>MLA backends (orthogonal axis under "attention")</h4>
+<table>
+  <thead><tr><th>Backend</th><th>Trigger</th><th>KV manager impact</th></tr></thead>
+  <tbody>
+    <tr><td><strong>TRTLLM MLA</strong></td><td>Default for MLA models.</td><td>Standard pool.</td></tr>
+    <tr><td><strong>FlashMLA</strong></td><td><code>model_config.enable_flash_mla</code> (DeepSeek path).</td><td><strong>Forces <code>tokens_per_block = 64</code></strong> (overrides user default of 32, see <code>py_executor_creator.py:632</code>). V2 pool sizing must honor this override; otherwise the connector's block-id view desyncs from the manager (cf. #13320). Bring-up must include an explicit FlashMLA + V2 test.</td></tr>
+    <tr><td><strong>MLA workspace</strong> (cross-backend)</td><td>Used by both.</td><td>Known IMA on GB200 DSv3 2-node: workspace size uses ISL instead of ISL + history_len (gap doc §3.a). Tracked in §5.</td></tr>
+  </tbody>
+</table>
+
+<h4>Orthogonal kernel backends (no direct manager coupling)</h4>
+<p>These don't read or write the KV manager and should be V1/V2-identical under load — verify by parity, but they are not bring-up risk on their own:</p>
+<ul>
+  <li><strong>MoE backends</strong> — <code>CUTLASS</code>, <code>TRTLLM</code>, <code>TRITON</code> (selected via <code>MoeConfig.backend</code>).</li>
+  <li><strong>Sampling backends</strong> — PyTorch sampling vs FlashInfer sampling.</li>
+  <li><strong>Quantization backends</strong> — weight-only, FP8 weights, NVFP4 weights (distinct from KV dtype).</li>
+</ul>
+
+<h4>Backend-coupling contract — V1 ↔ V2 attribute parity</h4>
+<p>Non-sparse PyTorch attention backends reach into the manager for the names below. V2 (<code>resource_manager.py:1807</code>) exposes every name used by a V2-supported backend; the smoke test in <a href="#sec2c">§2c</a> is the regression net under this contract. Sparse-only attributes (added by <code>RocketKVCacheManager</code> / <code>DSACacheManager</code> on top of V1) are <strong>a known gap on V2</strong>, not "covered differently" — those sparse managers extend V1 directly and have no V2 port today, as recorded in the Attention-backends table above and tracked as Phase-3 work.</p>
+<table>
+  <thead><tr><th>Attribute / method</th><th>V1</th><th>V2</th><th>Call site</th></tr></thead>
+  <tbody>
+    <tr><td><code>blocks_in_primary_pool</code></td><td><span class="chip green">attr</span> <code>:436</code></td><td><span class="chip green">@property</span> <code>:2221</code></td><td><code>flashinfer.py:237</code>, <code>sparse/dsa.py:801</code></td></tr>
+    <tr><td><code>tokens_per_block</code></td><td><span class="chip green">attr</span></td><td><span class="chip green">attr</span> <code>:1864</code></td><td><code>trtllm.py:155</code>, <code>flashinfer.py:311</code>, <code>sparse/dsa.py:714</code></td></tr>
+    <tr><td><code>max_seq_len</code></td><td><span class="chip green">attr</span></td><td><span class="chip green">attr</span> <code>:1865</code></td><td><code>trtllm.py:138,476,479,1740,1789,1832</code></td></tr>
+    <tr><td><code>max_batch_size</code></td><td><span class="chip green">attr</span></td><td><span class="chip green">attr</span> <code>:1866</code></td><td><code>trtllm.py:257,267,287</code>, <code>interface.py:353</code></td></tr>
+    <tr><td><code>max_blocks_per_seq</code></td><td><span class="chip green">attr</span></td><td><span class="chip green">attr</span> <code>:2075</code></td><td><code>trtllm.py:228,246,258,268</code>, <code>interface.py:354</code></td></tr>
+    <tr><td><code>num_pools</code></td><td><span class="chip green">attr</span></td><td><span class="chip green">attr</span> <code>:2026</code></td><td><code>trtllm.py:227</code></td></tr>
+    <tr><td><code>kv_cache_pool_pointers</code></td><td><span class="chip green">attr</span></td><td><span class="chip green">attr</span> <code>:2034</code></td><td><code>trtllm.py:162,1732,1780,1826,1943</code></td></tr>
+    <tr><td><code>kv_cache_pool_mapping</code></td><td><span class="chip green">attr</span></td><td><span class="chip green">attr</span> <code>:2035</code></td><td><code>trtllm.py:169,1733,1781,1827,1944</code></td></tr>
+    <tr><td><code>host_kv_cache_block_offsets</code></td><td><span class="chip green">attr</span> <code>:615</code></td><td><span class="chip green">attr</span> <code>:2108</code></td><td><code>trtllm.py:234</code>, <code>sparse/dsa.py:809</code></td></tr>
+    <tr><td><code>layer_offsets</code></td><td><span class="chip green">attr</span></td><td><span class="chip green">attr</span> <code>:1852</code></td><td><code>flashinfer.py:276</code>, <code>trtllm.py:1055</code></td></tr>
+    <tr><td><code>dtype</code></td><td><span class="chip green">attr</span></td><td><span class="chip green">attr</span> <code>:1836</code></td><td><code>trtllm_gen.py:1508</code></td></tr>
+    <tr><td><code>get_buffers(layer_idx, kv_layout)</code></td><td><span class="chip green">method</span> <code>:1226</code></td><td><span class="chip green">method</span> <code>:2227</code></td><td><code>vanilla.py:403</code>, <code>flashinfer.py:277,876</code>, <code>trtllm_gen.py:976,1135,1332,1352,1400</code></td></tr>
+    <tr><td><code>get_batch_cache_indices</code></td><td><span class="chip green">method</span> <code>:1184</code></td><td><span class="chip green">method</span></td><td><code>vanilla.py:66</code>, <code>flashinfer.py:417,479</code>, <code>trtllm.py:503</code></td></tr>
+    <tr><td><code>get_block_ids_per_seq</code></td><td><span class="chip green">method</span> <code>:1301</code></td><td><span class="chip green">method</span></td><td><code>trtllm.py:503</code></td></tr>
+    <tr><td><code>copy_batch_block_offsets</code></td><td><span class="chip green">method</span> <code>:1784</code></td><td><span class="chip green">method</span></td><td><code>trtllm.py:469,484</code></td></tr>
+    <tr><td colspan="4"><em>Sparse-only attributes — V2 gap (sparse managers extend V1; no V2 port today, tracked Phase 3+)</em></td></tr>
+    <tr><td><code>max_kt_blocks_per_seq</code>, <code>kt_tokens_per_block</code>, <code>get_kt_buffers</code>, <code>copy_kt_block_offsets</code></td><td><span class="chip green">added by <code>RocketKVCacheManager</code></span></td><td><span class="chip red">gap — no V2 path</span></td><td><code>sparse/rocket.py:137,190,225,459,475,…</code>. Required if/when Rocket ports to V2.</td></tr>
+    <tr><td><code>num_local_layers</code>, <code>head_dim</code>, <code>kv_factor</code> <em>(as consumed by DSA)</em></td><td><span class="chip green">attrs on V1</span></td><td><span class="chip yellow">attrs exist on V2 wrapper (<code>:1851,1863,1867</code>) but DSA inherits V1 directly</span></td><td><code>sparse/dsa.py:564,714,715,800,806,807</code>. V2 wrapper having matching names is incidental; the DSA path itself is V1-only until a V2 port lands.</td></tr>
+  </tbody>
+</table>
+<p><strong>Semantic caveats to verify in <a href="#sec2c">§2c</a>:</strong> V2's <code>blocks_in_primary_pool</code> returns <code>self.impl.get_page_index_upper_bound(0, Role.KEY)</code> (<code>resource_manager.py:2225</code>), while V1 stores <code>int(max_tokens // tokens_per_block)</code> (<code>:436</code>). Same name, different computation path — under VSWA or NVFP4 with per-buffer <code>tokens_per_block_override</code> these can diverge in principle. The smoke test in §2c is the first line of defence; I-11 (NVFP4 + override, §2d) is the second.</p>
+
+<h3 id="sec1e">1e. Coverage colors used below</h3>
+<div class="legend">
+  <span class="chip green">green</span> exercised by an existing V2 test that asserts parity or correctness, no waive.<br>
+  <span class="chip yellow">yellow</span> exercised but waived, partial, or known-broken (cite the waive / bug).<br>
+  <span class="chip red">red</span> not exercised; gap.
+</div>
+
+<hr>
+
+<h2 id="sec2">2. Phase 1 — GPT-OSS-120B (Starting Model)</h2>
+
+<h3 id="sec2a">2a. Why this model</h3>
+<p>GPT-OSS-120B is a pragmatic V2 starter because it stresses the manager but avoids the V2 hard-blockers:</p>
+<ul>
+  <li><strong>Sliding window every other layer + attention sinks</strong> (<code>modeling_gpt_oss.py:84,115</code>) — exercises <code>AttnLifeCycle</code> with windowed + sink-token policy.</li>
+  <li><strong>MoE with multiple backends</strong> (Cutlass / TRTLLM / Triton) — orthogonal to KV manager but the most common GPT-OSS perf knob.</li>
+  <li><strong>MXFP4 weights + optional FP8 KV dtype</strong> — covers the bytes-per-token math.</li>
+  <li><strong>Eagle3 one-model spec dec</strong> is available (<code>SpecDecOneEngineForCausalLM</code>) — exercises draft-token flow through the same pool.</li>
+  <li><strong>No</strong> beam search, <strong>no</strong> disagg requirement, <strong>no</strong> mandatory connector, <strong>no</strong> mamba state — so we avoid every V2 hard-fallback.</li>
+  <li>An existing parametrized harness (<code>tests/integration/defs/accuracy/test_llm_api_pytorch.py:5314</code> <code>TestGPTOSS.test_w4_1gpu</code>) already runs with <code>v2_kv_cache=[True, False]</code>.</li>
+</ul>
+
+<h3 id="sec2b">2b. Audit — existing GPT-OSS coverage today</h3>
+<p>Before adding new tests, inventory what already runs. The bring-up plan then extends, parametrizes, or fills the gaps in this baseline rather than duplicating it.</p>
+
+<h4>Existing GPT-OSS tests in the repo</h4>
+<table>
+  <thead><tr><th>Test ID</th><th>Location</th><th>Parametrizes <code>v2_kv_cache</code>?</th><th>Axes already exercised</th></tr></thead>
+  <tbody>
+    <tr><td><code>TestGPTOSS::test_w4_1gpu</code></td><td><code>tests/integration/defs/accuracy/test_llm_api_pytorch.py:5314</code></td><td><span class="chip green">Yes</span></td><td>1× B200; <code>kv_cache_dtype × moe_backend × (cuda_graph, overlap_scheduler)</code>. L0 has V1 + V2 cells (<code>l0_b200.yml:53-57,290-291</code>).</td></tr>
+    <tr><td><code>TestGPTOSS::test_w4_4gpus</code></td><td>same file</td><td><span class="chip green">Yes</span></td><td>4× GB200; TP/PP/EP × attention-DP × MoE backend × reuse on/off. L0 cells exist for V1 + V2 (<code>l0_gb200_multi_gpus.yml:67-78</code>).</td></tr>
+    <tr><td><code>TestGPTOSS::test_eagle3_4gpus</code></td><td>same file</td><td><span class="chip green">Yes</span></td><td>Eagle3 spec dec × <code>one_model</code> × overlap × MoE backend. L0 V1 + V2 cells.</td></tr>
+    <tr><td><code>TestGPTOSS::test_eagle3_2gpus</code></td><td>same file</td><td><span class="chip red">No</span></td><td>Eagle3 × MoE × overlap.</td></tr>
+    <tr><td><code>TestGPTOSS::test_w4_2gpus</code></td><td>same file</td><td><span class="chip red">No</span></td><td>2-GPU TP/PP/EP.</td></tr>
+    <tr><td><code>TestGPTOSS::test_w4a16</code></td><td>same file</td><td><span class="chip red">No</span></td><td>W4A16 quant variant.</td></tr>
+    <tr><td><code>TestGPTOSS::test_w4_chunked_prefill</code></td><td>same file</td><td><span class="chip red">No</span></td><td>Chunked prefill on 4× GPUs.</td></tr>
+    <tr><td><code>TestGPTOSS::test_w4_1gpu_piecewise_cuda_graph</code></td><td>same file</td><td><span class="chip red">No</span></td><td>Piecewise CUDA graph.</td></tr>
+    <tr><td><code>TestGPTOSS::test_dflash</code></td><td>same file</td><td><span class="chip red">No</span></td><td>DFlash attention variant.</td></tr>
+    <tr><td><code>TestGPTOSS::test_eagle3_vswa_reuse_4gpus</code></td><td>same file</td><td><span class="chip red">No</span></td><td>Eagle3 + VSWA + reuse.</td></tr>
+    <tr><td><code>TestGPTOSS::test_eagle3_guided_decoding_4gpus</code></td><td>same file</td><td><span class="chip red">No</span></td><td>Eagle3 + guided decoding.</td></tr>
+    <tr><td><code>TestGPTOSS::test_w4_4gpus_online_eplb</code></td><td>same file</td><td><span class="chip red">No</span></td><td>Online EPLB on GB200.</td></tr>
+    <tr><td><code>test_disaggregated_gpt_oss_120b_harmony</code></td><td><code>tests/integration/defs/disaggregated/test_disaggregated.py:2066</code></td><td><span class="chip red">No</span></td><td>4× B200 disagg; harmony protocol. V1-only today; runs via <code>run_disaggregated_test</code> against the <code>gpt_oss_120b_harmony</code> YAML — no <code>use_kv_cache_manager_v2</code> override.</td></tr>
+    <tr><td><code>TestGPTOSS::test_auto_dtype</code> (disagg-serving)</td><td><code>tests/integration/defs/accuracy/test_disaggregated_serving.py:1389</code></td><td><span class="chip red">No</span></td><td>8-GPU H200 disagg via <code>launch_disaggregated_llm</code>; parametrizes <code>block_reuse ∈ {True, False}</code>; SWA <code>max_attention_window=[128, 32768]</code>; <code>TP=4</code> ctx + <code>TP=4</code> gen. L0 H200 (<code>l0_dgx_h200.yml:38-39</code>). <strong>V2-coverage gap:</strong> bring-up step is to add <code>v2_kv_cache</code> parametrization here — couples disagg fallback (§2e D-4) to a live test on H200 in addition to the B200 harmony test above.</td></tr>
+    <tr><td>Unit-modeling tests</td><td><code>tests/unittest/_torch/modeling/test_modeling_gpt_oss.py</code></td><td>n/a</td><td>Module-level — doesn't touch the manager.</td></tr>
+    <tr><td>AutoDeploy patch</td><td><code>tensorrt_llm/_torch/auto_deploy/models/patches/gptoss-mxfp4.py</code></td><td>n/a (no integration test)</td><td>AD-shim path exists in code; not exercised in CI with GPT-OSS.</td></tr>
+  </tbody>
+</table>
+
+<h4>Audit summary against the 3 axes</h4>
+<table>
+  <thead><tr><th>Axis</th><th>What we have</th><th>Holes</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Backend configuration</strong></td><td>PyTorch + TRTLLM attn backend on V1 and V2 (1-GPU and 4-GPU).</td><td><span class="chip red">No</span> AutoDeploy × GPT-OSS test. <span class="chip red">No</span> FlashInfer, TRTLLM-gen, FlashAttention, or Vanilla cells exercising V2 explicitly.</td></tr>
+    <tr><td><strong>Inference configuration</strong></td><td>kv_cache_dtype, moe_backend, cuda_graph, overlap_scheduler, Eagle3 — all parametrized on <code>v2_kv_cache</code> for the cases listed above.</td><td>Not parametrized on <code>v2_kv_cache</code>: chunked prefill, piecewise CUDA graph, w4a16, dflash, VSWA+reuse, guided decoding. <span class="chip red">No</span> host-offload test. <span class="chip red">No</span> capacity-stress / suspend-resume / NVFP4-override test. <span class="chip red">No</span> reuse-len assertion test.</td></tr>
+    <tr><td><strong>Deployment configuration</strong></td><td>1/2/4 GPU coverage spans <strong>B200, GB200, B300, H100, H200</strong>: L0 has V1+V2 cells for <code>test_w4_4gpus</code> and <code>test_eagle3_4gpus</code> across <code>l0_dgx_b200.yml:272-293</code>, <code>l0_dgx_b300.yml:86-90,119-120</code>, <code>l0_gb200_multi_gpus.yml:67-78</code>, and <code>l0_dgx_h100.yml:240-247</code>; V1-only <code>test_eagle3_2gpus</code> on <code>l0_dgx_h100.yml:76-79</code>; B200 disagg test exists on V1 (<code>l0_dgx_b200.yml:35</code>); H200 disagg-serving test exists on V1 (<code>l0_dgx_h200.yml:38-39</code>).</td><td>Disagg + <code>v2_kv_cache=True</code> never run on either disagg surface — §1c says V2 falls back to V1; assertion that the fallback happens cleanly is missing for both the integration harmony test and the accuracy-suite disagg-serving test. <span class="chip red">No</span> multi-node test. <span class="chip red">No</span> explicit v2 cell for <code>test_auto_dtype</code> (disagg-serving).</td></tr>
+  </tbody>
+</table>
+
+<h3 id="sec2c">2c. Backend configuration matrix</h3>
+<p>Goal: prove the V2 manager exposes a stable surface to every (execution backend × attention backend) combination GPT-OSS supports. Each cell runs the <strong>same minimal baseline</strong> — <code>enable_block_reuse=False</code>, no CUDA graph, no overlap, no spec dec, no host offload — so a failure pins blame on the backend coupling, not the feature.</p>
+
+<h4>Execution backend × Attention backend × (V1, V2)</h4>
+<table>
+  <thead><tr><th>Execution</th><th>Attention</th><th>V1</th><th>V2</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td rowspan="6"><strong>PyTorch</strong> (default)</td><td>TRTLLM</td><td><span class="chip green">have</span></td><td><span class="chip green">have</span></td><td>Existing <code>TestGPTOSS::test_w4_1gpu</code> covers both. Carry forward as anchor.</td></tr>
+    <tr><td>TRTLLM-gen</td><td><span class="chip red">need</span></td><td><span class="chip red">need</span></td><td>Has an explicit V1/V2 branch (<code>_torch/attention_backend/trtllm_gen.py:948</code>); the V2 contiguous-per-layer tensor path is otherwise unexercised at the model level.</td></tr>
+    <tr><td>FlashInfer</td><td><span class="chip red">need</span></td><td><span class="chip red">need</span></td><td>Reads <code>blocks_in_primary_pool</code> directly (<code>_torch/attention_backend/flashinfer.py:237</code>). V2-readiness assertion = no <code>AttributeError</code> + parity.</td></tr>
+    <tr><td>FlashAttention</td><td><span class="chip red">need</span></td><td><span class="chip red">need</span></td><td>Skip on SM where unsupported.</td></tr>
+    <tr><td>Vanilla</td><td><span class="chip muted">optional</span></td><td><span class="chip muted">optional</span></td><td>Reference torch path; useful as an accuracy anchor when V2 cells diverge.</td></tr>
+    <tr><td>Triton prefill</td><td><span class="chip red">need</span></td><td><span class="chip red">need</span></td><td>Prefill-only kernels; cross-check on a single short prompt.</td></tr>
+    <tr><td><strong>AutoDeploy</strong> (beta)</td><td>TRTLLM (default for AD)</td><td><span class="chip red">need</span></td><td><span class="chip red">need</span></td><td>AD shares <code>PyExecutor</code> (<code>_torch/auto_deploy/shim/ad_executor.py</code>); the <code>gptoss-mxfp4</code> patch exists but no V2 cell. One cell is enough to catch shim regressions.</td></tr>
+    <tr><td><strong>TensorRT</strong> (legacy)</td><td>—</td><td><span class="chip muted">n/a</span></td><td><span class="chip muted">n/a</span></td><td>Does not consume <code>KVCacheManagerV2</code>; out of scope. <em>Assert</em> that passing <code>use_kv_cache_manager_v2=True</code> with <code>backend="tensorrt"</code> is silently ignored (not error).</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">If any V2 cell in this matrix fails, fix it before progressing to §2d — a broken backend-coupling contract will cascade into every inference feature later.</div>
+
+<h3 id="sec2d">2d. Inference configuration matrix</h3>
+<p>Pin the backend to (PyTorch + TRTLLM) — the anchor cell from §2c. Each row adds <strong>one</strong> feature on top of the previous and lands as a parametrized test with <code>v2_kv_cache ∈ {True, False}</code> so we get parity evidence and a regression net at once. Tests live under <code>tests/integration/defs/accuracy/test_llm_api_pytorch.py::TestGPTOSS</code> unless noted; unit-level V1/V2 parity is already in <code>tests/unittest/_torch/attention/test_attention.py::test_attention_backend{,_ifb}</code>.</p>
+
+<table>
+  <thead><tr><th>#</th><th>Feature added</th><th>Concrete step</th><th>Pass criterion</th></tr></thead>
+  <tbody>
+    <tr><td>I-0</td><td>Baseline single-GPU</td><td>Reuse existing <code>TestGPTOSS.test_w4_1gpu</code> with <code>enable_block_reuse=False</code>, no CUDA graph, no overlap — both V1 and V2.</td><td>GSM8K parity within tolerance of <code>TestGPTOSS.extra_evaluator_kwargs</code>.</td></tr>
+    <tr><td>I-1</td><td>Cross-request reuse + partial block reuse</td><td>Send the same long shared prefix twice (e.g. 4k tokens, 2 requests). Assert reuse-len &gt; 0 on the second request via the manager's introspection API.</td><td>Reuse-len &gt; 0; tokens generated identical to the no-reuse run.</td></tr>
+    <tr><td>I-2</td><td>Sliding window + attention sinks</td><td>Force a request long enough to exceed the window. Assert the early (sink) tokens stay resident while middle-of-context blocks are evicted from the working set.</td><td>Generation correct; verified by GSM8K and by introspection of the per-layer life-cycle.</td></tr>
+    <tr><td>I-3</td><td>KV dtype = FP8 / NVFP4</td><td>Lift the existing <code>kv_cache_dtype=fp8</code> case to both V1/V2 and add an NVFP4 variant (Blackwell).</td><td>GSM8K parity within tolerance.</td></tr>
+    <tr><td>I-4</td><td>CUDA graph + overlap scheduler</td><td>Cross-product with <code>cuda_graph=True</code>, <code>overlap_scheduler=True</code>.</td><td>Parity. Excludes Eagle3 (see I-8 caveat).</td></tr>
+    <tr><td>I-5</td><td>Chunked prefill</td><td>Set a chunk size that splits the long-prefix request from I-1. Add <code>v2_kv_cache</code> parametrization to <code>test_w4_chunked_prefill</code>.</td><td>Identical output to I-1; commit happens on chunk boundary.</td></tr>
+    <tr><td>I-6</td><td>Host offloading</td><td>Configure host cache size such that an evicted-but-reusable block must round-trip GPU→Host→GPU.</td><td>Second request hits cached path (no recompute) and matches I-1 output.</td></tr>
+    <tr><td>I-7</td><td>MTP / Eagle3 (one-model)</td><td>Existing <code>TestGPTOSS::test_eagle3_*</code> already parametrize <code>v2_kv_cache</code>; widen coverage and add <code>v2_kv_cache</code> to <code>test_eagle3_2gpus</code> / <code>test_eagle3_vswa_reuse_4gpus</code>.</td><td>Parity to non-spec V2. <strong>Mark <code>cuda_graph + overlap_scheduler + Eagle3</code> as expected-fail on H100 until fixed.</strong></td></tr>
+    <tr><td>I-8</td><td>LoRA</td><td>Apply an existing GPT-OSS LoRA (<code>gpt-oss-20b-lora-adapter_NIM_r8</code> is wired in conftest).</td><td>Parity.</td></tr>
+    <tr><td>I-9</td><td>Capacity stress</td><td>Push concurrency until eviction is forced. Run with <code>max_util_for_resume=0.95</code> and <code>=0.7</code> and <code>free_gpu_memory_fraction</code> near the edge.</td><td>No OOM; throughput within an envelope of V1; no hang at teardown. Also assert no live <code>_KVCache</code> after <code>LLM.__exit__</code> (rawref/<code>__del__</code> discipline check).</td></tr>
+    <tr><td>I-10</td><td>Suspend / resume (V2-only)</td><td>Force a resume failure by sending one more concurrent request than the GPU tier admits, with the host tier sized so the <em>first</em> request's pages must be offloaded then recalled.</td><td>Both requests complete; <code>_KVCache._Status</code> traces show ACTIVE→SUSPENDED→ACTIVE on the offloaded request; no scheduler deadlock. V2-only state machine (<a href="#sec1-0">§1.0</a>) — most likely place a "works on V1, hangs on V2" bug lives.</td></tr>
+    <tr><td>I-11</td><td>NVFP4 + <code>tokens_per_block_override</code></td><td>Extends I-3. With NVFP4 KV dtype, log the per-buffer <code>BufferConfig</code> and assert the block-scale buffer has a different <code>tokens_per_block_override</code> than the KV data buffers.</td><td>The override is actually exercised (not just configured); GSM8K parity with FP8 / BF16. Guards against the manager coercing all buffers to a single <code>tokens_per_block</code>.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout">Coverage we <strong>deliberately do not pursue</strong> in §2d: beam search, cache connector, event buffer, per-request salting, stats, helix, star — all flagged red in §1c and tracked in the gap doc. SWA scratch reuse (<code>enable_swa_scratch_reuse</code>) and the DISK cache tier are V2-core surfaces not yet wired in the wrapper; surface them in §5 as wrapper backlog, not as model-bring-up steps.</div>
+
+<h3 id="sec2e">2e. Deployment configuration matrix (B200)</h3>
+<p>Target hardware: <strong>B200</strong> (single node) and <strong>multi-node B200</strong> (when available). Goal: prove V2 holds under the parallelism, scheduling, and disagg pressures that real deployments apply. Where V2 hard-falls-back to V1 (per §1c), the bring-up still has a job: assert the fallback fires cleanly (warning issued, V1 used, no regression vs explicitly-V1).</p>
+
+<table>
+  <thead><tr><th>#</th><th>Deployment feature</th><th>Concrete step</th><th>Pass criterion</th></tr></thead>
+  <tbody>
+    <tr><td>D-0</td><td>Tensor parallelism (TP)</td><td><code>TP=2</code> and <code>TP=4</code> on B200; extend <code>test_w4_4gpus</code> coverage to V2.</td><td>Parity to V1 on each TP.</td></tr>
+    <tr><td>D-1</td><td>Pipeline parallelism (PP)</td><td><code>PP=2</code> on B200.</td><td><strong>Skip / xfail on V2</strong> until the V2 scheduler PP-BS bug is fixed (see <a href="#sec5">§5.2</a>). Document an xfail with NVBug link.</td></tr>
+    <tr><td>D-2</td><td>Expert parallelism (EP)</td><td><code>EP=8</code> on B200; piggyback on <code>test_w4_4gpus</code>.</td><td>Parity. MoE-EP is orthogonal to the manager per §1b.</td></tr>
+    <tr><td>D-3</td><td>Attention-DP</td><td><code>attention_dp=True</code> on the 4-GPU variant.</td><td>Parity. Verify token-count allreduce path in <code>resource_manager.py:1976-1981</code> (V2-specific bytes/token normalization) hits the same quota across ranks.</td></tr>
+    <tr><td>D-4</td><td>Disagg fallback validation</td><td>Run <code>test_disaggregated_gpt_oss_120b_harmony</code> with <code>use_kv_cache_manager_v2=True</code> requested. V2 hard-falls-back to V1 per §1c (<code>_util.py:235</code>).</td><td>Warning is logged at startup; runtime behaves identically to the V1-explicit run; no silent V2 instance instantiated. This is a <em>fallback</em> assertion, not a V2-exercise.</td></tr>
+    <tr><td>D-5</td><td>Disagg on V2 (proper)</td><td>Lift V2 to support disagg via <code>cache_transceiver_config</code>. Removes the fallback in D-4. <strong>Blocked</strong> on the disagg-on-V2 backlog (§5.5).</td><td>Disagg test passes on V2 with the same accuracy threshold as V1. <em>Not in scope for first Phase-1 pass; track as a phase exit-blocker for the next phase.</em></td></tr>
+    <tr><td>D-6</td><td>Multi-node B200</td><td>2-node B200 with TP=4 on each node. Use <code>test_w4_4gpus</code> wrapped in a 2-node SLURM job.</td><td>Parity. Especially watch the V2 bytes/token allreduce path under inter-node communication.</td></tr>
+  </tbody>
+</table>
+
+<div class="callout warn">D-1 and D-5 are blockers tracked in §5. Don't paper over them — keep the xfail / skip explicit, and link the NVBug.</div>
+
+<h3 id="sec2f">2f. Phase 1 exit criteria</h3>
+<ul>
+  <li><strong>Backend (§2c)</strong>: every "need" cell is filled in. AutoDeploy × V2 cell is green. FlashInfer × V2 explicitly asserts <code>blocks_in_primary_pool</code> is exposed.</li>
+  <li><strong>Inference (§2d)</strong>: I-0 through I-11 pass on B200, except I-7 with <code>cuda_graph + overlap_scheduler + Eagle3</code> on H100 (xfail).</li>
+  <li><strong>Deployment (§2e)</strong>: D-0, D-2, D-3, D-6 green on B200; D-1 (PP) xfailed with NVBug; D-4 fallback assertion green; D-5 tracked as next-phase blocker.</li>
+  <li>At least one inference step (any of I-0 through I-6) is run under both mypyc-release and <code>TLLM_KV_CACHE_MANAGER_V2_DEBUG=1</code>. See <a href="#sec1-5">§1.5</a>.</li>
+  <li>Each known waive is a single <code>pytest.mark.xfail</code> or <code>waives.txt</code> entry with an NVBug link; no broad skip.</li>
+  <li>A short summary appended to §6 lists the test IDs and the platforms they were green on, with the date.</li>
+</ul>
+
+<hr>
+
+<h2 id="sec3">3. Phase 2 — Multi-Modal Models (Recommended Next)</h2>
+<p>Multi-modal models push two manager-specific concerns that pure-text models do not: (a) image/audio tokens must be salted into the radix key (<code>gen_multi_modal_tokens</code>) or prefix reuse silently produces wrong outputs across different images with identical text prompts; (b) vision encoders often produce very long visual-token prefixes that stress eviction and host offloading.</p>
+<p>Recommended bring-up order (most-coverage-per-risk first):</p>
+
+<table>
+  <thead><tr><th>Rank</th><th>Model</th><th>What it specifically validates</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><strong>Qwen2.5-VL-7B / 32B / 72B</strong></td><td>Image+text prefix reuse path; long visual prefixes; well-supported in TRT-LLM; mature accuracy baselines. The cleanest "does V2 multi-modal radix actually work" test.</td></tr>
+    <tr><td>2</td><td><strong>Llama-3.2-Vision (Mllama) 11B / 90B</strong></td><td>Cross-attention KV (encoder output → cross-attn cache) — different cache topology than self-attn-only models. Currently uses <code>cross_kv_cache_fraction</code>; tests V2's handling of a second logical pool.</td></tr>
+    <tr><td>3</td><td><strong>LLaVA-1.6 (7B/13B)</strong></td><td>Simplest baseline; isolates the multi-modal salt bug from any MoE / hybrid noise. Good "control" model.</td></tr>
+    <tr><td>4</td><td><strong>Llama-4 Scout / Maverick (MoE multi-modal)</strong></td><td>MoE × multi-modal × long context — closest to production load. Validates MoE-EP doesn't regress V2 reuse.</td></tr>
+    <tr><td>5</td><td><strong>Gemma3 (multi-modal variant)</strong></td><td>Bridges to Phase 3 — same family as Gemma4 hybrid; helps isolate "is this a multi-modal regression or a hybrid regression" in Phase 3.</td></tr>
+    <tr><td>6</td><td><strong>Phi-4-Multimodal</strong></td><td>Audio + vision + text — different token-id encoding for non-image modalities; surface any modality-agnostic assumptions in the salting code.</td></tr>
+  </tbody>
+</table>
+
+<p>For each of the above, replay Phase-1 steps 0–6 (baseline, reuse, dtype, cuda-graph, chunked-prefill, host offload) plus one new step:</p>
+<ul>
+  <li><strong>MM-1</strong> — Same text prompt, two different images: assert generated tokens differ and that the radix did <strong>not</strong> reuse the second image's blocks against the first.</li>
+</ul>
+
+<h4>Phase 2 exit criteria</h4>
+<p>Same shape as Phase 1, plus an explicit MM-1 result for each model listed.</p>
+
+<hr>
+
+<h2 id="sec4">4. Phase 3 — Frontier / Architecture-Edge Models</h2>
+<p>By this point the manager has been hardened against multi-modal salting and the GPT-OSS feature set. Phase 3 targets the architectures that <strong>most stress the V2 design</strong> — and includes one model (Gemma4 hybrid) where V2 is already mandatory.</p>
+
+<h3>4a. Candidates beyond the two you named (Gemma4, DSV4-class)</h3>
+<table>
+  <thead><tr><th>Rank</th><th>Model / family</th><th>Why it belongs in Phase 3</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><strong>Gemma4 hybrid</strong></td><td><strong>V2 is already required</strong> by code (<code>_util.py:227</code>). Has the cleanest "V2-only" path; primary regression target. Also the only path that exercises distinct per-layer <code>head_dim</code> pool groups.</td></tr>
+    <tr><td>2</td><td><strong>DeepSeek-V3 / V3.2</strong></td><td>MLA (one latent vector per token, very different bytes/token); DSA sparse attention via <code>DSACacheManager</code> (V1-only today — V2 port required). <strong>Three backend variants to cover</strong>: (a) TRTLLM-MLA + V2, (b) FlashMLA + V2 — note <code>tokens_per_block</code> is forced to 64, V2 pool sizing must honor it; (c) DSA backend, currently V1-only. <strong>Known IMA on GB200 2-node:</strong> MLA workspace size uses ISL instead of ISL+history_len (see waive #3 in the gap doc). Phase 3 fixes this.</td></tr>
+    <tr><td>3</td><td><strong>DeepSeek-V4 (when available) / DeepSeek-Coder-V3</strong></td><td>Forward look; same MLA/MoE family. Bring-up should be near-zero-cost if (2) lands.</td></tr>
+    <tr><td>4</td><td><strong>Nemotron-H Hybrid</strong></td><td>Mamba+attention hybrid via <code>MixedMambaHybridCacheManager</code>. Today V2 handles only the attention pool; surfaces the question of whether mamba state should also migrate to V2-style management.</td></tr>
+    <tr><td>5</td><td><strong>Granite-Hybrid / Zamba2</strong></td><td>Independent implementations of the mamba-hybrid pattern. Validates the hybrid path isn't accidentally Nemotron-specific.</td></tr>
+    <tr><td>6</td><td><strong>Qwen3 / Qwen3-MoE</strong></td><td>Long context (128k+) + MoE-EP scale; primary stress test for V2 eviction + capacity estimation at concurrency.</td></tr>
+    <tr><td>7</td><td><strong>Llama-4 (text-only paths)</strong></td><td>MoE-EP at scale; cross-checks against Qwen3-MoE so we can tell MoE-routing-perturbation from manager regressions.</td></tr>
+    <tr><td>8</td><td><strong>Jamba 1.5</strong></td><td>Another hybrid (mamba + MoE); third datapoint for the mamba-hybrid story alongside Nemotron-H and Granite-Hybrid.</td></tr>
+  </tbody>
+</table>
+
+<h3>4b. New TDD step introduced in Phase 3</h3>
+<ul>
+  <li><strong>HY-1</strong> — For each hybrid model: send a request mid-pool-exhaustion and assert that the attention-pool eviction does <strong>not</strong> misalign with the mamba state's life-cycle (which is <em>not</em> evicted today). Pair this with the existing <code>is_hybrid_linear</code> + block-reuse warning in <code>_util.py:243</code>.</li>
+</ul>
+
+<h3>4c. Phase 3 exit criteria</h3>
+<ul>
+  <li>Gemma4 hybrid: all Phase-1 steps that apply (no spec dec, no LoRA needed).</li>
+  <li>DeepSeek-V3 / V3.2: MLA workspace fix lands; IMA waive removed; 2-node GB200 runs green.</li>
+  <li>At least one hybrid (Nemotron-H <strong>or</strong> Granite-Hybrid <strong>or</strong> Jamba) green on Phase-1 steps 0–6.</li>
+</ul>
+
+<hr>
+
+<h2 id="sec5">5. Known Issues Inherited from the Gap Doc</h2>
+<div class="callout bad">These are <em>blockers</em> the bring-up will hit; track them here so they're not silently waived.</div>
+<ol>
+  <li><strong>gpt-oss-120b + Eagle3 + overlap scheduler on H100</strong> — accuracy issue (Phase 1, step 8).</li>
+  <li><strong>V2 scheduler doesn't handle max BS for PP</strong> — Phase 1, step 7.</li>
+  <li><strong>MLA workspace size uses ISL, not ISL + history_len</strong> — Phase 3, item 2. Secondary risk: after the IMA fix, V2 scheduling is more aggressive and may trigger activation OOM (lower <code>free_gpu_memory_fraction</code>).</li>
+  <li><strong>CI-only teardown hang</strong> — V2 leans heavily on <code>__del__</code>; some failures disappear only when both <code>gc.collect()</code> <em>and</em> <code>gc.get_objects()</code> are called. Flag any new hang you see during Phase 1, step 10.</li>
+  <li><strong>Missing-feature backlog</strong> (see §1c red rows): connector, per-request salting, events, stats, beam, disagg, helix, star, two-model spec dec.</li>
+  <li><strong>V2-core / wrapper gaps</strong> (from <a href="#sec1-5">§1.5</a>):
+    <ul>
+      <li><code>DiskCacheTierConfig</code> implemented in V2 core but not wired in <code>KVCacheManagerV2</code> (<code>resource_manager.py:1986-2005</code>).</li>
+      <li><code>enable_swa_scratch_reuse</code> unit-tested only — no model-level path.</li>
+      <li><code>adjust()</code> / <code>need_adjustment</code> rebalancing has no model-level assertion; first place to look on a long-running VSWA regression.</li>
+      <li>mypyc-release vs <code>TLLM_KV_CACHE_MANAGER_V2_DEBUG=1</code> parity not enforced in CI.</li>
+    </ul>
+  </li>
+</ol>
+
+<hr>
+
+<h2 id="sec6">6. Tracking Table (live)</h2>
+<p>Update this table as evidence lands. Keep "Status" to one of: <span class="chip green">green</span> / <span class="chip yellow">yellow</span> / <span class="chip red">red</span>.</p>
+
+<table>
+  <thead><tr><th>Phase</th><th>Model</th><th>Step</th><th>Test ID</th><th>Status</th><th>Platform(s)</th><th>Date</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>Audit (§2b)</td><td>n/a — doc-only</td><td><span class="chip green">green</span></td><td>n/a (doc)</td><td>2026-05-13</td><td>§2b verified against repo: all <code>v2_kv_cache</code> yes/no claims hold; added missing row for <code>test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype</code>; broadened deployment-axis L0 platform coverage. §1d gains "Backend-coupling contract" subsection: V2 exposes every non-sparse attribute used by attention backends (<code>blocks_in_primary_pool</code>, <code>get_buffers</code>, <code>get_batch_cache_indices</code>, <code>get_block_ids_per_seq</code>, <code>copy_batch_block_offsets</code>, pool pointers/mapping, etc.); sparse-only attrs are an explicit V2 gap tied to the Rocket/DSA V1-only port status in §1d.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>B-PyTorch-TRTLLM</td><td><code>TestGPTOSS::test_w4_1gpu[…cuda_graph-overlap_scheduler-…]</code> (existing); <code>TestGPTOSS::test_w4_1gpu[…baseline_no_reuse-…]</code> (added 2026-05-13, awaiting B200 run)</td><td><span class="chip yellow">yellow</span></td><td>B200 (existing); pending (new subcase)</td><td>—</td><td>Anchor cell exists for V1+V2. Minimal-baseline subcase (reuse off, no CUDA graph, no overlap) added by extending the <code>(cuda_graph, overlap_scheduler, enable_block_reuse)</code> parametrize. Flip to green after first B200 run with all four ids (V1/V2 × baseline_no_reuse / cuda_graph-overlap).</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>B-PyTorch-TRTLLM-gen</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Note: TRTLLM-gen is dispatched internally from <code>attn_backend="TRTLLM"</code> on Blackwell — covered transitively by B-PyTorch-TRTLLM on B200/B300. A standalone cell only makes sense if a user-facing TRTLLM_GEN dispatch is introduced.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>B-PyTorch-FlashInfer</td><td><code>TestGPTOSS::test_w4_1gpu_flashinfer[v2_kv_cache]</code> + <code>[v1_kv_cache]</code></td><td><span class="chip yellow">yellow</span></td><td>pending (B200)</td><td>—</td><td>Added 2026-05-13. V2 already exposes <code>blocks_in_primary_pool</code> as <code>@property</code> at <code>resource_manager.py:2221</code> — no V2 API change required (see §1d contract table). Minimal-baseline shape (reuse off, no CUDA graph, no overlap). Cross-backend unit-level floor lives in <code>tests/unittest/_torch/attention/test_kv_cache_manager_backend_contract.py</code>.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>B-PyTorch-FlashAttention</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>SM-dependent.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>B-PyTorch-Triton-prefill</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Prefill-only; short prompt.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>B-AutoDeploy</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Catches shim regressions via <code>gptoss-mxfp4</code> patch.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-0</td><td><code>TestGPTOSS::test_w4_1gpu[v2_kv_cache-…]</code></td><td><span class="chip yellow">yellow</span></td><td>H100, B200</td><td>—</td><td>Existing; needs explicit "no-reuse, no-cuda-graph" subcase.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-1</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Prefix-reuse-len assertion.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-2</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>SWA + sinks.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-3</td><td><code>TestGPTOSS::test_w4_1gpu[fp8-…]</code></td><td><span class="chip yellow">yellow</span></td><td>B200</td><td>—</td><td>Need NVFP4 variant.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-4</td><td><code>TestGPTOSS::test_w4_1gpu[…cuda_graph-overlap…]</code></td><td><span class="chip green">green</span></td><td>H100, B200</td><td>—</td><td></td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-5</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Chunked prefill; widen <code>test_w4_chunked_prefill</code> to V2.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-6</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Host offload.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-7</td><td><code>TestGPTOSS::test_eagle3_4gpus[…]</code></td><td><span class="chip yellow">yellow</span></td><td>GB200</td><td>—</td><td>Exists; widen to <code>test_eagle3_2gpus</code>, <code>test_eagle3_vswa_reuse_4gpus</code>.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-8</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>LoRA.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-9</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Capacity stress + rawref leak assertion.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-10</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Suspend/resume (V2-only).</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>I-11</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>NVFP4 + <code>tokens_per_block_override</code>.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>D-0 (TP)</td><td><code>TestGPTOSS::test_w4_4gpus[v2_kv_cache-tp4-…]</code></td><td><span class="chip green">green</span></td><td>GB200</td><td>—</td><td>Existing.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>D-1 (PP)</td><td><em>to add</em> (xfail)</td><td><span class="chip yellow">yellow</span></td><td>—</td><td>—</td><td>Blocked on V2 scheduler PP-BS bug.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>D-2 (EP)</td><td><code>TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-…]</code></td><td><span class="chip green">green</span></td><td>GB200</td><td>—</td><td>Existing.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>D-3 (Attn-DP)</td><td><code>TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-…]</code></td><td><span class="chip green">green</span></td><td>GB200</td><td>—</td><td>Existing; verify bytes/token allreduce path.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>D-4 (Disagg fallback)</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Assert clean V2→V1 fallback with warning.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>D-5 (Disagg on V2)</td><td>—</td><td><span class="chip muted">backlog</span></td><td>—</td><td>—</td><td>Next-phase blocker; see §5.5.</td></tr>
+    <tr><td>1</td><td>GPT-OSS-120B</td><td>D-6 (Multi-node)</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>2-node B200 SLURM job.</td></tr>
+    <tr><td>2</td><td>Qwen2.5-VL</td><td>MM-1</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td></td></tr>
+    <tr><td>3</td><td>Gemma4-hybrid</td><td>0</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>V2-only path.</td></tr>
+    <tr><td>3</td><td>DeepSeek-V3.2</td><td>MLA</td><td><em>to add</em></td><td><span class="chip red">red</span></td><td>—</td><td>—</td><td>Blocked on workspace fix.</td></tr>
+  </tbody>
+</table>
+
+</main>
+</div>
+</body>
+</html>

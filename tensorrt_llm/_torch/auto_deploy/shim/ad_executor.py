@@ -14,7 +14,7 @@ import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from strenum import StrEnum
@@ -200,6 +200,43 @@ def maybe_pad_for_cuda_graph(func):
         return ret
 
     return wrapper
+
+
+def _compute_window_local_view(
+    all_indices: Sequence[int],
+    front_removed: int,
+    end_compute_i: int,
+    group_window: int,
+    tokens_per_block: int,
+) -> Tuple[List[int], int, int, int]:
+    """Compute the window-coherent metadata view for one (request, window) pair.
+
+    Under SWA front-eviction, the C++ KVCacheManager returns the full historical
+    page list (including evicted entries at the front) from get_cache_indices
+    while a separate per-window counter (get_num_front_blocks_removed) tracks
+    how many of those entries are stale.  This helper slices the historical
+    list down to the live window in window-local coordinates so the kernel
+    sees a contiguous page table starting at position 0.
+
+    Returns:
+        active_indices: the live slice of all_indices to hand the kernel.
+        extra_page: the spillover page id (the next slot past num_active), or
+            -1 when there is no spillover slot.
+        seq_len_with_cache: window-capped total length (cached + new tokens).
+        last_page_len: derived from seq_len_with_cache and tokens_per_block.
+    """
+    active_token_count = min(end_compute_i, group_window)
+    pages_for_active = (active_token_count + tokens_per_block - 1) // tokens_per_block
+    live_len = len(all_indices) - front_removed
+    num_active = min(live_len, pages_for_active)
+    active_indices = list(all_indices[front_removed : front_removed + num_active])
+    extra_slot_idx = front_removed + num_active
+    extra_page = all_indices[extra_slot_idx] if len(all_indices) > extra_slot_idx else -1
+    if active_token_count > 0:
+        last_page_len = (active_token_count - 1) % tokens_per_block + 1
+    else:
+        last_page_len = 0
+    return active_indices, extra_page, active_token_count, last_page_len
 
 
 class ADEngine(ModelEngine):
@@ -678,6 +715,12 @@ class ADEngine(ModelEngine):
         cache_loc_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
         cu_num_pages_per_pool: List[List[int]] = [[0] for _ in range(num_pools)]
         extra_page_per_seq_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+        # Phase 2: per-pool window-capped seq_len_with_cache / last_page_len for
+        # VSWA front-eviction.  Pool 0 always keeps the unclamped global value
+        # (set by nest_sequences via the base names), so the slot at index 0 is
+        # left empty and never read by the staging loop.
+        seq_len_with_cache_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
+        last_page_len_per_pool: List[List[int]] = [[] for _ in range(num_pools)]
 
         # Batched per-pool lookup preserves the #13560 host-overhead
         # optimization: one C++ call per pool instead of one per (request, pool).
@@ -702,22 +745,40 @@ class ADEngine(ModelEngine):
 
             for pool_idx, group_window in enumerate(kv_group_windows):
                 all_indices = batch_cache_indices_per_pool[pool_idx][i]
-                # Active blocks = pages needed to fit end_compute_i tokens within
-                # this window.  The trailing slot in all_indices (when present)
-                # is the reserved spillover page.
-                active_token_count = min(end_compute_i, group_window)
-                pages_for_active = (active_token_count + _tokens_per_block - 1) // _tokens_per_block
-                num_active = min(len(all_indices), pages_for_active)
-                active_indices = all_indices[:num_active]
+                # SWA front-eviction: get_batch_cache_indices returns the FULL
+                # historical page list including front-evicted entries (the
+                # C++ side bumps a counter rather than popping mCacheBlockIds).
+                # _compute_window_local_view slices it down to the live window
+                # in window-local coords.
+                front_removed = kv_cache_manager.get_num_front_blocks_removed(
+                    request.py_request_id, window_size=group_window
+                )
+                (
+                    active_indices,
+                    extra_page,
+                    active_token_count,
+                    lpl_i,
+                ) = _compute_window_local_view(
+                    all_indices,
+                    front_removed=front_removed,
+                    end_compute_i=end_compute_i,
+                    group_window=group_window,
+                    tokens_per_block=_tokens_per_block,
+                )
+                num_active = len(active_indices)
 
                 cache_loc_per_pool[pool_idx].extend(active_indices)
                 cu_num_pages_per_pool[pool_idx].append(
                     cu_num_pages_per_pool[pool_idx][i] + num_active
                 )
-                if len(all_indices) > num_active:
-                    extra_page_per_seq_per_pool[pool_idx].append(all_indices[num_active])
-                else:
-                    extra_page_per_seq_per_pool[pool_idx].append(-1)
+                extra_page_per_seq_per_pool[pool_idx].append(extra_page)
+                # Phase 2: window-capped seq_len_with_cache / last_page_len for
+                # SWA front-eviction.  Pool 0 keeps the unclamped global value
+                # (default in nest_sequences); pools 1..N-1 carry the per-pool
+                # window-local coords so the kernel sees a coherent live view.
+                if pool_idx != 0:
+                    seq_len_with_cache_per_pool[pool_idx].append(active_token_count)
+                    last_page_len_per_pool[pool_idx].append(lpl_i)
 
         # Store batch information based on prefill, decode, and extend requests.
         num_decode = len(generation_requests)
@@ -745,6 +806,8 @@ class ADEngine(ModelEngine):
             cache_loc_per_pool=cache_loc_per_pool if num_pools > 0 else None,
             cu_num_pages_per_pool=cu_num_pages_per_pool if num_pools > 0 else None,
             extra_page_per_seq_per_pool=extra_page_per_seq_per_pool if num_pools > 0 else None,
+            seq_len_with_cache_per_pool=(seq_len_with_cache_per_pool if num_pools >= 2 else None),
+            last_page_len_per_pool=last_page_len_per_pool if num_pools >= 2 else None,
             slot_idx=state_slot_idx,
             prompt_lens=prompt_lens,
             gather_context_logits=gather_context_logits,

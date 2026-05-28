@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/attentionWorkspace.h"
 
+#include "tensorrt_llm/common/attentionOp.h"
 #include "tensorrt_llm/common/workspace.h"
 
 #include <gtest/gtest.h>
@@ -257,4 +258,49 @@ TEST(AttentionWorkspaceManagerTest, FlashMlaLayoutKeepsAccumulatorOrder)
     expectNextSlice("softmaxLseAccum", layout.softmaxLseAccum, sizes.softmaxLseAccum, expectedOffset);
     expectNextSlice("outAccum", layout.outAccum, sizes.outAccum, expectedOffset);
     EXPECT_EQ(layout.totalSize, expectedOffset);
+}
+
+// Regression test for the perf-test warmup OOM seen on
+// test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:2000,2000]:
+// `attentionOp.cpp` resize_({workspace_size}) attempted a 396.03 GiB allocation
+// during _general_warmup. Hypothesis: mEnableContextFMHA was false at the time
+// of workspace sizing, so qk_buf_size + qk_buf_float_size (O(B*H*K^2), zero-guarded
+// only by the FMHA flag) were budgeted instead of skipped.
+//
+// This test pins that behaviour: with FMHA disabled and Bielik/Mistral dims, the
+// workspace is in the hundreds-of-GiB range. Future contributors who change the
+// FMHA gating must keep this property intact (the FMHA-off path is only safe for
+// small batch/seq combinations).
+TEST(AttentionOpWorkspaceTest, FmhaDisabledExplodesContextWorkspaceForBielikDims)
+{
+    tensorrt_llm::common::op::AttentionOp op{};
+    // Bielik-11B / Mistral GQA: 32 Q heads, 8 KV heads, head_dim 128.
+    op.mNumHeads = 32;
+    op.mNumKVHeads = 8;
+    op.mHeadSize = 128;
+    op.mNumAttnHeads = 32;  // these are written by initialize(); set them
+    op.mNumAttnKVHeads = 8; // explicitly so we don't need a CUDA initialize() call.
+    op.mType = nvinfer1::DataType::kBF16;
+    op.mIsMLAEnabled = false;
+    op.mCrossAttention = false;
+    op.mCpSize = 1;
+    op.mEnableContextFMHA = false;            // the pathological state we want to detect
+
+    constexpr int32_t kMaxNumSeq = 512;       // perf-test --max_batch_size
+    constexpr int32_t kInputSeqLength = 2048; // mMaxContextLength
+    constexpr int32_t kMaxNumTokens = 2048;   // perf-test --max_num_tokens
+    constexpr size_t kGiB = 1024ull * 1024 * 1024;
+
+    size_t const wsSize = op.getWorkspaceSizeForContext(nvinfer1::DataType::kBF16, kMaxNumSeq, kInputSeqLength,
+        /*cross_kv_length=*/0, kMaxNumTokens);
+
+    // Hand-computed expectation for these dims (size=2 for bf16):
+    //   qk_buf_size       = 2 * 512 * 32 * 2048 * 2048   = 128.00 GiB
+    //   qk_buf_float_size = 4 * 512 * 32 * 2048 * 2048   = 256.00 GiB
+    //   q_buf_2_size      = 2 * 512 * 2048 * (32*128)    =   8.00 GiB
+    //   k_buf_2 + v_buf_2 = 2 * 2 * 512 * 2048 * (8*128) =   4.00 GiB
+    //                                                    ≈ 396.05 GiB
+    EXPECT_GT(wsSize, 300ull * kGiB) << "qk_buf / qk_buf_float should dominate when FMHA is disabled. Got " << wsSize
+                                     << " bytes (" << (wsSize / static_cast<double>(kGiB)) << " GiB).";
+    EXPECT_LT(wsSize, 500ull * kGiB) << "Workspace far larger than expected for the FMHA-off path.";
 }

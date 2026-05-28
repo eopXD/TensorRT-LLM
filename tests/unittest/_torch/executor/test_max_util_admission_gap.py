@@ -1,59 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""
-Reproducer for MAX_UTILIZATION scheduler vs KVCacheManager admission-gap divergence.
+"""Scheduler-KV-manager invariant tests for the v1 pause-release-blocks fix.
 
-Background
-----------
-Under MAX_UTILIZATION + high concurrency + short ISL/OSL (e.g. bielik_11b_v2.2 bench
-at maxbs=512, ISL/OSL=128/128, L40S), the C++ KVCacheManager crashes in
+Bug context
+-----------
+Under MAX_UTILIZATION + high concurrency + short ISL/OSL (bielik_11b_v2.2 bench at
+maxbs=512, ISL/OSL=128/128 on L40S), the C++ KVCacheManager crashes in
 WindowBlockManager::allocateBlock with "No free blocks left" at
-cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp:2365.
+kvCacheManager.cpp:2365. Root cause: when MaxUtilizationPolicy paused a started
+request, schedulingReleaseBlocks bumped only the scheduling-view snapshot;
+physical blocks were never released before the next add_sequence_batch / add_token
+in the same iteration consumed them.
 
-Hypotheses under test
----------------------
-B. Admission gap: the scheduler's snapshot of free blocks (set in start_scheduling,
-   mutated by scheduling_remove_sequence on pause) does not see admission-time
-   reservations made by the same pass. The cumulative `num_scheduled_blocks`
-   accumulator in `MaxUtilizationScheduledBlocksManager` (scheduler.py:1234-1298)
-   should plug this gap — but only if `get_needed_blocks_one_step` returns the
-   same number of blocks that `addSequenceBatch` + `addToken` actually consume.
+What these scenarios prove
+--------------------------
+Each scenario drives the real C++ KVCacheManager (via nanobind) and the real
+PyCapacityScheduler with MAX_UTILIZATION, then mirrors what fixed PyExecutor does
+between `schedule_request` and `prepare_resources`: explicitly call
+`remove_sequence` on every paused request (analogue of
+py_executor.py:_release_paused_blocks) and `req.pause()` (analogue of
+py_executor.py:_pause_requests). The scenarios then assert no crash through the
+resource-consuming calls.
 
-C. No per-step revalidation: between scheduler decision and `add_token`, no
-   defensive check exists in resource_manager.py:1025-1054. Any off-by-one in the
-   predictor is unrecoverable — `TLLM_CHECK_WITH_INFO` at kvCacheManager.cpp:2365
-   aborts the process.
-
-Approach
---------
-Drive the **real C++ KVCacheManager** (via the nanobind binding) and the **real
-PyCapacityScheduler** with MAX_UTILIZATION through scenarios that match the failing
-benchmark's per-step admission + decode pattern. No model, no forward pass — just
-the KV pool, the scheduler, and `LlmRequest` instances. Runs in seconds on any
-single GPU.
-
-The mock variant of this test was deliberately rejected: faithfully mirroring
-`schedulingReleaseBlocks` / `mSchedulingNumFreeBlocks` semantics in Python risks
-papering over the very C++/scheduler interaction we are trying to stress. Using the
-real binding means any divergence between `get_needed_blocks_one_step` and the
-actual `addSequenceBatch` / `addToken` allocation surfaces directly.
-
-Outcomes
---------
-Each scenario mirrors the FIXED PyExecutor flow: between scheduler.schedule_request
-and the resource-consuming loop, it explicitly calls remove_sequence on every
-paused request (the unit-level analogue of py_executor.py:_release_paused_blocks)
-and req.pause() (the unit-level analogue of py_executor.py:_pause_requests). On
-top of the fix it asserts no crash plus the accounting invariant on free blocks.
-
-Note: this test does NOT exercise PyExecutor's wiring directly — it bypasses the
-executor loop and drives scheduler+KV manager+request state by hand. A regression
-that reverted py_executor.py:_release_paused_blocks would not be caught here; it
-would surface only in an integration test (e.g. the failing bielik bench itself).
-What this test does guarantee is that the FIX'S APPROACH — release physical KV
-blocks between schedule and allocate — produces a consistent free-block view and
-unblocks add_sequence_batch / add_token. If a scenario fails, the invariant has
-broken at the scheduler-KV-manager level, independent of the executor wiring.
+Scope note: this is a scheduler-KV-manager invariant check, not a PyExecutor
+wiring check. The wiring check lives in test_pyexecutor_pause_release.py.
+A regression that reverted _release_paused_blocks at the PyExecutor level would
+NOT trip these tests (they release by hand) — it would trip the wiring tests or
+the actual bench.
 """
 
 from __future__ import annotations
@@ -223,65 +196,7 @@ def _make_kv_manager(geom: _Geom) -> _SchedulerKVAdapter:
 
 
 # ---------------------------------------------------------------------------
-# Scenario A — admission burst against a tight pool
-# ---------------------------------------------------------------------------
-
-def test_admission_burst_does_not_overflow_pool():
-    """Many CONTEXT_INIT requests admitted in a single scheduling pass.
-
-    Hypothesis B: with the pool sized to fit J requests, if the scheduler
-    over-admits, the post-schedule `add_sequence_batch` will crash inside
-    `WindowBlockManager::allocateBlock` (kvCacheManager.cpp:2365).
-    """
-    TPB = 64
-    PROMPT_LEN = 128                          # 2 blocks per request
-    BLOCKS_PER_REQ = math.ceil(PROMPT_LEN / TPB)
-    POOL = 8                                  # holds exactly 4 requests
-    EXPECTED_FIT = POOL // BLOCKS_PER_REQ
-    NUM_REQS = 10
-
-    geom = _Geom(tokens_per_block=TPB,
-                 window_size=4096,
-                 max_num_sequences=NUM_REQS,
-                 max_sequence_length=4096,
-                 chunk_size=4096,
-                 primary_blocks=POOL)
-    kv = _make_kv_manager(geom)
-
-    scheduler = PyCapacityScheduler(
-        max_num_requests=NUM_REQS,
-        kv_cache_manager=kv,
-        scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
-    )
-    requests = [
-        _make_request(i, prompt_len=PROMPT_LEN, max_new_tokens=128)
-        for i in range(NUM_REQS)
-    ]
-
-    fitting, _, paused = scheduler.schedule_request(requests)
-
-    # Apply admissions exactly as PyExecutor.prepare_resources does
-    # (resource_manager.py:929). The tuple is (request_id, input_length, beam_width).
-    # C++ computes numContextBlocks itself: ceilDiv(inputLength, tokensPerBlock)
-    # at kvCacheManager.cpp:3682.
-    request_infos = [(req.py_request_id, req.prompt_len, req.py_beam_width)
-                     for req in fitting]
-    try:
-        kv.add_sequence_batch(request_infos, list(fitting))
-    except Exception as e:  # noqa: BLE001 — any C++ crash counts as reproduction
-        pytest.fail(
-            f"REPRODUCED at add_sequence_batch: {e}\n"
-            f"  fit={len(fitting)} expected_fit={EXPECTED_FIT} "
-            f"pool={POOL} blocks/req={BLOCKS_PER_REQ}")
-
-    assert len(fitting) == EXPECTED_FIT, (
-        f"OVER-ADMISSION (hypothesis B confirmed): "
-        f"scheduler admitted {len(fitting)} requests, pool fits only {EXPECTED_FIT}. "
-        f"free_after={kv.num_free_blocks(geom.window_size)}")
-
-
-# ---------------------------------------------------------------------------
-# Scenario B — simultaneous decode boundary crossings
+# Scenario A — simultaneous decode boundary crossings (single-pass proof)
 # ---------------------------------------------------------------------------
 
 def test_decode_boundary_burst_does_not_overflow_pool():
@@ -366,7 +281,7 @@ def test_decode_boundary_burst_does_not_overflow_pool():
 
 
 # ---------------------------------------------------------------------------
-# Scenario C — bielik-shaped steady-state churn
+# Scenario B — bielik-shaped steady-state churn
 # ---------------------------------------------------------------------------
 
 def test_steady_state_admission_churn_bielik_shape():

@@ -2420,6 +2420,9 @@ class PyExecutor:
 
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
+                    # Release blocks before prepare_resources consumes them.
+                    self._release_paused_blocks(
+                        scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
 
                 finished_requests = []
@@ -2700,6 +2703,12 @@ class PyExecutor:
 
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
+                    # Release blocks before prepare_resources consumes them.
+                    # _pause_requests (token fold) stays deferred until after
+                    # _update_requests has applied the previous batch's last
+                    # sample, so this single iteration splits the two halves.
+                    self._release_paused_blocks(
+                        scheduled_batch.paused_requests)
 
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
@@ -4468,7 +4477,25 @@ class PyExecutor:
         for req in requests_to_terminate:
             self._terminate_request(req)
 
+    def _release_paused_blocks(self, requests_to_pause):
+        # Honour the scheduler's schedulingReleaseBlocks promise by handing
+        # the paused requests' physical KV blocks back to the eviction
+        # policy's free list. Must run before this iteration's
+        # prepare_resources, so add_sequence_batch / add_token operate on
+        # a free-block count consistent with the scheduler's view. Safe to
+        # call regardless of whether a request still has unapplied sample
+        # state — touches only KV-manager state, not the request's tokens.
+        for req in requests_to_pause:
+            self.resource_manager.free_resources(req)
+
     def _pause_requests(self, requests_to_pause):
+        # Fold any generated tokens into the prompt and reset the request
+        # to CONTEXT_INIT so the next scheduler pass treats it as a fresh
+        # admission. Must run after all sample state for these requests
+        # has been applied to mTokens — otherwise the fold loses the last
+        # generated token. In overlap mode that means after
+        # _update_requests(previous_batch.sample_state); in non-overlap
+        # the predecessor's tokens are already applied at schedule time.
         for req in requests_to_pause:
             req.pause(self.max_input_len)
 

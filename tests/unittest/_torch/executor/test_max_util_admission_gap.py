@@ -40,14 +40,20 @@ actual `addSequenceBatch` / `addToken` allocation surfaces directly.
 
 Outcomes
 --------
-- If a scenario asserts "No free blocks left" (C++ TLLM_CHECK abort surfacing as a
-  Python exception, or the test's invariant check failing): hypotheses B and/or C
-  are reproduced — the scheduler over-admitted relative to what the C++ allocator
-  can actually serve. Whichever scenario fails localises the trigger.
-- If all scenarios pass: the C++ KVCacheManager + scheduler pair is internally
-  consistent at this geometry, redirecting the search to higher-order effects in
-  the bench path: chunked-prefill non-first-chunk allocation (line 3426 returns 0),
-  VSWA cross-pool contention, draft tokens, or the actual benchmark's request mix.
+Each scenario mirrors the FIXED PyExecutor flow: between scheduler.schedule_request
+and the resource-consuming loop, it explicitly calls remove_sequence on every
+paused request (the unit-level analogue of py_executor.py:_release_paused_blocks)
+and req.pause() (the unit-level analogue of py_executor.py:_pause_requests). On
+top of the fix it asserts no crash plus the accounting invariant on free blocks.
+
+Note: this test does NOT exercise PyExecutor's wiring directly — it bypasses the
+executor loop and drives scheduler+KV manager+request state by hand. A regression
+that reverted py_executor.py:_release_paused_blocks would not be caught here; it
+would surface only in an integration test (e.g. the failing bielik bench itself).
+What this test does guarantee is that the FIX'S APPROACH — release physical KV
+blocks between schedule and allocate — produces a consistent free-block view and
+unblocks add_sequence_batch / add_token. If a scenario fails, the invariant has
+broken at the scheduler-KV-manager level, independent of the executor wiring.
 """
 
 from __future__ import annotations
@@ -329,16 +335,34 @@ def test_decode_boundary_burst_does_not_overflow_pool():
     )
     fitting, _, paused = scheduler.schedule_request(seed_reqs)
 
+    # Mirror what PyExecutor does between schedule_request and prepare_resources
+    # after the v1 fix (py_executor.py:_release_paused_blocks): hand the paused
+    # requests' physical KV blocks back to the eviction policy so the snapshot
+    # the scheduler used during MaxUtilizationPolicy.schedule matches the real
+    # free count by the time add_token runs.
+    for req in paused:
+        kv.remove_sequence(req.py_request_id, req, False)
+
     # Each fitting request gets one add_token (the next decode token crosses TPB).
+    # Pre-fix: scheduler admits 5 against a real free count of 3 -> crash on 4th.
+    # Post-fix: paused 3 blocks released first -> real free = 6, all 5 succeed.
     try:
         for req in fitting:
             kv.add_token(req.py_request_id)
     except Exception as e:  # noqa: BLE001
         pytest.fail(
-            f"REPRODUCED at add_token: {e}\n"
+            f"add_token failed after releasing paused blocks "
+            f"(fix not effective at the unit level): {e}\n"
             f"  fit={len(fitting)} paused={len(paused)} free_margin={FREE_MARGIN}\n"
             f"  fitting_ids={[r.request_id for r in fitting]}\n"
             f"  paused_ids={[r.request_id for r in paused]}")
+
+    # Accounting invariant: 8 seeded - 3 released + 5 boundary allocations = 10 used,
+    # 1 free remaining of pool=11.
+    expected_free = POOL - (NUM_ACTIVE - len(paused)) - len(fitting)
+    assert kv.num_free_blocks(geom.window_size) == expected_free, (
+        f"unexpected free count: {kv.num_free_blocks(geom.window_size)} "
+        f"vs expected {expected_free}")
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +422,15 @@ def test_steady_state_admission_churn_bielik_shape():
             break
 
         fitting, _, paused = scheduler.schedule_request(active)
+
+        # Mirror PyExecutor's v1 pause handling after the fix
+        # (_release_paused_blocks + _pause_requests in py_executor.py):
+        # release physical KV blocks first, then fold the request's
+        # generated tokens into the new prompt + reset to CONTEXT_INIT so
+        # the next scheduler pass re-admits it through add_sequence_batch.
+        for req in paused:
+            kv.remove_sequence(req.py_request_id, req, False)
+            req.pause(geom.max_sequence_length)
 
         # Apply schedule.
         try:

@@ -162,8 +162,11 @@ class _SchedulerKVAdapter:
     def add_token(self, request_id: int):
         return self.impl.add_token(request_id)
 
-    def remove_sequence(self, request_id: int):
-        return self.impl.remove_sequence(request_id)
+    def remove_sequence(self, request_id: int, llm_request,
+                        pin_on_release: bool = False):
+        # nanobind does not propagate C++ default arguments, so all three
+        # positional args must be supplied (kvCacheManager.cpp:451).
+        return self.impl.remove_sequence(request_id, llm_request, pin_on_release)
 
     # === Convenience accessors used by the scenarios below ====================
 
@@ -436,7 +439,7 @@ def test_steady_state_admission_churn_bielik_shape():
         for req in fitting:
             n = num_tokens_seen.get(req.py_request_id, 0)
             if n >= PROMPT_LEN + MAX_NEW:
-                kv.remove_sequence(req.py_request_id)
+                kv.remove_sequence(req.py_request_id, req, False)
                 completed.append(req)
                 num_tokens_seen.pop(req.py_request_id, None)
             else:

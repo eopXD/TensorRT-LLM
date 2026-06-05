@@ -584,6 +584,18 @@ def get_model_yaml_config(model_label: str,
                     'num_nextn_predict_layers': 3,
                     'allow_advanced_sampling': True,
                 },
+	},
+        # GLM-5 fp8 EP8 KV-cache-size regression diagnostic: disable the
+        # autotuner to test whether autotuner profiling memory (suspected
+        # MoE-autotune-in-DEP change, PR #13667) is inflating the estimation
+        # peak and shrinking the estimated KV cache size. Diagnostic only --
+        # do not merge.
+        {
+            'patterns': [
+                'glm_5_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:2000,500-ep:8-gpus:8'
+            ],
+            'config': {
+                'enable_autotuner': False,
             }
         },
     ]

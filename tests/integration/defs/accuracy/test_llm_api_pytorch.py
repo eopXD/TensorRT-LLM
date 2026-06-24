@@ -5052,13 +5052,22 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytest.param("TRITON", marks=[skip_no_hopper, skip_no_mxfp4_swizzle])
     ],
                              ids=["cutlass", "trtllm", "triton"])
-    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
-        (True, True),
-    ])
+    @pytest.mark.parametrize(
+        "cuda_graph,overlap_scheduler,enable_block_reuse",
+        [
+            (True, True, True),
+            # §2c minimal-baseline anchor cell: reuse off, no CUDA graph, no
+            # overlap. Failure here pins blame on backend coupling, not
+            # feature interactions. Cf. docs/source/
+            # kv_cache_manager_v2_bringup/model_bringup.html §2c.
+            (False, False, False),
+        ],
+        ids=["cuda_graph-overlap_scheduler", "baseline_no_reuse"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
-                     overlap_scheduler, mocker, v2_kv_cache):
+                     overlap_scheduler, enable_block_reuse, mocker,
+                     v2_kv_cache):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -5069,6 +5078,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype,
+                                        enable_block_reuse=enable_block_reuse,
                                         use_kv_cache_manager_v2=v2_kv_cache)
 
         llm = LLM(self.MODEL_PATH,
@@ -5079,6 +5089,41 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   max_batch_size=720,
                   **pytorch_config,
                   moe_config=MoeConfig(backend=moe_backend))
+
+        with llm:
+            model_name = "GPT-OSS/20B-MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_w4_1gpu_flashinfer(self, mocker, v2_kv_cache):
+        # §2c PyTorch x FlashInfer x (V1, V2) cell. FlashInfer reads
+        # ``kv_cache_manager.blocks_in_primary_pool`` directly
+        # (flashinfer.py:237); this test is the load-bearing V2-readiness
+        # check for that attribute. Cf.
+        # docs/source/kv_cache_manager_v2_bringup/model_bringup.html §1d
+        # backend-coupling contract + §2c matrix. Minimal baseline shape:
+        # reuse off, no CUDA graph, no overlap, no spec dec.
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=720,
+                  attn_backend="FLASHINFER",
+                  disable_overlap_scheduler=True,
+                  cuda_graph_config=None,
+                  moe_config=MoeConfig(backend="CUTLASS"))
 
         with llm:
             model_name = "GPT-OSS/20B-MXFP4"

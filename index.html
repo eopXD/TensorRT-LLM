@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KV Cache Manager V2 — Bring-up Coverage Map</title>
+<style>
+  :root{--ok:#1a7f37;--skip:#9a6700;--plan:#57606a;--block:#cf222e;--fall:#8250df;--bg:#0d1117;--card:#161b22;--line:#30363d;--fg:#e6edf3;--mut:#8b949e;}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;}
+  .wrap{max-width:1100px;margin:0 auto;padding:32px 20px 80px;}
+  h1{font-size:26px;margin:0 0 4px;}
+  h2{font-size:20px;margin:38px 0 10px;border-bottom:1px solid var(--line);padding-bottom:6px;}
+  h3{font-size:16px;margin:24px 0 8px;color:var(--mut);}
+  .sub{color:var(--mut);margin:0 0 8px;}
+  code{background:var(--card);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12.5px;}
+  a{color:#2f81f7;}
+  table{width:100%;border-collapse:collapse;margin:10px 0 18px;font-size:13.5px;}
+  th,td{border:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top;}
+  th{background:var(--card);}
+  tr:nth-child(even) td{background:#11161d;}
+  .badge{display:inline-block;border-radius:11px;padding:1px 9px;font-size:11.5px;font-weight:600;color:#fff;white-space:nowrap;}
+  .b-ok{background:var(--ok)} .b-skip{background:var(--skip)} .b-plan{background:var(--plan)} .b-block{background:var(--block)} .b-fall{background:var(--fall)}
+  .legend span{margin-right:14px;}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin:14px 0;}
+  .kpi{font-size:22px;font-weight:700;}
+  .muted{color:var(--mut);font-size:12.5px;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:14px 0;}
+  footer{margin-top:48px;color:var(--mut);font-size:12px;border-top:1px solid var(--line);padding-top:14px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>KV Cache Manager V2 — Model Bring-up Coverage Map</h1>
+  <p class="sub">Branch <code>kv-cache-manager-v2-bringup</code> · tip <code>da0a878382</code> · generated 2026-06-25 · GPT-OSS-120B on B200 (sm100), wheel <code>1.3.0rc20</code></p>
+  <p class="sub">Plan source: <code>docs/source/kv_cache_manager_v2_bringup/model_bringup.html</code> (commit <code>a022d0fe41</code>). This page tracks the drafted coverage map and what has actually been executed.</p>
+
+  <div class="legend card">
+    <span class="badge b-ok">DONE</span> executed &amp; passed &nbsp;
+    <span class="badge b-skip">SKIP</span> intentionally skipped &nbsp;
+    <span class="badge b-plan">PLANNED</span> drafted, not yet run &nbsp;
+    <span class="badge b-block">BLOCKED</span> can't run as designed &nbsp;
+    <span class="badge b-fall">FALLBACK</span> V2→V1 by design
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="kpi" style="color:var(--ok)">V2 91.05</div><div class="muted">GSM8K (flex-extract) — §2c baseline anchor</div></div>
+    <div class="card"><div class="kpi">V1 90.37</div><div class="muted">GSM8K — parity reference (thr 81.80)</div></div>
+    <div class="card"><div class="kpi" style="color:var(--ok)">8 / 10</div><div class="muted">A1 contract cases pass (2 design-skips)</div></div>
+    <div class="card"><div class="kpi">aggregated</div><div class="muted">scope this pass (disagg deferred)</div></div>
+  </div>
+
+  <!-- ================= SECTION 1: DRAFTED MAP ================= -->
+  <h2>1 · Drafted test coverage map (the plan)</h2>
+
+  <h3>Phase 1 · GPT-OSS-120B · §2c backend configuration (Execution × Attention × {V1,V2})</h3>
+  <table>
+    <tr><th>Execution</th><th>Attention backend</th><th>Status</th><th>Note</th></tr>
+    <tr><td>PyTorch</td><td>TRTLLM</td><td><span class="badge b-ok">DONE</span></td><td>Anchor cell — <code>test_w4_1gpu</code> baseline_no_reuse</td></tr>
+    <tr><td>PyTorch</td><td>FlashInfer</td><td><span class="badge b-block">BLOCKED</span></td><td>GPT-OSS mandates TRTLLM (attention sinks, <code>modeling_gpt_oss.py:85</code>). Contract covered at unit level (A1). Integration needs a FlashInfer-capable model → backlog.</td></tr>
+    <tr><td>PyTorch</td><td>Vanilla</td><td><span class="badge b-ok">DONE</span></td><td>Covered at unit level by A1</td></tr>
+    <tr><td>PyTorch</td><td>TRTLLM-gen</td><td><span class="badge b-skip">SKIP</span></td><td>Internal dispatch from TRTLLM on Blackwell; A1 skips, covered transitively</td></tr>
+    <tr><td>PyTorch</td><td>FlashAttention</td><td><span class="badge b-skip">SKIP</span></td><td>Not a top-level attn_backend; A1 skips</td></tr>
+    <tr><td>PyTorch</td><td>Triton (prefill)</td><td><span class="badge b-plan">PLANNED</span></td><td>Not run this pass</td></tr>
+    <tr><td>AutoDeploy</td><td>TRTLLM</td><td><span class="badge b-plan">PLANNED</span></td><td>Not run this pass</td></tr>
+    <tr><td>TensorRT (legacy)</td><td>—</td><td><span class="badge b-plan">N/A</span></td><td>Out of scope; V2 flag silently ignored</td></tr>
+  </table>
+  <p class="muted">Plus the §2c cross-backend unit floor — <code>test_kv_cache_manager_backend_contract.py</code> — <span class="badge b-ok">DONE</span> (A1).</p>
+
+  <h3>Phase 1 · §2d inference configuration (fix PyTorch+TRTLLM; each ×{V1,V2})</h3>
+  <table>
+    <tr><th>#</th><th>Feature</th><th>Status</th></tr>
+    <tr><td>I-0</td><td>Baseline (reuse off, no graph, no overlap)</td><td><span class="badge b-ok">DONE</span> (A2, full GSM8K parity)</td></tr>
+    <tr><td>I-1</td><td>Cross-request + partial block reuse</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>I-2</td><td>Sliding window + attention sinks</td><td><span class="badge b-plan">PLANNED</span> — not stressed (no window override)</td></tr>
+    <tr><td>I-3</td><td>KV dtype FP8 / NVFP4</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>I-4</td><td>CUDA graph + overlap scheduler</td><td><span class="badge b-plan">PLANNED</span> — feature-rich cell exists, not run</td></tr>
+    <tr><td>I-5</td><td>Chunked prefill</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>I-6</td><td>Host offloading</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>I-7</td><td>MTP / Eagle3 (one-model)</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>I-8</td><td>LoRA</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>I-9</td><td>Capacity stress (eviction; dynamic pool)</td><td><span class="badge b-plan">PLANNED</span> — <b>dynamic-pool-adjust gap</b></td></tr>
+    <tr><td>I-10</td><td>Suspend / resume (V2-only; dynamic pool)</td><td><span class="badge b-plan">PLANNED</span> — <b>dynamic-pool-adjust gap</b></td></tr>
+    <tr><td>I-11</td><td>NVFP4 + tokens_per_block_override</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+  </table>
+
+  <h3>Phase 1 · §2e deployment configuration (B200)</h3>
+  <table>
+    <tr><th>#</th><th>Feature</th><th>Status</th></tr>
+    <tr><td>D-0</td><td>Tensor parallel (TP2/TP4)</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>D-1</td><td>Pipeline parallel (PP2)</td><td><span class="badge b-plan">PLANNED</span> — V2 xfail (scheduler bug)</td></tr>
+    <tr><td>D-2</td><td>Expert parallel (EP8)</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>D-3</td><td>Attention-DP</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>D-4</td><td>Disagg fallback (request V2 → assert V1)</td><td><span class="badge b-fall">FALLBACK</span> not run (deferred)</td></tr>
+    <tr><td>D-5</td><td>Disagg on V2 (proper)</td><td><span class="badge b-block">BACKLOG</span> V2 unsupported in disagg</td></tr>
+    <tr><td>D-6</td><td>Multi-node B200</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+  </table>
+
+  <h3>Phases 2 &amp; 3 (later)</h3>
+  <p class="muted">Phase 2 multimodal (Qwen2.5-VL, Mllama, LLaVA-1.6, Llama-4, Gemma3-MM, Phi-4-MM). Phase 3 frontier (Gemma4 hybrid [V2-mandatory], DeepSeek-V3/V3.2 MLA+DSA, Nemotron-H/Granite/Jamba hybrids, Qwen3-MoE). All <span class="badge b-plan">PLANNED</span>.</p>
+
+  <!-- ================= SECTION 2: DONE + COMMITS ================= -->
+  <h2>2 · Test coverage completed (with the commit that adds it)</h2>
+  <table>
+    <tr><th>Cell</th><th>Test (node IDs)</th><th>Mode</th><th>Result</th><th>Added by commit</th><th>Log (computelab scratch)</th></tr>
+    <tr>
+      <td><b>A1</b><br>§2c unit floor</td>
+      <td><code>test_kv_cache_manager_backend_contract.py::test_backend_manager_contract</code><br>×{v1,v2}×{TRTLLM,FLASHINFER,VANILLA}=6; TRTLLM_GEN/FLASHATTENTION=4 skip</td>
+      <td>unit</td>
+      <td><span class="badge b-ok">PASS</span> 6 pass / 4 skip</td>
+      <td><code>9ffa69172a</code> (new file)</td>
+      <td><code>tekit/.kvcv2-test-A1.log</code></td>
+    </tr>
+    <tr>
+      <td><b>A2</b><br>§2c anchor / §2d I-0</td>
+      <td><code>TestGPTOSS::test_w4_1gpu[v1_kv_cache-baseline_no_reuse-cutlass-auto]</code><br><code>TestGPTOSS::test_w4_1gpu[v2_kv_cache-baseline_no_reuse-cutlass-auto]</code></td>
+      <td>smoke</td>
+      <td><span class="badge b-ok">PASS</span></td>
+      <td><code>9ffa69172a</code> (baseline cell + enable_block_reuse param)</td>
+      <td><code>tekit/.kvcv2-test-smoke.log</code></td>
+    </tr>
+    <tr>
+      <td><b>A2</b> (full)</td>
+      <td>same two node IDs, full GSM8K (1319, real threshold)</td>
+      <td>full</td>
+      <td><span class="badge b-ok">PASS</span><br>V2 <b>91.05</b> / V1 <b>90.37</b> (thr 81.80)</td>
+      <td><code>9ffa69172a</code></td>
+      <td><code>tekit/.kvcv2-test-a2full.log</code></td>
+    </tr>
+    <tr>
+      <td><b>A3</b><br>§2c FlashInfer cell</td>
+      <td><code>TestGPTOSS::test_w4_1gpu_flashinfer[v1_kv_cache]</code><br><code>TestGPTOSS::test_w4_1gpu_flashinfer[v2_kv_cache]</code></td>
+      <td>smoke</td>
+      <td><span class="badge b-block">FAIL</span> → <span class="badge b-skip">SKIP</span><br>GPT-OSS is TRTLLM-only</td>
+      <td>added <code>9ffa69172a</code>; skipped <code>da0a878382</code></td>
+      <td><code>tekit/.kvcv2-test-smoke.log</code></td>
+    </tr>
+  </table>
+
+  <h3>Commit ledger</h3>
+  <table>
+    <tr><th>Commit</th><th>Adds</th></tr>
+    <tr><td><code>a022d0fe41</code></td><td>[doc] KV cache manager v2 model bring-up notes (the plan)</td></tr>
+    <tr><td><code>9ffa69172a</code></td><td>[test] §2c aggregated bring-up tests — A1 unit floor, A2 baseline anchor, A3 flashinfer cell, test-list ID refresh</td></tr>
+    <tr><td><code>da0a878382</code></td><td>[test] skip GPT-OSS test_w4_1gpu_flashinfer (TRTLLM-only)</td></tr>
+  </table>
+
+  <h3>Test configuration notes</h3>
+  <ul class="muted">
+    <li><b>Attention window:</b> <code>max_attention_window=None</code> on all runs — no override; GPT-OSS native attention pattern used. Sliding-window edge behavior (I-2) not explicitly stressed.</li>
+    <li><b>Dynamic memory-pool adjustment:</b> <code>enable_kv_pool_rebalance=False</code> on all runs; V2 <code>adjust()</code>/<code>need_adjustment</code> online rebalancing <b>not exercised</b> (would require I-9/I-10).</li>
+    <li><b>mypyc mode:</b> release (default); <code>TLLM_KV_CACHE_MANAGER_V2_DEBUG=1</code> not yet run.</li>
+    <li><b>Disaggregated:</b> deferred — V2 hard-falls-back to V1 (doc §1c/§2e D-4).</li>
+  </ul>
+
+  <footer>
+    Generated from the bring-up run on 2026-06-25. Logs on computelab scratch under <code>/home/scratch.yuehtingc_gpu/</code>. Plan: <code>docs/source/kv_cache_manager_v2_bringup/model_bringup.html</code>.
+  </footer>
+</div>
+</body>
+</html>

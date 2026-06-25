@@ -5096,16 +5096,25 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.extra_evaluator_kwargs)
 
+    @pytest.mark.skip(
+        reason="GPT-OSS requires attn_backend='TRTLLM' (attention sinks, see "
+        "tensorrt_llm/_torch/models/modeling_gpt_oss.py:85) and is rejected at "
+        "model init on FlashInfer, so this cell cannot run on GPT-OSS for "
+        "either V1 or V2. The V2 blocks_in_primary_pool FlashInfer read-path "
+        "contract is already covered at unit level by tests/unittest/_torch/"
+        "attention/test_kv_cache_manager_backend_contract.py. Integration-level "
+        "FlashInfer x V2 coverage needs a FlashInfer-capable model "
+        "(e.g. Llama-3.1-8B) and is tracked as §2c backlog.")
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_w4_1gpu_flashinfer(self, mocker, v2_kv_cache):
-        # §2c PyTorch x FlashInfer x (V1, V2) cell. FlashInfer reads
-        # ``kv_cache_manager.blocks_in_primary_pool`` directly
-        # (flashinfer.py:237); this test is the load-bearing V2-readiness
-        # check for that attribute. Cf.
-        # docs/source/kv_cache_manager_v2_bringup/model_bringup.html §1d
-        # backend-coupling contract + §2c matrix. Minimal baseline shape:
-        # reuse off, no CUDA graph, no overlap, no spec dec.
+        # §2c PyTorch x FlashInfer x (V1, V2) cell — SKIPPED for GPT-OSS.
+        # GPT-OSS mandates TRTLLM attention (attention sinks), so FlashInfer is
+        # rejected at model init (verified empirically on B200, 2026-06-24).
+        # FlashInfer reads ``kv_cache_manager.blocks_in_primary_pool`` directly
+        # (flashinfer.py:237); the V2-readiness of that attribute is verified by
+        # the unit-level backend-contract test. Cf.
+        # docs/source/kv_cache_manager_v2_bringup/model_bringup.html §1d/§2c.
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})

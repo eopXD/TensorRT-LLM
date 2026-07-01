@@ -71,7 +71,7 @@
   <table>
     <tr><th>#</th><th>Feature</th><th>Status</th></tr>
     <tr><td>I-0</td><td>Baseline (reuse off, no graph, no overlap)</td><td><span class="badge b-ok">DONE</span> V2 90.22 vs V1 90.52 GSM8K (2026-07-01, thr 81.8)</td></tr>
-    <tr><td>I-1</td><td>Cross-request + partial block reuse</td><td><span class="badge b-ok">V1 DONE</span> <span class="badge b-fall">V2 obs-gap</span> V2 reused=0 via <code>get_stats</code> while V1 reports reuse; xfail pending #15633</td></tr>
+    <tr><td>I-1</td><td>Cross-request + partial block reuse</td><td><span class="badge b-ok">DONE</span> V1+V2 reuse counted (<code>reusedBlocks</code>/<code>iterReusedBlocks &gt; 0</code>). V2 initial 0 was <code>enable_stats</code> not wired in the V2 factory (radix-tree reuse was real but uncounted); fixed by wiring <code>enable_iter_perf_stats</code> (commit ba390c84af)</td></tr>
     <tr><td>I-2</td><td>Sliding window + attention sinks</td><td><span class="badge b-plan">PLANNED</span> — not stressed (no window override)</td></tr>
     <tr><td>I-3</td><td>KV dtype FP8 / NVFP4</td><td><span class="badge b-ok">fp8 DONE</span> V2 91.05 vs V1 90.67 GSM8K; <span class="badge b-skip">nvfp4 xfail</span> missing TRTLLM-GEN decode kernel for GPT-OSS head_dim=64 (V1+V2, not a V2 bug)</td></tr>
     <tr><td>I-4</td><td>CUDA graph + overlap scheduler</td><td><span class="badge b-ok">DONE</span> V2 90.52 vs V1 89.92 GSM8K (2026-07-01)</td></tr>

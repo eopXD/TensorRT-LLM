@@ -70,11 +70,11 @@
   <h3>Phase 1 · §2d inference configuration (fix PyTorch+TRTLLM; each ×{V1,V2})</h3>
   <table>
     <tr><th>#</th><th>Feature</th><th>Status</th></tr>
-    <tr><td>I-0</td><td>Baseline (reuse off, no graph, no overlap)</td><td><span class="badge b-ok">DONE</span> (A2, full GSM8K parity)</td></tr>
-    <tr><td>I-1</td><td>Cross-request + partial block reuse</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>I-0</td><td>Baseline (reuse off, no graph, no overlap)</td><td><span class="badge b-ok">DONE</span> V2 90.22 vs V1 90.52 GSM8K (2026-07-01, thr 81.8)</td></tr>
+    <tr><td>I-1</td><td>Cross-request + partial block reuse</td><td><span class="badge b-ok">V1 DONE</span> <span class="badge b-fall">V2 obs-gap</span> V2 reused=0 via <code>get_stats</code> while V1 reports reuse; xfail pending #15633</td></tr>
     <tr><td>I-2</td><td>Sliding window + attention sinks</td><td><span class="badge b-plan">PLANNED</span> — not stressed (no window override)</td></tr>
-    <tr><td>I-3</td><td>KV dtype FP8 / NVFP4</td><td><span class="badge b-plan">PLANNED</span></td></tr>
-    <tr><td>I-4</td><td>CUDA graph + overlap scheduler</td><td><span class="badge b-plan">PLANNED</span> — feature-rich cell exists, not run</td></tr>
+    <tr><td>I-3</td><td>KV dtype FP8 / NVFP4</td><td><span class="badge b-ok">fp8 DONE</span> V2 91.05 vs V1 90.67 GSM8K; <span class="badge b-skip">nvfp4 xfail</span> missing TRTLLM-GEN decode kernel for GPT-OSS head_dim=64 (V1+V2, not a V2 bug)</td></tr>
+    <tr><td>I-4</td><td>CUDA graph + overlap scheduler</td><td><span class="badge b-ok">DONE</span> V2 90.52 vs V1 89.92 GSM8K (2026-07-01)</td></tr>
     <tr><td>I-5</td><td>Chunked prefill</td><td><span class="badge b-plan">PLANNED</span></td></tr>
     <tr><td>I-6</td><td>Host offloading</td><td><span class="badge b-plan">PLANNED</span></td></tr>
     <tr><td>I-7</td><td>MTP / Eagle3 (one-model)</td><td><span class="badge b-plan">PLANNED</span></td></tr>

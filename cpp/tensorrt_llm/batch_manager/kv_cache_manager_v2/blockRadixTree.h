@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/eventSink.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
@@ -26,6 +27,7 @@
 #include <array>
 #include <cstdint>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -113,6 +115,7 @@ struct NodeBase
 
     BlockKey key;
     std::unordered_map<BlockKey, SharedPtr<Block>> next;
+    EventSink* eventSink;
 
     virtual ~NodeBase();
 
@@ -125,8 +128,9 @@ struct NodeBase
     virtual int tokensPerBlock() const noexcept = 0;
 
 protected:
-    NodeBase(BlockKey k)
+    NodeBase(BlockKey k, EventSink* sink)
         : key(k)
+        , eventSink(sink)
     {
     }
 };
@@ -226,7 +230,8 @@ private:
 class BlockRadixTree
 {
 public:
-    BlockRadixTree(LifeCycleRegistry const& lifeCycles, int tokensPerBlock);
+    BlockRadixTree(
+        LifeCycleRegistry const& lifeCycles, int tokensPerBlock, std::shared_ptr<EventSink> eventSink = nullptr);
     ~BlockRadixTree();
 
     // Get (or create) the RootBlock for the given reuse scope.
@@ -265,6 +270,11 @@ public:
         return mLifeCycles;
     }
 
+    std::shared_ptr<EventSink> const& eventSink() const noexcept
+    {
+        return mEventSink;
+    }
+
     // Read-only access to the root map (used by nanobind introspection).
     std::unordered_map<BlockKey, SharedPtr<RootBlock>> const& roots() const noexcept
     {
@@ -289,6 +299,7 @@ private:
 
     LifeCycleRegistry const& mLifeCycles;
     int mTokensPerBlock;
+    std::shared_ptr<EventSink> mEventSink;
 
     std::unordered_map<BlockKey, SharedPtr<RootBlock>> mRoots;
     mutable std::vector<BlockKey> mPendingRootErases;

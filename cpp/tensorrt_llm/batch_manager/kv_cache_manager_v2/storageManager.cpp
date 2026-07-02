@@ -113,8 +113,10 @@ TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(Storage
 
 StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
     std::optional<SwaScratchReuseConfig> swaScratchReuse, std::optional<BatchDesc> const& typicalBatch,
-    std::vector<BatchDesc> const& constraints, std::optional<std::vector<float>> const& initialPoolRatio)
+    std::vector<BatchDesc> const& constraints, std::optional<std::vector<float>> const& initialPoolRatio,
+    std::shared_ptr<EventSink> eventSink)
     : mLifeCycles(lifeCycles)
+    , mEventSink(std::move(eventSink))
     , mStorageConfig(config)
     , mSwaScratchReuse(std::move(swaScratchReuse))
 {
@@ -658,6 +660,9 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
         {
             migrationRecorder(srcPages, dstSlots, srcLevel, dstLevel);
         }
+        std::set<std::pair<std::string, int>> emittedCacheLevelUpdates;
+        bool const emitCacheLevelUpdates
+            = updateSrc && !defrag && srcLevel != dstLevel && static_cast<bool>(mEventSink);
         for (std::size_t i = 0; i < srcPages.size(); ++i)
         {
             dstSlots.at(i).readyEvent = finishEvent;
@@ -678,6 +683,19 @@ void StorageManager::_batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, 
                 // Transfer dst slot ownership to the page.
                 srcPages.at(i)->setSlot(dstSlots.at(i));
                 srcPages.at(i)->cacheLevel = dstLevel;
+                if (emitCacheLevelUpdates && srcPages.at(i)->isCommitted())
+                {
+                    auto const& page = static_cast<CommittedPage const&>(*srcPages.at(i));
+                    Block const* block = page.block;
+                    std::string const blockKey = block
+                        ? std::string(reinterpret_cast<char const*>(block->key.data()), block->key.size())
+                        : std::string{};
+                    if (block && !block->isOrphan()
+                        && emittedCacheLevelUpdates.insert({blockKey, page.lifeCycle.value()}).second)
+                    {
+                        mEventSink->addCacheLevelUpdated(block->key, srcLevel, dstLevel, page.lifeCycle);
+                    }
+                }
                 if (wasScheduled)
                     scheduleForEviction(*srcPages.at(i));
             }

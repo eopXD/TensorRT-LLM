@@ -20,6 +20,7 @@
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
+#include "kv_cache_manager_v2/eventSink.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/movingAverage.h"
@@ -116,7 +117,7 @@ struct PageIndexConverter
 class KvCacheManager : public std::enable_shared_from_this<KvCacheManager>
 {
 public:
-    explicit KvCacheManager(KVCacheManagerConfig const& config);
+    explicit KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink = nullptr);
     ~KvCacheManager();
 
     KvCacheManager(KvCacheManager const&) = delete;
@@ -252,6 +253,11 @@ public:
         return *mRadixTree;
     }
 
+    std::shared_ptr<EventSink> const& eventSink() const noexcept
+    {
+        return mEventSink;
+    }
+
     // Called by KvCache constructor/destructor.
     void registerKvCache(KvCache* kvc);
     void unregisterKvCache(KvCache* kvc);
@@ -300,6 +306,7 @@ private:
 
     KVCacheManagerConfig mConfig;
     LifeCycleRegistry mLifeCycles;
+    std::shared_ptr<EventSink> mEventSink;
     std::shared_ptr<BlockRadixTree> mRadixTree;
     std::shared_ptr<StorageManager> mStorage;
 

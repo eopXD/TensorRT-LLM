@@ -101,20 +101,21 @@ std::vector<int> PageIndexConverter::operator()(int baseIndex) const
 // KvCacheManager
 // ---------------------------------------------------------------------------
 
-KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config)
+KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_ptr<EventSink> eventSink)
     : mConfig(config)
     , mLifeCycles(config)
+    , mEventSink(std::move(eventSink))
     , mAvgReusedLength(0.9999)
     , mAvgSqrCapacity(0.9999)
     , mAvgSqrHistoryLength(0.9999)
 {
     mConfig.validate();
 
-    mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock);
+    mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock, mEventSink);
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
-        mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio);
+        mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio, mEventSink);
 
     mTargetRatioListGpu = _currentGpuRatio();
     mTargetRatioListOther = _currentOtherRatios();

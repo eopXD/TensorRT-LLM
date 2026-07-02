@@ -20,21 +20,25 @@
 #include "kv_cache_manager_v2/blockRadixTree.h"
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
+#include "kv_cache_manager_v2/eventManager.h"
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/introspection.h"
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
+#include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <memory>
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/function.h>
+#include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
@@ -45,6 +49,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -153,10 +158,10 @@ static nb::tuple reuseScopeTuple(kv::ReuseScope const& self)
     return nb::make_tuple(optionalIntToObject(self.loraId), optionalIntToObject(self.salt));
 }
 
-static nb::list committedTokensList(kv::KvCache const& self)
+static nb::list tokenList(std::vector<kv::TokenIdExt> const& tokens)
 {
     nb::list result;
-    for (auto const& tok : self.committedTokens())
+    for (auto const& tok : tokens)
     {
         if (auto* id = std::get_if<kv::TokenId>(&tok))
         {
@@ -169,6 +174,192 @@ static nb::list committedTokensList(kv::KvCache const& self)
         }
     }
     return result;
+}
+
+static nb::list committedTokensList(kv::KvCache const& self)
+{
+    return tokenList(self.committedTokens());
+}
+
+static nb::bytes digestBytes(kv::Digest const& digest)
+{
+    return nb::bytes(reinterpret_cast<char const*>(digest.data()), digest.size());
+}
+
+static kv::Digest castDigest(nb::handle value)
+{
+    if (!nb::isinstance<nb::bytes>(value))
+    {
+        throw std::invalid_argument("block hash must be bytes");
+    }
+    auto bytes = nb::cast<nb::bytes>(value);
+    if (nb::len(bytes) != kv::kDIGEST_LEN)
+    {
+        throw std::invalid_argument("block hash bytes must have length kDIGEST_LEN");
+    }
+    kv::Digest digest;
+    std::memcpy(digest.data(), bytes.c_str(), digest.size());
+    return digest;
+}
+
+static bool hasDigestSize(nb::handle value)
+{
+    return nb::len(value) == kv::kDIGEST_LEN;
+}
+
+static kv::EventBlockHash castEventBlockHash(nb::handle value)
+{
+    if (PyLong_Check(value.ptr()))
+    {
+        return nb::cast<uint64_t>(value);
+    }
+    return nb::cast<std::string>(value);
+}
+
+static std::optional<kv::EventBlockHash> castOptionalEventBlockHash(nb::handle value)
+{
+    return value.is_none() ? std::nullopt : std::optional<kv::EventBlockHash>{castEventBlockHash(value)};
+}
+
+static std::vector<kv::KVCacheStoredBlockData> castStoredBlocks(nb::handle values)
+{
+    std::vector<kv::KVCacheStoredBlockData> result;
+    for (nb::handle value : nb::cast<nb::iterable>(values))
+    {
+        result.push_back(nb::cast<kv::KVCacheStoredBlockData>(value));
+    }
+    return result;
+}
+
+static std::vector<kv::MmKey> castMmKeys(nb::handle values)
+{
+    std::vector<kv::MmKey> result;
+    for (nb::handle value : nb::cast<nb::iterable>(values))
+    {
+        nb::tuple tuple = nb::cast<nb::tuple>(value);
+        if (tuple.size() != 2 && tuple.size() != 3)
+        {
+            throw std::invalid_argument("mm_key must have two or three entries");
+        }
+        std::optional<std::string> uuid;
+        if (tuple.size() == 3 && !tuple[2].is_none())
+        {
+            uuid = nb::cast<std::string>(tuple[2]);
+        }
+        if (!nb::isinstance<nb::bytes>(tuple[0]))
+        {
+            throw std::invalid_argument("mm_key hash must be bytes");
+        }
+        auto hash = nb::cast<nb::bytes>(tuple[0]);
+        result.push_back(kv::MmKey{std::string(hash.c_str(), static_cast<size_t>(nb::len(hash))),
+            nb::cast<int>(tuple[1]), std::move(uuid), tuple.size() == 3});
+    }
+    return result;
+}
+
+static nb::list castMmKeys(kv::KVCacheStoredBlockData const& data)
+{
+    nb::list result;
+    for (auto const& mmKey : data.mmKeys)
+    {
+        auto hash = nb::bytes(mmKey.hash.data(), mmKey.hash.size());
+        if (mmKey.hasUuidField)
+        {
+            result.append(nb::make_tuple(std::move(hash), mmKey.startOffset, mmKey.uuid));
+        }
+        else
+        {
+            result.append(nb::make_tuple(std::move(hash), mmKey.startOffset));
+        }
+    }
+    return result;
+}
+
+static nb::object castEventData(kv::KVCacheEventData const& data)
+{
+    return std::visit([](auto const& concreteData) { return nb::cast(concreteData); }, data);
+}
+
+static kv::KVCacheEventData castEventData(nb::handle data)
+{
+    if (nb::isinstance<kv::KVCacheCreatedData>(data))
+    {
+        return nb::cast<kv::KVCacheCreatedData>(data);
+    }
+    if (nb::isinstance<kv::KVCacheStoredData>(data))
+    {
+        return nb::cast<kv::KVCacheStoredData>(data);
+    }
+    if (nb::isinstance<kv::KVCacheRemovedData>(data))
+    {
+        return nb::cast<kv::KVCacheRemovedData>(data);
+    }
+    if (nb::isinstance<kv::KVCacheUpdatedData>(data))
+    {
+        return nb::cast<kv::KVCacheUpdatedData>(data);
+    }
+    throw std::invalid_argument("Unsupported KV cache event data type");
+}
+
+static std::string pythonHandleRepr(nb::handle value)
+{
+    nb::object result = nb::steal<nb::object>(PyObject_Repr(value.ptr()));
+    if (!result)
+    {
+        throw nb::python_error();
+    }
+    return nb::cast<std::string>(result);
+}
+
+template <typename T>
+static std::string pythonRepr(T const& value)
+{
+    return pythonHandleRepr(nb::cast(value));
+}
+
+class PythonAttentionDpGather
+{
+public:
+    explicit PythonAttentionDpGather(nb::handle callback)
+        : mCallback(callback.ptr())
+    {
+        Py_INCREF(mCallback);
+    }
+
+    ~PythonAttentionDpGather()
+    {
+        if (Py_IsInitialized())
+        {
+            nb::gil_scoped_acquire acquire;
+            Py_DECREF(mCallback);
+        }
+    }
+
+    PythonAttentionDpGather(PythonAttentionDpGather const&) = delete;
+    PythonAttentionDpGather& operator=(PythonAttentionDpGather const&) = delete;
+
+    std::vector<std::vector<kv::KVCacheEvent>> operator()(std::vector<kv::KVCacheEvent> const& events) const
+    {
+        nb::gil_scoped_acquire acquire;
+        return nb::cast<std::vector<std::vector<kv::KVCacheEvent>>>(nb::borrow<nb::object>(mCallback)(events));
+    }
+
+private:
+    PyObject* mCallback;
+};
+
+static kv::EventManager::AttentionDpGatherFn castAttentionDpGather(nb::handle callback)
+{
+    if (callback.is_none())
+    {
+        return {};
+    }
+    if (!PyCallable_Check(callback.ptr()))
+    {
+        throw std::invalid_argument("attention_dp_gather must be callable");
+    }
+    auto gather = std::make_shared<PythonAttentionDpGather>(callback);
+    return [gather = std::move(gather)](std::vector<kv::KVCacheEvent> const& events) { return (*gather)(events); };
 }
 
 static nb::object castStatsDelta(kv::KVCacheStatsDelta const& stats)
@@ -316,6 +507,283 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                              .value("ACTIVE", kv::KvCache::Status::ACTIVE)
                              .value("SUSPENDED", kv::KvCache::Status::SUSPENDED)
                              .value("CLOSED", kv::KvCache::Status::CLOSED);
+
+    // ---- KV cache events ----------------------------------------------------
+    nb::class_<kv::UniqueToken>(m, "UniqueToken")
+        .def(nb::init<kv::EventTokenId, int64_t>(), nb::arg("token_id"), nb::arg("token_extra_id") = 0)
+        .def_ro("token_id", &kv::UniqueToken::tokenId)
+        .def_ro("token_extra_id", &kv::UniqueToken::tokenExtraId)
+        .def("__eq__", &kv::UniqueToken::operator==, nb::arg("other"))
+        .def("__repr__",
+            [](kv::UniqueToken const& self)
+            {
+                return "UniqueToken(token_id=" + pythonRepr(self.tokenId)
+                    + ", token_extra_id=" + pythonRepr(self.tokenExtraId) + ")";
+            })
+        .def("__reduce__",
+            [](kv::UniqueToken const& self)
+            { return nb::make_tuple(nb::type<kv::UniqueToken>(), nb::make_tuple(self.tokenId, self.tokenExtraId)); });
+
+    nb::class_<kv::KVCacheCreatedData>(m, "KVCacheCreatedData")
+        .def(nb::init<std::vector<int>>(), nb::arg("num_blocks_per_cache_level"))
+        .def_ro("num_blocks_per_cache_level", &kv::KVCacheCreatedData::numBlocksPerCacheLevel)
+        .def("__eq__", &kv::KVCacheCreatedData::operator==, nb::arg("other"))
+        .def("__repr__",
+            [](kv::KVCacheCreatedData const& self) {
+                return "KVCacheCreatedData(num_blocks_per_cache_level=" + pythonRepr(self.numBlocksPerCacheLevel) + ")";
+            })
+        .def("__reduce__",
+            [](kv::KVCacheCreatedData const& self) {
+                return nb::make_tuple(nb::type<kv::KVCacheCreatedData>(), nb::make_tuple(self.numBlocksPerCacheLevel));
+            });
+
+    nb::class_<kv::KVCacheStoredBlockData>(m, "KVCacheStoredBlockData")
+        .def(
+            "__init__",
+            [](kv::KVCacheStoredBlockData* self, kv::EventBlockHash blockHash, std::vector<kv::UniqueToken> tokens,
+                int cacheLevel, int priority, nb::handle mmKeys, std::optional<std::string> cacheSalt)
+            {
+                new (self) kv::KVCacheStoredBlockData{std::move(blockHash), std::move(tokens), cacheLevel, priority,
+                    castMmKeys(mmKeys), std::move(cacheSalt)};
+            },
+            nb::arg("block_hash"), nb::arg("tokens"), nb::arg("cache_level"), nb::arg("priority"),
+            nb::arg("mm_keys") = nb::make_tuple(), nb::arg("cache_salt") = std::nullopt)
+        .def_ro("block_hash", &kv::KVCacheStoredBlockData::blockHash)
+        .def_ro("tokens", &kv::KVCacheStoredBlockData::tokens)
+        .def_ro("cache_level", &kv::KVCacheStoredBlockData::cacheLevel)
+        .def_ro("priority", &kv::KVCacheStoredBlockData::priority)
+        .def_prop_ro("mm_keys", [](kv::KVCacheStoredBlockData const& self) { return castMmKeys(self); })
+        .def_ro("cache_salt", &kv::KVCacheStoredBlockData::cacheSalt)
+        .def("__eq__", &kv::KVCacheStoredBlockData::operator==, nb::arg("other"))
+        .def("__repr__",
+            [](kv::KVCacheStoredBlockData const& self)
+            {
+                return "KVCacheStoredBlockData(block_hash=" + pythonRepr(self.blockHash)
+                    + ", tokens=" + pythonRepr(self.tokens) + ", cache_level=" + pythonRepr(self.cacheLevel)
+                    + ", priority=" + pythonRepr(self.priority) + ", mm_keys=" + pythonHandleRepr(castMmKeys(self))
+                    + ", cache_salt=" + pythonRepr(self.cacheSalt) + ")";
+            })
+        .def("__reduce__",
+            [](kv::KVCacheStoredBlockData const& self)
+            {
+                return nb::make_tuple(nb::type<kv::KVCacheStoredBlockData>(),
+                    nb::make_tuple(
+                        self.blockHash, self.tokens, self.cacheLevel, self.priority, castMmKeys(self), self.cacheSalt));
+            });
+
+    nb::class_<kv::KVCacheStoredData>(m, "KVCacheStoredData")
+        .def(
+            "__init__",
+            [](kv::KVCacheStoredData* self, nb::object parentHash, nb::object blocks) {
+                new (self) kv::KVCacheStoredData{castOptionalEventBlockHash(parentHash), castStoredBlocks(blocks)};
+            },
+            nb::arg("parent_hash").none(), nb::arg("blocks"))
+        .def_ro("parent_hash", &kv::KVCacheStoredData::parentHash)
+        .def_ro("blocks", &kv::KVCacheStoredData::blocks)
+        .def("__eq__", &kv::KVCacheStoredData::operator==, nb::arg("other"))
+        .def("__repr__",
+            [](kv::KVCacheStoredData const& self)
+            {
+                return "KVCacheStoredData(parent_hash=" + pythonRepr(self.parentHash)
+                    + ", blocks=" + pythonRepr(self.blocks) + ")";
+            })
+        .def("__reduce__",
+            [](kv::KVCacheStoredData const& self) {
+                return nb::make_tuple(nb::type<kv::KVCacheStoredData>(), nb::make_tuple(self.parentHash, self.blocks));
+            });
+
+    nb::class_<kv::KVCacheRemovedData>(m, "KVCacheRemovedData")
+        .def(nb::init<std::vector<kv::EventBlockHash>>(), nb::arg("block_hashes"))
+        .def_ro("block_hashes", &kv::KVCacheRemovedData::blockHashes)
+        .def("__eq__", &kv::KVCacheRemovedData::operator==, nb::arg("other"))
+        .def("__repr__",
+            [](kv::KVCacheRemovedData const& self)
+            { return "KVCacheRemovedData(block_hashes=" + pythonRepr(self.blockHashes) + ")"; })
+        .def("__reduce__",
+            [](kv::KVCacheRemovedData const& self)
+            { return nb::make_tuple(nb::type<kv::KVCacheRemovedData>(), nb::make_tuple(self.blockHashes)); });
+
+    nb::class_<kv::KVCacheEventDiff>(m, "KVCacheEventDiff")
+        .def(nb::init<int, int>(), nb::arg("old_value"), nb::arg("new_value"))
+        .def_ro("old_value", &kv::KVCacheEventDiff::oldValue)
+        .def_ro("new_value", &kv::KVCacheEventDiff::newValue)
+        .def("__eq__", &kv::KVCacheEventDiff::operator==, nb::arg("other"))
+        .def("__repr__",
+            [](kv::KVCacheEventDiff const& self)
+            {
+                return "KVCacheEventDiff(old_value=" + pythonRepr(self.oldValue)
+                    + ", new_value=" + pythonRepr(self.newValue) + ")";
+            })
+        .def("__reduce__",
+            [](kv::KVCacheEventDiff const& self)
+            { return nb::make_tuple(nb::type<kv::KVCacheEventDiff>(), nb::make_tuple(self.oldValue, self.newValue)); });
+
+    nb::class_<kv::KVCacheUpdatedData>(m, "KVCacheUpdatedData")
+        .def(nb::init<kv::EventBlockHash, std::optional<kv::KVCacheEventDiff>, std::optional<kv::KVCacheEventDiff>>(),
+            nb::arg("block_hash"), nb::arg("cache_level").none(), nb::arg("priority").none())
+        .def_ro("block_hash", &kv::KVCacheUpdatedData::blockHash)
+        .def_ro("cache_level", &kv::KVCacheUpdatedData::cacheLevel)
+        .def_ro("priority", &kv::KVCacheUpdatedData::priority)
+        .def("__eq__", &kv::KVCacheUpdatedData::operator==, nb::arg("other"))
+        .def("__repr__",
+            [](kv::KVCacheUpdatedData const& self)
+            {
+                return "KVCacheUpdatedData(block_hash=" + pythonRepr(self.blockHash)
+                    + ", cache_level=" + pythonRepr(self.cacheLevel) + ", priority=" + pythonRepr(self.priority) + ")";
+            })
+        .def("__reduce__",
+            [](kv::KVCacheUpdatedData const& self)
+            {
+                return nb::make_tuple(
+                    nb::type<kv::KVCacheUpdatedData>(), nb::make_tuple(self.blockHash, self.cacheLevel, self.priority));
+            });
+
+    nb::class_<kv::KVCacheEvent>(m, "KVCacheEvent")
+        .def(
+            "__init__",
+            [](kv::KVCacheEvent* self, int64_t eventId, nb::handle data, int windowSize,
+                std::optional<std::string> hashAlgo, std::optional<int> attentionDpRank,
+                kv::EventLayerGroupId layerGroupId)
+            {
+                new (self) kv::KVCacheEvent{
+                    eventId, castEventData(data), windowSize, std::move(hashAlgo), attentionDpRank, layerGroupId};
+            },
+            nb::arg("event_id"), nb::arg("data"), nb::arg("window_size"), nb::arg("hash_algo") = std::nullopt,
+            nb::arg("attention_dp_rank") = std::nullopt, nb::arg("layer_group_id") = std::nullopt)
+        .def_ro("event_id", &kv::KVCacheEvent::eventId)
+        .def_prop_ro("data", [](kv::KVCacheEvent const& self) { return castEventData(self.data); })
+        .def_ro("window_size", &kv::KVCacheEvent::windowSize)
+        .def_ro("hash_algo", &kv::KVCacheEvent::hashAlgo)
+        .def_ro("attention_dp_rank", &kv::KVCacheEvent::attentionDpRank)
+        .def_ro("layer_group_id", &kv::KVCacheEvent::layerGroupId)
+        .def("__eq__", &kv::KVCacheEvent::operator==, nb::arg("other"))
+        .def("__repr__",
+            [](kv::KVCacheEvent const& self)
+            {
+                return "KVCacheEvent(event_id=" + pythonRepr(self.eventId) + ", data="
+                    + pythonHandleRepr(castEventData(self.data)) + ", window_size=" + pythonRepr(self.windowSize)
+                    + ", hash_algo=" + pythonRepr(self.hashAlgo) + ", attention_dp_rank="
+                    + pythonRepr(self.attentionDpRank) + ", layer_group_id=" + pythonRepr(self.layerGroupId) + ")";
+            })
+        .def("__reduce__",
+            [](kv::KVCacheEvent const& self)
+            {
+                return nb::make_tuple(nb::type<kv::KVCacheEvent>(),
+                    nb::make_tuple(self.eventId, castEventData(self.data), self.windowSize, self.hashAlgo,
+                        self.attentionDpRank, self.layerGroupId));
+            });
+
+    nb::class_<kv::EventManager>(m, "KVCacheEventManager")
+        .def(
+            "__init__",
+            [](kv::EventManager* self, int maxKvEventEntries, int windowSize, std::optional<int> attentionDpRank,
+                nb::handle attentionDpGather, std::string hashAlgo, nb::handle windowSizeByLayerGroup)
+            {
+                std::map<int, int> windowSizes;
+                if (!windowSizeByLayerGroup.is_none())
+                {
+                    windowSizes = nb::cast<std::map<int, int>>(windowSizeByLayerGroup);
+                }
+                new (self) kv::EventManager(maxKvEventEntries, windowSize, attentionDpRank,
+                    castAttentionDpGather(attentionDpGather), std::move(hashAlgo), std::move(windowSizes));
+            },
+            nb::arg("max_kv_event_entries"), nb::kw_only(), nb::arg("window_size") = 0,
+            nb::arg("attention_dp_rank") = std::nullopt, nb::arg("attention_dp_gather") = nb::none(),
+            nb::arg("hash_algo") = "v2_blake3", nb::arg("window_size_by_layer_group").none() = nb::none())
+        .def("add_created_event", &kv::EventManager::addCreatedEvent, nb::arg("num_blocks_per_cache_level"),
+            nb::arg("layer_group_ids") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
+        .def("set_layer_group_window_sizes", &kv::EventManager::setLayerGroupWindowSizes, nb::arg("window_sizes"),
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "add_stored_event",
+            [](kv::EventManager& self, nb::object parentHash, nb::object blocks, kv::EventLayerGroupId layerGroupId)
+            {
+                self.addStoredEvent(
+                    kv::KVCacheStoredData{castOptionalEventBlockHash(parentHash), castStoredBlocks(blocks)},
+                    layerGroupId);
+            },
+            nb::arg("parent_hash").none(), nb::arg("blocks"), nb::arg("layer_group_id") = std::nullopt)
+        .def(
+            "add_removed_event",
+            [](kv::EventManager& self, nb::handle blockHashes)
+            {
+                if (nb::isinstance<nb::bytes>(blockHashes))
+                {
+                    if (hasDigestSize(blockHashes))
+                    {
+                        self.addRemovedBlock(castDigest(blockHashes));
+                    }
+                    return;
+                }
+                if (PyLong_Check(blockHashes.ptr()) || nb::isinstance<nb::str>(blockHashes))
+                {
+                    self.addRemovedEvent({castEventBlockHash(blockHashes)});
+                    return;
+                }
+                for (nb::handle blockHash : nb::cast<nb::iterable>(blockHashes))
+                {
+                    if (nb::isinstance<nb::bytes>(blockHash))
+                    {
+                        if (hasDigestSize(blockHash))
+                        {
+                            self.addRemovedBlock(castDigest(blockHash));
+                        }
+                    }
+                    else
+                    {
+                        self.addRemovedEvent({castEventBlockHash(blockHash)});
+                    }
+                }
+            },
+            nb::arg("block_hashes"))
+        .def(
+            "add_removed_life_cycle_event",
+            [](kv::EventManager& self, nb::handle blockHash, int lifeCycleId)
+            {
+                if (!nb::isinstance<nb::bytes>(blockHash))
+                {
+                    throw std::invalid_argument("block hash must be bytes");
+                }
+                if (hasDigestSize(blockHash))
+                {
+                    self.addRemovedLifeCycle(castDigest(blockHash), kv::LifeCycleId{lifeCycleId});
+                }
+            },
+            nb::arg("block_hash"), nb::arg("life_cycle_id"))
+        .def(
+            "add_updated_event",
+            [](kv::EventManager& self, nb::handle blockHash, std::optional<kv::KVCacheEventDiff> cacheLevel,
+                std::optional<kv::KVCacheEventDiff> priority, kv::EventLayerGroupId layerGroupId)
+            {
+                if (!cacheLevel.has_value() && !priority.has_value())
+                {
+                    return;
+                }
+                if (nb::isinstance<nb::bytes>(blockHash))
+                {
+                    if (!hasDigestSize(blockHash))
+                    {
+                        return;
+                    }
+                    auto digest = castDigest(blockHash);
+                    nb::gil_scoped_release release;
+                    self.addUpdatedEvent(digest, cacheLevel, priority, layerGroupId);
+                    return;
+                }
+                auto eventBlockHash = castEventBlockHash(blockHash);
+                nb::gil_scoped_release release;
+                self.addUpdatedEvent(std::move(eventBlockHash), cacheLevel, priority, layerGroupId);
+            },
+            nb::arg("block_hash"), nb::kw_only(), nb::arg("cache_level") = std::nullopt,
+            nb::arg("priority") = std::nullopt, nb::arg("layer_group_id") = std::nullopt)
+        .def(
+            "flush_iteration_events", &kv::EventManager::flushIterationEvents, nb::call_guard<nb::gil_scoped_release>())
+        .def("get_latest_events", &kv::EventManager::getLatestEvents, nb::arg("timeout_ms") = std::nullopt,
+            nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("hash_algo", &kv::EventManager::hashAlgorithm)
+        .def_prop_ro("_hash_algo", &kv::EventManager::hashAlgorithm)
+        .def_static("_hash_block_key", &kv::EventManager::hashV1BlockKey, nb::arg("tokens"), nb::arg("parent_hash") = 0,
+            nb::arg("lora_task_id") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt);
 
     // ---- Statistics --------------------------------------------------------
     nb::class_<kv::KVCacheStatsDelta>(m, "KVCacheStatsDelta")
@@ -1069,7 +1537,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- KvCacheManager ----------------------------------------------------
     nb::class_<kv::KvCacheManager>(m, "KVCacheManager")
-        .def(nb::init<kv::KVCacheManagerConfig const&>(), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "__init__",
+            [](kv::KvCacheManager* self, kv::KVCacheManagerConfig const& config, nb::object eventManager)
+            {
+                std::shared_ptr<kv::EventSink> eventSink;
+                if (!eventManager.is_none())
+                {
+                    eventSink = nb::cast<std::shared_ptr<kv::EventManager>>(eventManager);
+                }
+                nb::gil_scoped_release release;
+                new (self) kv::KvCacheManager(config, std::move(eventSink));
+            },
+            nb::arg("config"), nb::arg("event_manager").none() = nb::none())
         .def("shutdown", &kv::KvCacheManager::shutdown, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "clear_reusable_blocks", &kv::KvCacheManager::clearReusableBlocks, nb::call_guard<nb::gil_scoped_release>())
@@ -1143,6 +1623,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("clear_stats_excluded", &kv::KvCacheManager::clearStatsExcluded, nb::arg("kv_cache_id").none())
         .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none())
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
+        .def_prop_ro("event_manager",
+            [](kv::KvCacheManager const& self)
+            { return std::dynamic_pointer_cast<kv::EventManager>(self.eventSink()); })
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })
         .def_prop_ro("all_buffer_ids", &kv::KvCacheManager::allBufferIds)

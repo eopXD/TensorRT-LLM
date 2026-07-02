@@ -1456,6 +1456,10 @@ void KvCache::_commitBlock(int ord, bool isLast)
         }
         TLLM_CHECK_DEBUG(_getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
         ++mNumCommittedBlocks;
+        if (newBlock->eventSink)
+        {
+            newBlock->eventSink->addStoredBlock(*newBlock);
+        }
     }
     else if (newBlock->isFull() && mManager->allowSeqRebasing() && isFull)
     {
@@ -1481,6 +1485,10 @@ void KvCache::_commitBlock(int ord, bool isLast)
                     {
                         bp = std::monostate{};
                         auto committed = up->convertToCommitted(newBlock, finishEvent());
+                        if (newBlock->eventSink)
+                        {
+                            newBlock->eventSink->addStoredLifeCycle(*newBlock, lc);
+                        }
                         bp = isLocked
                             ? BlockPage{committed->lock(*this, kDefaultBeamIndex, static_cast<BlockOrdinal>(ord), lc)}
                             : BlockPage{committed->hold()};
@@ -1495,6 +1503,10 @@ void KvCache::_commitBlock(int ord, bool isLast)
                         {
                             bp = std::monostate{};
                             auto committed = up->convertToCommitted(newBlock, finishEvent());
+                            if (newBlock->eventSink)
+                            {
+                                newBlock->eventSink->addStoredLifeCycle(*newBlock, lc);
+                            }
                             bp = committed->hold();
                         }
                     }

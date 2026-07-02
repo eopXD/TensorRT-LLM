@@ -19,6 +19,7 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/config.h"
+#include "kv_cache_manager_v2/eventSink.h"
 #include "kv_cache_manager_v2/evictionController.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
@@ -100,7 +101,8 @@ public:
     StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
         std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
         std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
-        std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt);
+        std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt,
+        std::shared_ptr<EventSink> eventSink = nullptr);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;
@@ -285,6 +287,7 @@ private:
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 
     LifeCycleRegistry const& mLifeCycles;
+    std::shared_ptr<EventSink> mEventSink;
     TypedVec<LifeCycleId, PoolGroupIndex> mLifeCycleGrouping; // lcId → pgIdx
     std::unordered_map<LayerId, LifeCycleId> mLayerToLifeCycleIds;
     StorageConfig mStorageConfig;

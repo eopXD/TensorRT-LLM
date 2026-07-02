@@ -234,7 +234,7 @@ BlockKey RootBlock::makeKey(ReuseScope const& reuseScope)
 }
 
 RootBlock::RootBlock(ReuseScope reuseScope_, BlockRadixTree* treePtr)
-    : NodeBase(makeKey(reuseScope_))
+    : NodeBase(makeKey(reuseScope_), treePtr->eventSink().get())
     , reuseScope(std::move(reuseScope_))
     , tree(treePtr)
 {
@@ -271,6 +271,10 @@ SharedPtr<Block> NodeBase::detachNext(BlockKey const& blockKey)
     auto block = it->second;
     block->prev = nullptr;
     next.erase(it);
+    if (eventSink)
+    {
+        eventSink->addRemovedBlock(block->key);
+    }
     if (type() == Type::kROOT_BLOCK && next.empty())
     {
         auto* root = static_cast<RootBlock*>(this);
@@ -309,7 +313,7 @@ BlockKey Block::makeKey(BlockKey const& prevKey, TokenIdExt const* tokens, size_
 }
 
 Block::Block(BlockKey k, std::vector<TokenIdExt> toks, NodeBase* prevNode, LifeCycleId numLifeCycles)
-    : NodeBase(k)
+    : NodeBase(k, prevNode->eventSink)
     , tokens(std::move(toks))
     , prev(prevNode)
     , storage(numLifeCycles, nullptr)
@@ -398,6 +402,10 @@ std::vector<SharedPtr<Block>> Block::clearStaleBlocksAfterPageUnlink(
     {
         pruneStart = block.prev;
         detachedBlocks.push_back(removeSubtree(block));
+    }
+    else if (block.eventSink)
+    {
+        block.eventSink->addRemovedLifeCycle(block.key, lcIdx);
     }
 
     // Prune empty tail nodes up the chain.
@@ -537,9 +545,11 @@ SharedPtr<Block> removeSubtree(Block& root)
 // BlockRadixTree
 // ---------------------------------------------------------------------------
 
-BlockRadixTree::BlockRadixTree(LifeCycleRegistry const& lifeCycles, int tokensPerBlock)
+BlockRadixTree::BlockRadixTree(
+    LifeCycleRegistry const& lifeCycles, int tokensPerBlock, std::shared_ptr<EventSink> eventSink)
     : mLifeCycles(lifeCycles)
     , mTokensPerBlock(tokensPerBlock)
+    , mEventSink(std::move(eventSink))
 {
 }
 

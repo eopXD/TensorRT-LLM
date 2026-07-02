@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <unordered_map>
@@ -37,6 +38,10 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class Page;
 class KvCache;
 struct BatchedLockTarget;
+
+using MigrationRecorder
+    = std::function<void(std::vector<SharedPtr<Page>> const&, std::vector<Slot> const&, CacheLevel, CacheLevel)>;
+using DropRecorder = std::function<void(std::vector<SharedPtr<Page>> const&, CacheLevel)>;
 
 // ---------------------------------------------------------------------------
 // StorageStatistics — per-pool-group slot counts.
@@ -108,14 +113,17 @@ public:
     // Allocate slots for all life cycles at the given cache level.
     // numSlotsPerLc[lcId] = how many slots to allocate for that life cycle.
     // Returns a vector indexed by lcId.
-    TypedVec<LifeCycleId, std::vector<Slot>> newSlots(
-        CacheLevel level, TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc);
+    TypedVec<LifeCycleId, std::vector<Slot>> newSlots(CacheLevel level,
+        TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc, MigrationRecorder const& migrationRecorder = {},
+        DropRecorder const& dropRecorder = {});
 
-    TypedVec<LifeCycleId, std::vector<Slot>> newGpuSlots(TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc);
+    TypedVec<LifeCycleId, std::vector<Slot>> newGpuSlots(TypedVec<LifeCycleId, SlotCount> const& numSlotsPerLc,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     // Allocate slots for a single pool group at the given cache level.
     // Returns numSlots Slot objects. Throws OutOfPagesError if allocation fails.
-    std::vector<Slot> newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots);
+    std::vector<Slot> newSlotsForPoolGroup(CacheLevel level, PoolGroupIndex pgIdx, SlotCount numSlots,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     // Release a slot back to its pool.
     void releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot);
@@ -132,10 +140,12 @@ public:
     bool isEvictable(Page const& page, std::optional<CacheLevel> level = std::nullopt) const noexcept;
 
     // Ensure numFreeSlots[pgIdx] free GPU slots exist (evicting pages as needed).
-    void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements);
+    void prepareFreeSlots(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& requirements,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     // Force-evict pages from a level to free space.
-    void forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages);
+    void forceEvict(CacheLevel level, TypedVec<PoolGroupIndex, SlotCount> const& minNumPages,
+        DropRecorder const& dropRecorder = {});
 
     // Dynamic cache level resizing.
     void adjustCacheLevel(CacheLevel level, std::optional<size_t> newQuota,
@@ -148,7 +158,8 @@ public:
     // ---- Migration ---------------------------------------------------------
 
     // Migrate a batch of pages to GPU (used by batchedLockToGpu).
-    void batchedMigrateToGpu(std::vector<BatchedLockTarget> const& targets, KvCache& kvCache);
+    void batchedMigrateToGpu(
+        std::vector<BatchedLockTarget> const& targets, KvCache& kvCache, MigrationRecorder const& migrationRecorder);
 
     // Best-effort migration of grouped pages to a destination cache level.
     void prefetch(
@@ -264,10 +275,12 @@ private:
 
     // Internal helpers.
     void _prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>>& goals, CacheLevel lvlId,
-        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages);
+        TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>>& fallenPages,
+        MigrationRecorder const& migrationRecorder = {}, DropRecorder const& dropRecorder = {});
 
     void _batchedMigrate(PoolGroupIndex pgIdx, CacheLevel dstLevel, CacheLevel srcLevel,
-        std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, bool defrag = false);
+        std::vector<SharedPtr<Page>> const& srcPages, bool updateSrc, MigrationRecorder const& migrationRecorder = {},
+        bool defrag = false);
 
     PoolGroupBase& poolGroup(CacheLevel lvl, PoolGroupIndex pgIdx);
 

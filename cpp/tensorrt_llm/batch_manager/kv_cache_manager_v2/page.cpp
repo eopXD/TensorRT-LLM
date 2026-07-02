@@ -416,9 +416,14 @@ std::vector<SharedPageLock> batchedLockToGpu(KvCache& kvCache, std::vector<Batch
 
     try
     {
-        storeMgr->prepareFreeSlots(kGpuLevel, requirements);
+        MigrationRecorder const migrationRecorder
+            = [&kvCache](std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots, CacheLevel srcLevel,
+                  CacheLevel dstLevel) { kvCache._recordMigratedSlots(pages, slots, srcLevel, dstLevel); };
+        DropRecorder const dropRecorder = [&kvCache](std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel)
+        { kvCache._recordDroppedPages(pages, cacheLevel); };
+        storeMgr->prepareFreeSlots(kGpuLevel, requirements, migrationRecorder, dropRecorder);
         // Migrate non-GPU pages.
-        storeMgr->batchedMigrateToGpu(targets, kvCache);
+        storeMgr->batchedMigrateToGpu(targets, kvCache, migrationRecorder);
     }
     catch (...)
     {

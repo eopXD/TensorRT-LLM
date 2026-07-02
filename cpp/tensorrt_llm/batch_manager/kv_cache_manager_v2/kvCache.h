@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/movingAverage.h"
 #include "kv_cache_manager_v2/page.h"
+#include "kv_cache_manager_v2/pendingStats.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -177,7 +178,7 @@ public:
     using PriorityCb = std::function<Priority(BlockOrdinal, LifeCycleId)>;
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::vector<TokenIdExt> const& inputTokens,
-        std::optional<int64_t> id, PriorityCb priorityCb);
+        std::optional<int64_t> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt);
 
     ~KvCache();
 
@@ -196,6 +197,10 @@ public:
 
     // Close: release all blocks back to KvCacheManager.
     void close();
+
+    // Commit or discard request-local statistics accumulated since the previous scheduler commit.
+    KVCacheStatsDelta commitPendingStats();
+    void discardPendingStats();
 
     // Best-effort prefetch active pages to the target cache level.
     bool prefetch(CacheLevel target);
@@ -390,6 +395,8 @@ public:
 
 private:
     friend class KvCacheIntrospection;
+    friend std::vector<SharedPageLock> batchedLockToGpu(
+        KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
     // Activate: lock all pages to GPU. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
@@ -432,6 +439,17 @@ private:
 
     bool _shortcutSetCapacity(int capacity);
     bool _shortcutSetHistoryLength(int historyLength);
+    bool _shouldRecordStats() const;
+    void _refreshStatsDirtyState();
+    void _recordDirectIterationStats(LifeCycleId lifeCycle, KVCacheIterationStatsDelta const& iterationStats);
+    void _recordMigratedSlots(std::vector<SharedPtr<Page>> const& pages, std::vector<Slot> const& slots,
+        CacheLevel srcLevel, CacheLevel dstLevel);
+    void _recordDroppedPages(std::vector<SharedPtr<Page>> const& pages, CacheLevel cacheLevel);
+    void _refreshGenerationAllocReady();
+    void _recordResizePendingAllocations(BlockOrdinal blockBegin, BlockOrdinal blockEnd,
+        TypedVec<LifeCycleId, HalfOpenRange<BlockOrdinal>> const& excludedRanges, bool countAsGeneration);
+    void _subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
+    static bool _hasReuseSource(BlockPage const& page);
     void _increaseCapacity(BlockOrdinal newNumBlocks, int newHistoryLength);
     void _decreaseCapacity(BlockOrdinal newNumBlocks);
 
@@ -511,6 +529,8 @@ private:
     BeamIndex mBeamWidth;
     int mCapacity;
     int mHistoryLength;
+    std::optional<int> mExpectedPromptLength;
+    bool mGenerationAllocReady = false;
 
     // Page index tables: [beamIdx][lcId] → either an internal vector or an external span.
     // Mirrors Python's IndexSeq = array.array | memoryview.
@@ -531,6 +551,8 @@ private:
     // SSM pages: [beamIdx][lcId] — always initialized (empty entries = monostate).
     BeamBlockPages mSsmBlocks;
     bool mNeverResumed = true;
+
+    PendingStats mPendingStats;
 
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;

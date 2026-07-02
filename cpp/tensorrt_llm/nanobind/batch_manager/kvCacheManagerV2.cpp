@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
+#include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
 
@@ -41,8 +42,10 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/vector.h>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace nb = nanobind;
@@ -168,6 +171,82 @@ static nb::list committedTokensList(kv::KvCache const& self)
     return result;
 }
 
+static nb::object castStatsDelta(kv::KVCacheStatsDelta const& stats)
+{
+    return nb::cast(stats);
+}
+
+static nb::object castIterationStatsDelta(kv::KVCacheIterationStatsDelta const& stats)
+{
+    return nb::cast(stats);
+}
+
+static nb::dict castIterationStatsByLifeCycle(kv::IterationStatsByLifeCycle const& statsByLifeCycle)
+{
+    nb::dict result;
+    for (auto const& [lifeCycle, stats] : statsByLifeCycle)
+    {
+        result[nb::int_(lifeCycle.value())] = castIterationStatsDelta(stats);
+    }
+    return result;
+}
+
+static nb::list castPeakBlockStats(kv::PeakBlockStatsByPoolGroup const& statsByPoolGroup)
+{
+    nb::list result;
+    for (auto const& stats : statsByPoolGroup)
+    {
+        result.append(nb::cast(stats));
+    }
+    return result;
+}
+
+static std::string statsDeltaRepr(kv::KVCacheStatsDelta const& stats)
+{
+    std::ostringstream stream;
+    stream << "KVCacheStatsDelta(alloc_total_blocks=" << stats.allocTotalBlocks
+           << ", alloc_new_blocks=" << stats.allocNewBlocks << ", reused_blocks=" << stats.reusedBlocks
+           << ", missed_blocks=" << stats.missedBlocks << ')';
+    return stream.str();
+}
+
+static std::string iterationStatsDeltaRepr(kv::KVCacheIterationStatsDelta const& stats)
+{
+    std::ostringstream stream;
+    stream << "KVCacheIterationStatsDelta(iter_alloc_total_blocks=" << stats.iterAllocTotalBlocks
+           << ", iter_alloc_new_blocks=" << stats.iterAllocNewBlocks
+           << ", iter_reused_blocks=" << stats.iterReusedBlocks
+           << ", iter_full_reused_blocks=" << stats.iterFullReusedBlocks
+           << ", iter_partial_reused_blocks=" << stats.iterPartialReusedBlocks
+           << ", iter_missed_blocks=" << stats.iterMissedBlocks
+           << ", iter_gen_alloc_blocks=" << stats.iterGenAllocBlocks
+           << ", iter_onboard_blocks=" << stats.iterOnboardBlocks << ", iter_onboard_bytes=" << stats.iterOnboardBytes
+           << ", iter_offload_blocks=" << stats.iterOffloadBlocks << ", iter_offload_bytes=" << stats.iterOffloadBytes
+           << ", iter_intra_device_copy_blocks=" << stats.iterIntraDeviceCopyBlocks
+           << ", iter_intra_device_copy_bytes=" << stats.iterIntraDeviceCopyBytes
+           << ", iter_host_dropped_blocks=" << stats.iterHostDroppedBlocks
+           << ", iter_host_dropped_bytes=" << stats.iterHostDroppedBytes << ')';
+    return stream.str();
+}
+
+static std::string peakBlockStatsRepr(kv::PoolGroupPeakBlockStats const& stats)
+{
+    std::ostringstream stream;
+    stream << "PoolGroupPeakBlockStats(available=" << stats.available << ", unavailable=" << stats.unavailable
+           << ", evictable=" << stats.evictable << ')';
+    return stream.str();
+}
+
+static nb::object castRequestIds(std::unordered_set<int64_t> const& requestIds)
+{
+    nb::object result = nb::module_::import_("builtins").attr("set")();
+    for (int64_t const requestId : requestIds)
+    {
+        result.attr("add")(requestId);
+    }
+    return result;
+}
+
 static std::optional<int64_t> castOptionalIntAttr(nb::handle obj, char const* attrName)
 {
     nb::object attr = nb::steal(PyObject_GetAttrString(obj.ptr(), attrName));
@@ -237,6 +316,111 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                              .value("ACTIVE", kv::KvCache::Status::ACTIVE)
                              .value("SUSPENDED", kv::KvCache::Status::SUSPENDED)
                              .value("CLOSED", kv::KvCache::Status::CLOSED);
+
+    // ---- Statistics --------------------------------------------------------
+    nb::class_<kv::KVCacheStatsDelta>(m, "KVCacheStatsDelta")
+        .def(
+            "__init__",
+            [](kv::KVCacheStatsDelta* self, int64_t allocTotalBlocks, int64_t allocNewBlocks, int64_t reusedBlocks,
+                int64_t missedBlocks)
+            {
+                new (self) kv::KVCacheStatsDelta{};
+                self->allocTotalBlocks = allocTotalBlocks;
+                self->allocNewBlocks = allocNewBlocks;
+                self->reusedBlocks = reusedBlocks;
+                self->missedBlocks = missedBlocks;
+            },
+            nb::arg("alloc_total_blocks") = 0, nb::arg("alloc_new_blocks") = 0, nb::arg("reused_blocks") = 0,
+            nb::arg("missed_blocks") = 0)
+        .def_rw("alloc_total_blocks", &kv::KVCacheStatsDelta::allocTotalBlocks)
+        .def_rw("alloc_new_blocks", &kv::KVCacheStatsDelta::allocNewBlocks)
+        .def_rw("reused_blocks", &kv::KVCacheStatsDelta::reusedBlocks)
+        .def_rw("missed_blocks", &kv::KVCacheStatsDelta::missedBlocks)
+        .def("add", &kv::KVCacheStatsDelta::add, nb::arg("other"))
+        .def("subtract", &kv::KVCacheStatsDelta::subtract, nb::arg("other"))
+        .def("clear", &kv::KVCacheStatsDelta::clear)
+        .def("copy", &kv::KVCacheStatsDelta::copy)
+        .def_prop_ro("empty", &kv::KVCacheStatsDelta::empty)
+        .def("__eq__", &kv::KVCacheStatsDelta::operator==, nb::arg("other"))
+        .def("__repr__", &statsDeltaRepr);
+
+    nb::class_<kv::KVCacheIterationStatsDelta>(m, "KVCacheIterationStatsDelta")
+        .def(
+            "__init__",
+            [](kv::KVCacheIterationStatsDelta* self, int64_t iterAllocTotalBlocks, int64_t iterAllocNewBlocks,
+                int64_t iterReusedBlocks, int64_t iterFullReusedBlocks, int64_t iterPartialReusedBlocks,
+                int64_t iterMissedBlocks, int64_t iterGenAllocBlocks, int64_t iterOnboardBlocks,
+                int64_t iterOnboardBytes, int64_t iterOffloadBlocks, int64_t iterOffloadBytes,
+                int64_t iterIntraDeviceCopyBlocks, int64_t iterIntraDeviceCopyBytes, int64_t iterHostDroppedBlocks,
+                int64_t iterHostDroppedBytes)
+            {
+                new (self) kv::KVCacheIterationStatsDelta{};
+                self->iterAllocTotalBlocks = iterAllocTotalBlocks;
+                self->iterAllocNewBlocks = iterAllocNewBlocks;
+                self->iterReusedBlocks = iterReusedBlocks;
+                self->iterFullReusedBlocks = iterFullReusedBlocks;
+                self->iterPartialReusedBlocks = iterPartialReusedBlocks;
+                self->iterMissedBlocks = iterMissedBlocks;
+                self->iterGenAllocBlocks = iterGenAllocBlocks;
+                self->iterOnboardBlocks = iterOnboardBlocks;
+                self->iterOnboardBytes = iterOnboardBytes;
+                self->iterOffloadBlocks = iterOffloadBlocks;
+                self->iterOffloadBytes = iterOffloadBytes;
+                self->iterIntraDeviceCopyBlocks = iterIntraDeviceCopyBlocks;
+                self->iterIntraDeviceCopyBytes = iterIntraDeviceCopyBytes;
+                self->iterHostDroppedBlocks = iterHostDroppedBlocks;
+                self->iterHostDroppedBytes = iterHostDroppedBytes;
+            },
+            nb::arg("iter_alloc_total_blocks") = 0, nb::arg("iter_alloc_new_blocks") = 0,
+            nb::arg("iter_reused_blocks") = 0, nb::arg("iter_full_reused_blocks") = 0,
+            nb::arg("iter_partial_reused_blocks") = 0, nb::arg("iter_missed_blocks") = 0,
+            nb::arg("iter_gen_alloc_blocks") = 0, nb::arg("iter_onboard_blocks") = 0, nb::arg("iter_onboard_bytes") = 0,
+            nb::arg("iter_offload_blocks") = 0, nb::arg("iter_offload_bytes") = 0,
+            nb::arg("iter_intra_device_copy_blocks") = 0, nb::arg("iter_intra_device_copy_bytes") = 0,
+            nb::arg("iter_host_dropped_blocks") = 0, nb::arg("iter_host_dropped_bytes") = 0)
+        .def_rw("iter_alloc_total_blocks", &kv::KVCacheIterationStatsDelta::iterAllocTotalBlocks)
+        .def_rw("iter_alloc_new_blocks", &kv::KVCacheIterationStatsDelta::iterAllocNewBlocks)
+        .def_rw("iter_reused_blocks", &kv::KVCacheIterationStatsDelta::iterReusedBlocks)
+        .def_rw("iter_full_reused_blocks", &kv::KVCacheIterationStatsDelta::iterFullReusedBlocks)
+        .def_rw("iter_partial_reused_blocks", &kv::KVCacheIterationStatsDelta::iterPartialReusedBlocks)
+        .def_rw("iter_missed_blocks", &kv::KVCacheIterationStatsDelta::iterMissedBlocks)
+        .def_rw("iter_gen_alloc_blocks", &kv::KVCacheIterationStatsDelta::iterGenAllocBlocks)
+        .def_rw("iter_onboard_blocks", &kv::KVCacheIterationStatsDelta::iterOnboardBlocks)
+        .def_rw("iter_onboard_bytes", &kv::KVCacheIterationStatsDelta::iterOnboardBytes)
+        .def_rw("iter_offload_blocks", &kv::KVCacheIterationStatsDelta::iterOffloadBlocks)
+        .def_rw("iter_offload_bytes", &kv::KVCacheIterationStatsDelta::iterOffloadBytes)
+        .def_rw("iter_intra_device_copy_blocks", &kv::KVCacheIterationStatsDelta::iterIntraDeviceCopyBlocks)
+        .def_rw("iter_intra_device_copy_bytes", &kv::KVCacheIterationStatsDelta::iterIntraDeviceCopyBytes)
+        .def_rw("iter_host_dropped_blocks", &kv::KVCacheIterationStatsDelta::iterHostDroppedBlocks)
+        .def_rw("iter_host_dropped_bytes", &kv::KVCacheIterationStatsDelta::iterHostDroppedBytes)
+        .def("add", &kv::KVCacheIterationStatsDelta::add, nb::arg("other"))
+        .def("subtract", &kv::KVCacheIterationStatsDelta::subtract, nb::arg("other"))
+        .def("clear", &kv::KVCacheIterationStatsDelta::clear)
+        .def("copy", &kv::KVCacheIterationStatsDelta::copy)
+        .def_prop_ro("empty", &kv::KVCacheIterationStatsDelta::empty)
+        .def_prop_ro("iter_cache_hit_rate", &kv::KVCacheIterationStatsDelta::iterCacheHitRate)
+        .def("__eq__", &kv::KVCacheIterationStatsDelta::operator==, nb::arg("other"))
+        .def("__repr__", &iterationStatsDeltaRepr);
+
+    m.attr("KVCacheIterationStatsDelta").attr("_field_names") = nb::make_tuple("iter_alloc_total_blocks",
+        "iter_alloc_new_blocks", "iter_reused_blocks", "iter_full_reused_blocks", "iter_partial_reused_blocks",
+        "iter_missed_blocks", "iter_gen_alloc_blocks", "iter_onboard_blocks", "iter_onboard_bytes",
+        "iter_offload_blocks", "iter_offload_bytes", "iter_intra_device_copy_blocks", "iter_intra_device_copy_bytes",
+        "iter_host_dropped_blocks", "iter_host_dropped_bytes");
+
+    nb::class_<kv::PoolGroupPeakBlockStats>(m, "PoolGroupPeakBlockStats")
+        .def(
+            "__init__",
+            [](kv::PoolGroupPeakBlockStats* self, kv::SlotCount available, kv::SlotCount unavailable,
+                kv::SlotCount evictable) {
+                new (self) kv::PoolGroupPeakBlockStats{available, unavailable, evictable};
+            },
+            nb::arg("available"), nb::arg("unavailable"), nb::arg("evictable"))
+        .def_ro("available", &kv::PoolGroupPeakBlockStats::available)
+        .def_ro("unavailable", &kv::PoolGroupPeakBlockStats::unavailable)
+        .def_ro("evictable", &kv::PoolGroupPeakBlockStats::evictable)
+        .def("__eq__", &kv::PoolGroupPeakBlockStats::operator==, nb::arg("other"))
+        .def("__repr__", &peakBlockStatsRepr);
 
     // ---- Life cycle helpers ------------------------------------------------
     using BlockRange = kv::HalfOpenRange<kv::BlockOrdinal>;
@@ -544,7 +728,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 nb::list layers, float maxUtilForResume, bool enablePartialReuse,
                 std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
                 std::optional<std::vector<float>> initialPoolRatio, int ssmReuseInterval,
-                std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, std::optional<kv::HelixConfig> helixConfig)
+                std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool enableStats,
+                std::optional<kv::HelixConfig> helixConfig)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -564,13 +749,15 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->initialPoolRatio = std::move(initialPoolRatio);
                 cfg->ssmReuseInterval = ssmReuseInterval;
                 cfg->swaScratchReuse = std::move(swaScratchReuse);
+                cfg->enableStats = enableStats;
                 cfg->helixConfig = std::move(helixConfig);
             },
             nb::arg("tokens_per_block"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
             nb::arg("initial_pool_ratio").none() = std::nullopt, nb::arg("ssm_reuse_interval") = 512,
-            nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("helix_config").none() = std::nullopt)
+            nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("enable_stats") = true,
+            nb::arg("helix_config").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -581,6 +768,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio)
         .def_rw("ssm_reuse_interval", &kv::KVCacheManagerConfig::ssmReuseInterval)
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
+        .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
         .def_prop_rw(
             "helix_config",
@@ -624,6 +812,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "prefetch", [](kv::KvCache& self, int target) { return self.prefetch(kv::CacheLevel{target}); },
             nb::arg("target"), nb::call_guard<nb::gil_scoped_release>())
         .def("close", &kv::KvCache::close, nb::call_guard<nb::gil_scoped_release>())
+        .def("commit_pending_stats", [](kv::KvCache& self) { return castStatsDelta(self.commitPendingStats()); })
+        .def("discard_pending_stats", &kv::KvCache::discardPendingStats)
         .def(
             "resize",
             [](kv::KvCache& self, std::optional<int> capacity, std::optional<int> historyLength) -> bool
@@ -817,6 +1007,19 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kGpuLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
+        "life_cycle_pool_group_indices",
+        [](kv::KvCacheManager& manager)
+        {
+            std::vector<int> result;
+            result.reserve(manager.lifeCycles().size().value());
+            for (kv::LifeCycleId lifeCycle{0}; lifeCycle < manager.lifeCycles().size(); ++lifeCycle)
+            {
+                result.push_back(manager.storage().getPoolGroupIndex(lifeCycle).value());
+            }
+            return result;
+        },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
         "storage_utilization",
         [](kv::KvCacheManager& manager, int cacheLevel)
         {
@@ -873,20 +1076,26 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
-                std::optional<int64_t> id, nb::object customPriorityCallback)
+                std::optional<int64_t> id, nb::object customPriorityCallback, std::optional<int> expectedPromptLength)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 std::vector<kv::TokenIdExt> tokens;
+                bool const hasInputTokens = !inputTokens.is_none();
                 if (!inputTokens.is_none())
                 {
                     tokens = castTokenIterable(inputTokens);
                 }
+                if (!expectedPromptLength.has_value() && hasInputTokens)
+                {
+                    expectedPromptLength = static_cast<int>(tokens.size());
+                }
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
                 nb::gil_scoped_release release;
-                return self->createKvCache(std::move(reuseScope), tokens, id, std::move(priorityCb));
+                return self->createKvCache(
+                    std::move(reuseScope), tokens, id, std::move(priorityCb), expectedPromptLength);
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
-            nb::arg("custom_priority_callback") = nb::none())
+            nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
@@ -917,6 +1126,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "get_quota",
             [](kv::KvCacheManager const& self, int cacheLevel) { return self.getQuota(kv::CacheLevel{cacheLevel}); },
             nb::arg("cache_level"))
+        .def("get_committed_stats",
+            [](kv::KvCacheManager const& self) { return castStatsDelta(self.getCommittedStats()); })
+        .def("get_and_reset_iteration_stats",
+            [](kv::KvCacheManager& self) { return castIterationStatsByLifeCycle(self.getAndResetIterationStats()); })
+        .def(
+            "get_and_reset_iteration_peak_block_stats",
+            [](kv::KvCacheManager& self, int cacheLevel)
+            { return castPeakBlockStats(self.getAndResetIterationPeakBlockStats(kv::CacheLevel{cacheLevel})); },
+            nb::arg("cache_level"))
+        .def("mark_stats_dirty", &kv::KvCacheManager::markStatsDirty, nb::arg("kv_cache_id").none())
+        .def("clear_stats_dirty", &kv::KvCacheManager::clearStatsDirty, nb::arg("kv_cache_id").none())
+        .def("get_dirty_stats_kv_cache_ids",
+            [](kv::KvCacheManager const& self) { return castRequestIds(self.getDirtyStatsKvCacheIds()); })
+        .def("mark_stats_excluded", &kv::KvCacheManager::markStatsExcluded, nb::arg("kv_cache_id").none())
+        .def("clear_stats_excluded", &kv::KvCacheManager::clearStatsExcluded, nb::arg("kv_cache_id").none())
+        .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none())
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
         .def_prop_ro("init_config", [](kv::KvCacheManager const& self) { return self.config(); })
         .def_prop_ro("cache_tier_list", [](kv::KvCacheManager const& self) { return self.cacheTierList().raw(); })

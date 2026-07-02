@@ -276,6 +276,9 @@ struct KVCacheManagerConfig
     // have no preserved data after the step.
     std::optional<SwaScratchReuseConfig> swaScratchReuse;
 
+    // Collect V2 KV cache allocation, reuse, and transfer statistics.
+    bool enableStats = true;
+
     bool enableSwaScratchReuse() const noexcept
     {
         return swaScratchReuse.has_value();

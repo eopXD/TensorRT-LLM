@@ -23,12 +23,14 @@
 #include "kv_cache_manager_v2/kvCache.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/movingAverage.h"
+#include "kv_cache_manager_v2/stats.h"
 #include "kv_cache_manager_v2/storageManager.h"
 
 #include <functional>
 #include <memory>
 #include <optional>
 #include <set>
+#include <unordered_set>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -133,7 +135,8 @@ public:
     // input_tokens: optional sequence to match against existing cached blocks.
     // priorityCb:   optional priority override per block.
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {},
-        std::optional<int64_t> id = std::nullopt, KvCache::PriorityCb priorityCb = {});
+        std::optional<int64_t> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
+        std::optional<int> expectedPromptLength = std::nullopt);
 
     BlockRadixTree::ReuseMatch matchReuse(
         ReuseScope const& reuseScope, std::vector<TokenIdExt> const& inputTokens) const;
@@ -208,6 +211,20 @@ public:
     bool resize(CacheLevel level, size_t quota, bool bestEfforts = false);
     size_t getQuota(CacheLevel level) const;
 
+    // ---- Statistics -------------------------------------------------------
+
+    void commitStats(KVCacheStatsDelta const& stats, IterationStatsByLifeCycle const& iterationStatsByLifeCycle = {});
+    KVCacheStatsDelta getCommittedStats() const;
+    IterationStatsByLifeCycle getAndResetIterationStats();
+    PeakBlockStatsByPoolGroup getAndResetIterationPeakBlockStats(CacheLevel cacheLevel);
+
+    void markStatsDirty(std::optional<int64_t> kvCacheId);
+    void clearStatsDirty(std::optional<int64_t> kvCacheId);
+    std::unordered_set<int64_t> getDirtyStatsKvCacheIds() const;
+    void markStatsExcluded(std::optional<int64_t> kvCacheId);
+    void clearStatsExcluded(std::optional<int64_t> kvCacheId);
+    bool isStatsExcluded(std::optional<int64_t> kvCacheId) const;
+
     // Mirrors Python's need_adjustment property and adjust() method.
     // All KvCaches must be suspended before calling adjust().
     bool needAdjustment() const;
@@ -273,6 +290,10 @@ private:
     TypedVec<PoolGroupIndex, float> const& _getTargetRatioList(CacheLevel level) const;
     TypedVec<PoolGroupIndex, std::vector<SharedPtr<Page>>> _gatherPersistentPages() const;
 
+    PeakBlockStatsByCacheLevel _currentBlockStatsByCacheLevel() const;
+    void _resetIterationPeakNumBlocks(std::optional<CacheLevel> cacheLevel = std::nullopt);
+    void _updateIterationPeakNumBlocks();
+
     // Current per-pool-group GPU utilization ratios.
     TypedVec<PoolGroupIndex, float> _currentGpuRatio() const;
     TypedVec<PoolGroupIndex, float> _currentOtherRatios() const;
@@ -297,6 +318,12 @@ private:
     int mNumSampledKvCaches{0};
     double mLastAdjustmentTime{0.0};
     int mLastUpdateNumSampledKvCaches{0};
+
+    KVCacheStatsDelta mCommittedStats;
+    IterationStatsByLifeCycle mIterationStatsByLifeCycle;
+    PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
+    std::unordered_set<int64_t> mDirtyStatsKvCacheIds;
+    std::unordered_set<int64_t> mStatsExcludedKvCacheIds;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

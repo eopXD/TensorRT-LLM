@@ -542,7 +542,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__init__",
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, std::vector<kv::CacheTierConfig> cacheTiers,
                 nb::list layers, float maxUtilForResume, bool enablePartialReuse,
-                std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints, int ssmReuseInterval,
+                std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
+                std::optional<std::vector<float>> initialPoolRatio, int ssmReuseInterval,
                 std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, std::optional<kv::HelixConfig> helixConfig)
             {
                 new (cfg) kv::KVCacheManagerConfig();
@@ -560,6 +561,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->enablePartialReuse = enablePartialReuse;
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
+                cfg->initialPoolRatio = std::move(initialPoolRatio);
                 cfg->ssmReuseInterval = ssmReuseInterval;
                 cfg->swaScratchReuse = std::move(swaScratchReuse);
                 cfg->helixConfig = std::move(helixConfig);
@@ -567,8 +569,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("tokens_per_block"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
-            nb::arg("ssm_reuse_interval") = 512, nb::arg("swa_scratch_reuse").none() = std::nullopt,
-            nb::arg("helix_config").none() = std::nullopt)
+            nb::arg("initial_pool_ratio").none() = std::nullopt, nb::arg("ssm_reuse_interval") = 512,
+            nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("helix_config").none() = std::nullopt)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -576,6 +578,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("enable_partial_reuse", &kv::KVCacheManagerConfig::enablePartialReuse)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
+        .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio)
         .def_rw("ssm_reuse_interval", &kv::KVCacheManagerConfig::ssmReuseInterval)
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)

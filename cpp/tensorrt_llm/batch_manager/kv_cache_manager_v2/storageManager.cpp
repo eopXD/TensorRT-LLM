@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <numeric>
 #include <set>
+#include <string>
 #include <utility>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -112,7 +113,7 @@ TypedVec<LifeCycleId, TypedVec<PoolIndex, int>> computeSlotToPageIndices(Storage
 
 StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
     std::optional<SwaScratchReuseConfig> swaScratchReuse, std::optional<BatchDesc> const& typicalBatch,
-    std::vector<BatchDesc> const& constraints)
+    std::vector<BatchDesc> const& constraints, std::optional<std::vector<float>> const& initialPoolRatio)
     : mLifeCycles(lifeCycles)
     , mStorageConfig(config)
     , mSwaScratchReuse(std::move(swaScratchReuse))
@@ -157,12 +158,34 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     size_t gpuQuota = cacheTierQuota(config.cacheTiers[kGpuLevel]);
     size_t gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
 
-    // Compute min_slots from constraints.
-    mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse);
+    // Explicit ratios override constraints for both initial sizing and minimum slot counts.
+    mMinSlots = computeMinSlotsFromConstraints(
+        initialPoolRatio.has_value() ? std::vector<BatchDesc>{} : constraints, tokensPerBlock, mSwaScratchReuse);
 
-    // Compute init_ratio from typical_batch, constraints, or fallback.
+    // Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
     TypedVec<PoolGroupIndex, float> initRatio;
-    if (typicalBatch.has_value())
+    if (initialPoolRatio.has_value())
+    {
+        if (initialPoolRatio->size() != toSizeT(numPoolGroups()))
+        {
+            throw std::invalid_argument("initial_pool_ratio length must match number of pool groups ("
+                + std::to_string(toSizeT(numPoolGroups())) + "), got " + std::to_string(initialPoolRatio->size()));
+        }
+        if (std::any_of(initialPoolRatio->begin(), initialPoolRatio->end(), [](float ratio) { return ratio <= 0.0F; }))
+        {
+            throw std::invalid_argument("initial_pool_ratio values must be positive");
+        }
+
+        constexpr double kExpectedRatioSum = 1.0;
+        constexpr double kRatioSumTolerance = 1e-6;
+        double const ratioSum = std::accumulate(initialPoolRatio->begin(), initialPoolRatio->end(), 0.0);
+        if (!std::isfinite(ratioSum) || std::abs(ratioSum - kExpectedRatioSum) > kRatioSumTolerance)
+        {
+            throw std::invalid_argument("initial_pool_ratio values must sum to 1.0");
+        }
+        initRatio = TypedVec<PoolGroupIndex, float>(*initialPoolRatio);
+    }
+    else if (typicalBatch.has_value())
     {
         initRatio = ratioFromBatch(*typicalBatch, tokensPerBlock, mSwaScratchReuse, gpuGranularity);
     }

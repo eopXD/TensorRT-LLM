@@ -94,7 +94,8 @@ class StorageManager : public std::enable_shared_from_this<StorageManager>
 public:
     StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfig const& config, int tokensPerBlock,
         std::optional<SwaScratchReuseConfig> swaScratchReuse = std::nullopt,
-        std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {});
+        std::optional<BatchDesc> const& typicalBatch = std::nullopt, std::vector<BatchDesc> const& constraints = {},
+        std::optional<std::vector<float>> const& initialPoolRatio = std::nullopt);
     ~StorageManager();
 
     StorageManager(StorageManager const&) = delete;

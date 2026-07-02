@@ -789,6 +789,17 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             }
         }
 
+        // Wait for all slots that will back new pages. This includes detached excess scratch slots,
+        // which are not covered by the earlier wait on newly allocated slots.
+        {
+            std::vector<CachedCudaEvent const*> readyEvents;
+            for (auto const& lcSlots : slots)
+                for (auto const& slot : lcSlots)
+                    readyEvents.push_back(&slot.readyEvent);
+            if (!readyEvents.empty())
+                streamWaitEvents(reinterpret_cast<CudaStream>(cudaStream()), readyEvents);
+        }
+
         // Resize page index buffers.
         TLLM_CHECK_DEBUG(std::all_of(mBasePageIndices.begin(), mBasePageIndices.end(),
             [oldNumBlocks](auto const& beamIndices)
@@ -830,7 +841,7 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
                     slots[lc].pop_back();
                     auto page = makeShared<UncommittedPage>(*this, ord, lc, kGpuLevel, bi);
                     page->setSlot(slot);
-                    sb.pages[bi][lc] = page->lock(*this, bi, ord, lc);
+                    sb.pages[bi][lc] = page->lock(*this, bi, ord, lc, /*skipWait=*/true);
                 }
             }
             mBlocks.push_back(std::move(sb));

@@ -114,7 +114,7 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config)
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
-        mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints);
+        mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio);
 
     mTargetRatioListGpu = _currentGpuRatio();
     mTargetRatioListOther = _currentOtherRatios();
@@ -455,8 +455,11 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
     {
         TLLM_CHECK_DEBUG(minSlots[pgIdx] >= 0);
         SlotCount const reservedSlots = minSlots[pgIdx] * (batchSize - 1);
-        TLLM_CHECK_DEBUG(remainingSlots[pgIdx] >= reservedSlots);
         remainingSlots[pgIdx] -= reservedSlots;
+        if (remainingSlots[pgIdx] < 0)
+        {
+            return 0;
+        }
     }
 
     auto isEnough = [&](int numBlocks) -> bool
@@ -473,7 +476,10 @@ int KvCacheManager::clampMaxSeqLenForMem(int batchSize, int tokenNumUpperBound) 
         return true;
     };
 
-    TLLM_CHECK_DEBUG(isEnough(1));
+    if (!isEnough(1))
+    {
+        return 0;
+    }
     int lb = 1;
     int ub = divUp(tokenNumUpperBound, tokPerBlock);
     if (isEnough(ub))

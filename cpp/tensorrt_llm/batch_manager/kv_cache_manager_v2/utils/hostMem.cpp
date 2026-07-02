@@ -19,14 +19,25 @@
 #include "kv_cache_manager_v2/exceptions.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cuda.h>
+#include <exception>
 #include <fcntl.h>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/utsname.h>
+#include <system_error>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -84,6 +95,56 @@ void resizeFile(int fd, size_t newSize)
     }
 }
 
+bool hostUseThp()
+{
+    char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_THP");
+    return value == nullptr || std::string_view(value) == "1";
+}
+
+int hostPrefaultThreads()
+{
+    char const* value = std::getenv("TLLM_KV_CACHE_MANAGER_V2_PREFAULT_THREADS");
+    if (value != nullptr)
+    {
+        return std::stoi(value);
+    }
+    unsigned int const detectedCpuCount = std::thread::hardware_concurrency();
+    unsigned int const cpuCount = detectedCpuCount == 0 ? 32 : detectedCpuCount;
+    return static_cast<int>(std::min(64U, cpuCount / 2));
+}
+
+void hostMadvisePageMode(MemAddress ptr, size_t size, bool useThp, HostMadviseFn madviseFn) noexcept
+{
+    HostMadviseFn const fn = madviseFn != nullptr ? madviseFn : ::madvise;
+    int const advice = useThp ? MADV_HUGEPAGE : MADV_NOHUGEPAGE;
+    if (fn(reinterpret_cast<void*>(ptr), size, advice) != 0)
+    {
+        std::fprintf(stderr, "madvise failed with errno %d\n", errno);
+    }
+}
+
+void hostPrefaultChunk(MemAddress ptr, size_t size, HostMadviseFn madviseFn, HostMemsetFn memsetFn)
+{
+    HostMadviseFn const advise = madviseFn != nullptr ? madviseFn : ::madvise;
+    HostMemsetFn const touch = memsetFn != nullptr ? memsetFn : ::memset;
+    if (advise(reinterpret_cast<void*>(ptr), size, MADV_POPULATE_WRITE) == 0)
+    {
+        return;
+    }
+
+    int const errorCode = errno;
+    if (errorCode == EINVAL || errorCode == ENOSYS)
+    {
+        touch(reinterpret_cast<void*>(ptr), 0, size);
+        return;
+    }
+    if (errorCode == ENOMEM)
+    {
+        throw HostOOMError("madvise(MADV_POPULATE_WRITE) failed: " + std::string(std::strerror(errorCode)));
+    }
+    throw std::system_error(errorCode, std::generic_category(), "madvise(MADV_POPULATE_WRITE) failed");
+}
+
 // ---------------------------------------------------------------------------
 // HostMem implementation
 // ---------------------------------------------------------------------------
@@ -111,6 +172,7 @@ bool HostMem::shouldUseChunkedRegistration()
 }
 
 HostMem::HostMem(size_t size)
+    : mUseThp(hostUseThp())
 {
     if (size == 0)
     {
@@ -119,8 +181,24 @@ HostMem::HostMem(size_t size)
     mAddr = hostMmap(size);
     TLLM_CHECK_DEBUG(mAddr % kAlignment == 0);
     mSize = size;
-    madviseHugepages();
-    registerToCuda();
+    try
+    {
+        madvisePageMode();
+        int const prefaultThreads = hostPrefaultThreads();
+        if (prefaultThreads > 0)
+        {
+            parallelPrefault(prefaultThreads);
+        }
+        registerToCuda();
+    }
+    catch (...)
+    {
+        unregisterFromCuda();
+        hostMunmap(mAddr, mSize);
+        mAddr = 0;
+        mSize = 0;
+        throw;
+    }
 }
 
 HostMem::~HostMem()
@@ -131,10 +209,18 @@ HostMem::~HostMem()
 void HostMem::resize(size_t newSize)
 {
     unregisterFromCuda();
-    mAddr = hostMremap(mAddr, mSize, newSize);
-    TLLM_CHECK_DEBUG(mAddr % kAlignment == 0);
-    mSize = newSize;
-    madviseHugepages();
+    try
+    {
+        mAddr = hostMremap(mAddr, mSize, newSize);
+        TLLM_CHECK_DEBUG(mAddr % kAlignment == 0);
+        mSize = newSize;
+        madvisePageMode();
+    }
+    catch (...)
+    {
+        registerToCuda();
+        throw;
+    }
     registerToCuda();
 }
 
@@ -150,11 +236,63 @@ void HostMem::destroy()
     mSize = 0;
 }
 
-void HostMem::madviseHugepages()
+void HostMem::madvisePageMode()
 {
     TLLM_CHECK_DEBUG(mAddr && mSize);
-    // Advisory — ignore failures.
-    ::madvise(reinterpret_cast<void*>(mAddr), mSize, MADV_HUGEPAGE);
+    hostMadvisePageMode(mAddr, mSize, mUseThp);
+}
+
+void HostMem::parallelPrefault(int numThreads)
+{
+    size_t const numChunks = (mSize + kPrefaultChunkSize - 1) / kPrefaultChunkSize;
+    int const workerCount = std::min<int>(numThreads, static_cast<int>(numChunks));
+    std::atomic_size_t nextChunk{0};
+    std::atomic_bool failed{false};
+    std::exception_ptr error;
+    std::mutex errorMutex;
+
+    auto worker = [&]()
+    {
+        while (!failed.load())
+        {
+            size_t const chunkIndex = nextChunk.fetch_add(1);
+            if (chunkIndex >= numChunks)
+            {
+                return;
+            }
+            size_t const offset = chunkIndex * kPrefaultChunkSize;
+            size_t const chunkSize = std::min(kPrefaultChunkSize, mSize - offset);
+            try
+            {
+                hostPrefaultChunk(mAddr + offset, chunkSize);
+            }
+            catch (...)
+            {
+                failed.store(true);
+                std::lock_guard<std::mutex> lock(errorMutex);
+                if (error == nullptr)
+                {
+                    error = std::current_exception();
+                }
+                return;
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(workerCount));
+    for (int i = 0; i < workerCount; ++i)
+    {
+        workers.emplace_back(worker);
+    }
+    for (auto& thread : workers)
+    {
+        thread.join();
+    }
+    if (error != nullptr)
+    {
+        std::rethrow_exception(error);
+    }
 }
 
 void HostMem::registerToCuda()

@@ -30,7 +30,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 //
 // Memory is:
 //   - Anonymous private mmap
-//   - Advised as MADV_HUGEPAGE for transparent huge pages
+//   - Advised according to TLLM_KV_CACHE_MANAGER_V2_THP
+//   - Optionally prefaulted in parallel before CUDA registration
 //   - Registered to CUDA as page-locked (CU_MEMHOSTREGISTER_DEVICEMAP)
 //
 // On kernels 6.11/6.12/6.13, pinning is chunked in 2GB pieces to work around
@@ -39,8 +40,9 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 class HostMem
 {
 public:
-    static constexpr size_t kAlignment = 4096;       // 4 KB
-    static constexpr size_t kChunkSize = 2ULL << 30; // 2 GB
+    static constexpr size_t kAlignment = 4096;                 // 4 KB
+    static constexpr size_t kChunkSize = 2ULL << 30;           // 2 GB
+    static constexpr size_t kPrefaultChunkSize = 512ULL << 20; // 512 MB
 
     explicit HostMem(size_t size);
     ~HostMem();
@@ -67,11 +69,13 @@ public:
 private:
     void registerToCuda();
     void unregisterFromCuda();
-    void madviseHugepages();
+    void madvisePageMode();
+    void parallelPrefault(int numThreads);
 
     MemAddress mAddr = 0;
     size_t mSize = 0;
     int mNumRegisteredChunks = 0;
+    bool mUseThp = true;
 
     // Detect kernel version once at startup.
     static bool shouldUseChunkedRegistration();
@@ -84,5 +88,13 @@ MemAddress hostMmap(size_t size);                                      // throws
 void hostMunmap(MemAddress ptr, size_t size) noexcept;
 MemAddress hostMremap(MemAddress ptr, size_t oldSize, size_t newSize); // throws HostOOMError
 void resizeFile(int fd, size_t newSize);                               // throws DiskOOMError
+
+using HostMadviseFn = int (*)(void*, size_t, int);
+using HostMemsetFn = void* (*) (void*, int, size_t);
+
+bool hostUseThp();
+int hostPrefaultThreads();
+void hostMadvisePageMode(MemAddress ptr, size_t size, bool useThp, HostMadviseFn madviseFn = nullptr) noexcept;
+void hostPrefaultChunk(MemAddress ptr, size_t size, HostMadviseFn madviseFn = nullptr, HostMemsetFn memsetFn = nullptr);
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

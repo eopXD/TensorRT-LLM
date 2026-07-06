@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +30,7 @@ from defs.trt_test_alternative import check_call
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -75,7 +76,7 @@ def test_llm_gpt2_medium_1gpu(gpt_example_root, llm_venv,
                               llm_gpt2_medium_model_root, cmodel_dir,
                               engine_dir, use_gemm_plugin, use_py_session,
                               streaming):
-    "gpt2-medium build & run"
+    """gpt2-medium build & run"""
     print("Converting checkpoint...")
     dtype = 'float16'
     ckpt_dir = convert_weights(llm_venv=llm_venv,
@@ -152,8 +153,7 @@ def test_llm_gpt2_medium_1gpu(gpt_example_root, llm_venv,
 def test_llm_gpt2_medium_bad_words_1gpu(gpt_example_root, llm_venv,
                                         llm_gpt2_medium_model_root, cmodel_dir,
                                         engine_dir, use_py_session, streaming):
-    "gpt2 build & run"
-
+    """gpt2 build & run"""
     if use_py_session and streaming:
         pytest.skip(
             "Streaming with py session does not return complete sequence to reliably check stop words"
@@ -225,7 +225,7 @@ def test_llm_gpt2_medium_bad_words_1gpu(gpt_example_root, llm_venv,
 def test_llm_gpt2_medium_stop_words_1gpu(gpt_example_root, llm_venv,
                                          llm_gpt2_medium_model_root, cmodel_dir,
                                          engine_dir, use_py_session, streaming):
-    "gpt2 build & run"
+    """gpt2 build & run"""
     if use_py_session and streaming:
         pytest.skip(
             "Streaming with py session does not return complete sequence to reliably check stop words"
@@ -318,9 +318,9 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
         "trtllm-build",
         f"--checkpoint_dir={ckpt_dir}",
         f"--output_dir={engine_dir}",
-        f"--max_batch_size=4",
-        f"--max_input_len=924",
-        f"--max_seq_len=1024",
+        "--max_batch_size=4",
+        "--max_input_len=924",
+        "--max_seq_len=1024",
         f"--gpt_attention_plugin={dtype}",
         "--max_prompt_embedding_table_size=200",
     ]
@@ -418,7 +418,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
         f"--prompt_table={squad_table}",
         f"--num_prepend_vtokens={inference_params['squad']['num_v_tokens']}",
         f"--input_text={inference_params['squad']['input']}",
-        f"--no-kv_cache_enable_block_reuse",
+        "--no-kv_cache_enable_block_reuse",
     ]
 
     if use_py_session:
@@ -440,7 +440,7 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
         f"--prompt_table={train900_table}",
         f"--num_prepend_vtokens={inference_params['train900']['num_v_tokens']}",
         f"--input_text={inference_params['train900']['input']}",
-        f"--no-kv_cache_enable_block_reuse",
+        "--no-kv_cache_enable_block_reuse",
     ]
 
     if use_py_session:
@@ -461,14 +461,14 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
         f"--engine_dir={engine_dir}",
         f"--vocab_file={ckpt_dir}/tokenizer.model",
         f"--prompt_table={merged_table}",
-        f"--num_prepend_vtokens",
+        "--num_prepend_vtokens",
         str(inference_params['squad']['num_v_tokens']),
         str(inference_params['train900']['num_v_tokens']),
-        f"--prompt_tasks=0,1",
-        f"--input_text",
+        "--prompt_tasks=0,1",
+        "--input_text",
         inference_params["squad"]["input"],
         inference_params['train900']['input'],
-        f"--no-kv_cache_enable_block_reuse",
+        "--no-kv_cache_enable_block_reuse",
     ]
 
     if use_py_session:
@@ -497,15 +497,15 @@ def test_llm_gpt2_next_prompt_tuning(gpt_example_root, llm_venv,
             f"--engine_dir={engine_dir}",
             f"--vocab_file={ckpt_dir}/tokenizer.model",
             f"--prompt_table={merged_table}",
-            f"--num_prepend_vtokens",
+            "--num_prepend_vtokens",
             str(inference_params['squad']['num_v_tokens']),
             str(inference_params['train900']['num_v_tokens']),
-            f"--prompt_tasks=0,1",
+            "--prompt_tasks=0,1",
             "--streaming",
-            f"--input_text",
+            "--input_text",
             inference_params["squad"]["input"],
             inference_params['train900']['input'],
-            f"--no-kv_cache_enable_block_reuse",
+            "--no-kv_cache_enable_block_reuse",
         ]
 
         output = venv_mpi_check_output(
@@ -551,7 +551,7 @@ def test_llm_gpt_starcoder_lora_1gpu(data_type, lora_data_type,
                                      llm_datasets_root, llm_venv, cmodel_dir,
                                      engine_dir, llm_lora_model_root,
                                      qcache_dir):
-    "run starcoder2 lora test on 1gpu"
+    """Run starcoder2 lora test on 1gpu"""
     if data_type == 'fp8':
         skip_fp8_pre_ada(use_fp8=True)
     else:
@@ -602,7 +602,7 @@ def test_llm_gpt_starcoder_lora_1gpu(data_type, lora_data_type,
 
     input_text = "def print_hello_world():"
 
-    print(f"Run inference with lora id 0...")
+    print("Run inference with lora id 0...")
     venv_check_call(llm_venv, [
         f"{gpt_example_root}/../../../run.py",
         "--max_output_len=20",
@@ -621,7 +621,7 @@ def test_llm_gpt_starcoder_lora_1gpu(data_type, lora_data_type,
     predict = [int(p) for p in predict]
     assert ref_1 == predict or data_type != "float16"
 
-    print(f"Run inference with lora id -1...")
+    print("Run inference with lora id -1...")
     venv_check_call(llm_venv, [
         f"{gpt_example_root}/../../../run.py",
         "--max_output_len=20",
@@ -650,8 +650,7 @@ def test_llm_minitron_fp8_with_pseudo_loras(gpt_example_root,
                                             cmodel_dir,
                                             engine_dir,
                                             dtype='bfloat16'):
-    "Run Minitron model with multiple pseudo LoRAs."
-
+    """Run Minitron model with multiple pseudo LoRAs."""
     # Quantize the base model to fp8.
     print("Quantizing and converting checkpoint...")
     ckpt_dir = f"{cmodel_dir}/minitron/fp8/1-gpu"
@@ -689,11 +688,12 @@ def test_llm_minitron_fp8_with_pseudo_loras(gpt_example_root,
 @pytest.mark.parametrize("llm_lora_model_root",
                          ['gpt-oss-20b-lora-adapter_NIM_r8'],
                          indirect=True)
+@pytest.mark.parametrize("v2_kv_cache", [True, False],
+                         ids=["v2_kv_cache", "v1_kv_cache"])
 def test_gpt_oss_20b_lora_torch(gpt_example_root, llm_venv, gpt_oss_model_root,
                                 llm_datasets_root, llm_rouge_root, engine_dir,
-                                cmodel_dir, llm_lora_model_root):
+                                cmodel_dir, llm_lora_model_root, v2_kv_cache):
     """Run GPT-OSS-20B with LoRA adapter using Torch backend."""
-
     print(f"Using LoRA from: {llm_lora_model_root}")
 
     defs.ci_profiler.start("test_gpt_oss_20b_lora_torch")
@@ -705,7 +705,13 @@ def test_gpt_oss_20b_lora_torch(gpt_example_root, llm_venv, gpt_oss_model_root,
         max_cpu_loras=1,
     )
 
-    with LLM(model=gpt_oss_model_root, lora_config=lora_config) as llm:
+    # I-8 (§2d): exercise LoRA under both KV cache managers (V1/V2) for parity.
+    # Cf. docs/source/kv_cache_manager_v2_bringup/model_bringup.html §2d I-8.
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=v2_kv_cache)
+
+    with LLM(model=gpt_oss_model_root,
+             lora_config=lora_config,
+             kv_cache_config=kv_cache_config) as llm:
 
         prompts = [
             "User: Message Mason saying that we should compete in next week's football tournament, and tell him that the winner will get $100.\n\nAssistant: "

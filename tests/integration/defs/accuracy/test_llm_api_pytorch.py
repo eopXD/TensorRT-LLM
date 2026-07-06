@@ -51,8 +51,7 @@ from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
 # Keep helper definitions below imports so new imports do not need E402
 # suppressions in this legacy test file.
 def patch_mpi_pool_session_for_env(mocker, env_vars: dict):
-    """
-    Patch MpiPoolSession._start_mpi_pool to propagate environment variables to MPI child processes.
+    """Patch MpiPoolSession._start_mpi_pool to propagate environment variables to MPI child processes.
 
     Uses MPIPoolExecutor's built-in `env` parameter instead of `initializer` to avoid
     segfault issues during process cleanup (UCX memory cache conflicts with PyTorch
@@ -4207,7 +4206,7 @@ class TestQwen3_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-4B"
 
     def test_eagle3(self):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5698434"
+        """RCCA: https://nvbugspro.nvidia.com/bug/5698434"""
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(),
@@ -4476,7 +4475,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     @pytest.mark.parametrize("tp_size,ep_size", [(1, 1)], ids=["latency"])
     def test_fp8(self, tp_size, ep_size, torch_compile):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5284463"
+        """RCCA: https://nvbugspro.nvidia.com/bug/5284463"""
         "Need to check Ada support"
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
 
@@ -4914,7 +4913,7 @@ class TestKanana_Instruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_device_not_contain(["H20", "H100"])
     def test_auto_dtype(self):
-        "RCCA: https://nvbugspro.nvidia.com/bug/5310520"
+        """RCCA: https://nvbugspro.nvidia.com/bug/5310520"""
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig(
             enable_padding=True, max_batch_size=384))
         with LLM(self.MODEL_PATH, **pytorch_config,
@@ -4940,20 +4939,36 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize(
         "kv_cache_dtype",
-        ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
+        [
+            "auto",
+            pytest.param("fp8", marks=skip_pre_blackwell),
+            # I-3 (§2d): NVFP4 KV dtype variant. Blackwell-only, same GSM8K parity
+            # tolerance as auto/fp8. Cf. docs/source/kv_cache_manager_v2_bringup/
+            # model_bringup.html §2d I-3.
+            pytest.param("nvfp4", marks=skip_pre_blackwell),
+        ])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
         pytest.param("TRTLLM", marks=skip_no_trtllm_gen_moe_support),
         pytest.param("TRITON", marks=[skip_no_hopper, skip_no_mxfp4_swizzle])
     ],
                              ids=["cutlass", "trtllm", "triton"])
-    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
-        (True, True),
-    ])
+    @pytest.mark.parametrize(
+        "cuda_graph,overlap_scheduler,enable_block_reuse",
+        [
+            (True, True, True),
+            # §2c minimal-baseline anchor cell: reuse off, no CUDA graph, no
+            # overlap. Failure here pins blame on backend coupling, not
+            # feature interactions. Cf. docs/source/
+            # kv_cache_manager_v2_bringup/model_bringup.html §2c.
+            (False, False, False),
+        ],
+        ids=["cuda_graph-overlap_scheduler", "baseline_no_reuse"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_w4_1gpu(self, kv_cache_dtype, moe_backend, cuda_graph,
-                     overlap_scheduler, mocker, v2_kv_cache):
+                     overlap_scheduler, enable_block_reuse, mocker,
+                     v2_kv_cache):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
@@ -4964,6 +4979,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype,
+                                        enable_block_reuse=enable_block_reuse,
                                         use_kv_cache_manager_v2=v2_kv_cache)
 
         llm = LLM(self.MODEL_PATH,
@@ -4974,6 +4990,256 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   max_batch_size=720,
                   **pytorch_config,
                   moe_config=MoeConfig(backend=moe_backend))
+
+        with llm:
+            model_name = "GPT-OSS/20B-MXFP4"
+            task = GSM8K(model_name)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.extra_evaluator_kwargs)
+
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_w4_1gpu_prefix_reuse(self, v2_kv_cache):
+        # I-1 (§2d): cross-request KV block reuse. Send the same long shared
+        # prefix twice; assert the second (warm) request reuses KV blocks via
+        # the iteration-stats introspection API, and that reuse does not
+        # perturb the generated tokens (warm output == cold output under greedy
+        # decoding). Runs on V1 and V2 for parity. Cf. docs/source/
+        # kv_cache_manager_v2_bringup/model_bringup.html §2d I-1.
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        enable_block_reuse=True,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
+
+        # The overlap scheduler surfaces iteration stats for the *previous*
+        # batch, which would race the warm request's reuse delta against the
+        # drain that follows it. Disable it so the reuse is observable in the
+        # immediately-following get_stats() drain.
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=8,
+                  disable_overlap_scheduler=True,
+                  enable_iter_perf_stats=True,
+                  moe_config=MoeConfig(backend="CUTLASS"))
+
+        # Repeat a sentence so the prefix spans many KV blocks (full-block
+        # reuse), not just a single partial trailing block.
+        prefix = (
+            "In large language model inference, the key-value cache stores the "
+            "attention keys and values computed for each token so they are not "
+            "recomputed on later decoding steps. ") * 24
+        sampling = SamplingParams(max_tokens=16, temperature=0.0)
+
+        def _max_reused_blocks():
+            reused = 0
+            for s in llm.get_stats(timeout=10):
+                for _, window in (s.get("kvCacheIterationStats") or {}).items():
+                    reused = max(reused, window.get("iterReusedBlocks", 0))
+                cumulative = s.get("kvCacheStats") or {}
+                reused = max(reused, cumulative.get("reusedBlocks", 0))
+            return reused
+
+        with llm:
+            cold = llm.generate([prefix], sampling)
+            _max_reused_blocks()  # drain the cold request's stats
+            warm = llm.generate([prefix], sampling)
+            warm_reused = _max_reused_blocks()
+
+        cold_text = cold[0].outputs[0].text
+        warm_text = warm[0].outputs[0].text
+        assert warm_reused > 0, (
+            "expected KV block reuse on the warm request "
+            f"(v2_kv_cache={v2_kv_cache}); iterReusedBlocks/reusedBlocks was 0")
+        assert warm_text == cold_text, (
+            "block reuse changed generated tokens: "
+            f"cold={cold_text!r} warm={warm_text!r}")
+
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_w4_1gpu_chunked_prefill_reuse(self, v2_kv_cache):
+        # I-5 (§2d): chunked prefill. Run a long prompt with max_num_tokens
+        # small enough that the prefill is split across several chunks, and
+        # assert the generated tokens are identical to the same request run
+        # WITHOUT chunking (greedy determinism) -- i.e. the per-chunk KV commit
+        # on each chunk boundary does not corrupt state. Parametrized over
+        # V1/V2 for parity. Cf. docs/source/kv_cache_manager_v2_bringup/
+        # model_bringup.html §2d I-5.
+
+        # Repeat a sentence so the prompt spans many tokens / several prefill
+        # chunks (same prompt shape as the I-1 reuse cell).
+        prompt = (
+            "In large language model inference, the key-value cache stores the "
+            "attention keys and values computed for each token so they are not "
+            "recomputed on later decoding steps. ") * 24
+        sampling = SamplingParams(max_tokens=16, temperature=0.0)
+
+        def _generate(enable_chunked_prefill, max_num_tokens):
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                            enable_block_reuse=False,
+                                            use_kv_cache_manager_v2=v2_kv_cache)
+            llm = LLM(self.MODEL_PATH,
+                      tensor_parallel_size=1,
+                      kv_cache_config=kv_cache_config,
+                      max_batch_size=8,
+                      max_num_tokens=max_num_tokens,
+                      enable_chunked_prefill=enable_chunked_prefill,
+                      disable_overlap_scheduler=True,
+                      moe_config=MoeConfig(backend="CUTLASS"))
+            with llm:
+                return llm.generate([prompt], sampling)[0].outputs[0].text
+
+        # Chunk size (max_num_tokens) well below the prompt length forces
+        # multiple prefill chunks; the reference keeps the whole prompt in a
+        # single prefill.
+        chunked = _generate(enable_chunked_prefill=True, max_num_tokens=256)
+        reference = _generate(enable_chunked_prefill=False, max_num_tokens=8192)
+
+        assert chunked == reference, (
+            "chunked prefill changed generated tokens "
+            f"(v2_kv_cache={v2_kv_cache}): chunked={chunked!r} "
+            f"reference={reference!r}")
+
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_w4_1gpu_host_offload_reuse(self, v2_kv_cache):
+        # I-6 (§2d): host offloading. Cap the GPU KV pool small (max_tokens) and
+        # provide a host cache tier so that a cold request's reusable blocks are
+        # evicted GPU->host under pressure from distinct filler requests, then
+        # recalled host->GPU when the same prefix is sent again. Assert the warm
+        # request still reuses (reused > 0) and that the recalled path does not
+        # change generated tokens (warm == cold). Parametrized over V1/V2 for
+        # parity; V2 host offload honours host_cache_size
+        # (kv_cache_manager_v2.py). Cf. docs/source/kv_cache_manager_v2_bringup/
+        # model_bringup.html §2d I-6.
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.7,
+            # Primary pool must be smaller than prefix + one filler so a filler
+            # forces the cached prefix out to the host tier (2048 held both, so
+            # nothing was evicted -> offload/onboard were 0). ~1024 tokens holds
+            # the ~840-token prefix but not prefix + a concurrent filler.
+            max_tokens=1024,
+            enable_block_reuse=True,
+            host_cache_size=2 * (1 << 30),  # 2 GiB host tier
+            use_kv_cache_manager_v2=v2_kv_cache)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=8,
+                  max_seq_len=1024,
+                  disable_overlap_scheduler=True,
+                  enable_iter_perf_stats=True,
+                  moe_config=MoeConfig(backend="CUTLASS"))
+
+        # ~840-token prefix (spans many KV blocks); each distinct filler is a
+        # different long prompt so it does not itself reuse the prefix.
+        prefix = (
+            "In large language model inference, the key-value cache stores the "
+            "attention keys and values computed for each token so they are not "
+            "recomputed on later decoding steps. ") * 24
+        fillers = [
+            ("Distributed training partitions model weights and optimizer "
+             "state across many accelerators to fit models that exceed the "
+             "memory of a single device. ") * 24,
+            ("Speculative decoding drafts several future tokens with a small "
+             "model and verifies them in parallel with the target model to "
+             "reduce end-to-end generation latency. ") * 24,
+        ]
+        sampling = SamplingParams(max_tokens=16, temperature=0.0)
+
+        def _drain_stats():
+            # Accumulate reuse + host<->GPU transfer counters across a
+            # get_stats() drain. V2's pool-group stats (PR #15633) expose the
+            # per-iteration onboard (host->GPU) / offload (GPU->host) byte
+            # counters that directly evidence the round-trip.
+            reused = offload_bytes = onboard_bytes = secondary_used = 0
+            for s in llm.get_stats(timeout=10):
+                for _, w in (s.get("kvCacheIterationStats") or {}).items():
+                    reused = max(reused, w.get("iterReusedBlocks", 0))
+                reused = max(reused, (s.get("kvCacheStats")
+                                      or {}).get("reusedBlocks", 0))
+                for _, pg in (s.get("kvCacheIterationStatsByPoolGroup")
+                              or {}).items():
+                    offload_bytes += pg.get("iterOffloadBytes", 0)
+                    onboard_bytes += pg.get("iterOnboardBytes", 0)
+                    secondary_used = max(secondary_used,
+                                         pg.get("secondaryUsedNumBlocks", 0))
+            return reused, offload_bytes, onboard_bytes, secondary_used
+
+        with llm:
+            cold = llm.generate([prefix], sampling)
+            _drain_stats()  # drain the cold request's stats
+            # Distinct fillers overflow the small GPU pool, forcing the cold
+            # prefix's reusable blocks to be offloaded GPU->host.
+            llm.generate(fillers, sampling)
+            _, filler_offload, _, secondary_after_fillers = _drain_stats()
+            # The warm request must recall the prefix blocks host->GPU.
+            warm = llm.generate([prefix], sampling)
+            warm_reused, _, warm_onboard, _ = _drain_stats()
+
+        cold_text = cold[0].outputs[0].text
+        warm_text = warm[0].outputs[0].text
+        print(f"[I-6] v2_kv_cache={v2_kv_cache} warm_reused={warm_reused} "
+              f"filler_offload_bytes={filler_offload} "
+              f"secondary_used_after_fillers={secondary_after_fillers} "
+              f"warm_onboard_bytes={warm_onboard}")
+        assert warm_reused > 0, (
+            "expected KV block reuse via host offload on the warm request "
+            f"(v2_kv_cache={v2_kv_cache}); iterReusedBlocks/reusedBlocks was 0")
+        assert warm_text == cold_text, (
+            "host-offload reuse changed generated tokens: "
+            f"cold={cold_text!r} warm={warm_text!r}")
+        if v2_kv_cache:
+            # Direct proof of the GPU->host->GPU round-trip via V2 pool-group
+            # transfer counters (PR #15633): the cold prefix's blocks were
+            # offloaded to the host tier under filler pressure, then onboarded
+            # back to GPU for the warm request.
+            assert filler_offload > 0 or secondary_after_fillers > 0, (
+                "expected GPU->host offload under filler pressure "
+                f"(iterOffloadBytes={filler_offload}, "
+                f"secondaryUsedNumBlocks={secondary_after_fillers})")
+            assert warm_onboard > 0, (
+                "expected host->GPU onboard on the warm request; "
+                f"iterOnboardBytes={warm_onboard} was 0 (blocks not recalled "
+                "from the host tier)")
+
+    @pytest.mark.skip(
+        reason="GPT-OSS requires attn_backend='TRTLLM' (attention sinks, see "
+        "tensorrt_llm/_torch/models/modeling_gpt_oss.py:85) and is rejected at "
+        "model init on FlashInfer, so this cell cannot run on GPT-OSS for "
+        "either V1 or V2. The V2 blocks_in_primary_pool FlashInfer read-path "
+        "contract is already covered at unit level by tests/unittest/_torch/"
+        "attention/test_kv_cache_manager_backend_contract.py. Integration-level "
+        "FlashInfer x V2 coverage needs a FlashInfer-capable model "
+        "(e.g. Llama-3.1-8B) and is tracked as §2c backlog.")
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_w4_1gpu_flashinfer(self, mocker, v2_kv_cache):
+        # §2c PyTorch x FlashInfer x (V1, V2) cell — SKIPPED for GPT-OSS.
+        # GPT-OSS mandates TRTLLM attention (attention sinks), so FlashInfer is
+        # rejected at model init (verified empirically on B200, 2026-06-24).
+        # FlashInfer reads ``kv_cache_manager.blocks_in_primary_pool`` directly
+        # (flashinfer.py:237); the V2-readiness of that attribute is verified by
+        # the unit-level backend-contract test. Cf.
+        # docs/source/kv_cache_manager_v2_bringup/model_bringup.html §1d/§2c.
+        mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
+        mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
+                          {"scores_filter": "exact_match,flexible-extract"})
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=720,
+                  attn_backend="FLASHINFER",
+                  disable_overlap_scheduler=True,
+                  cuda_graph_config=None,
+                  moe_config=MoeConfig(backend="CUTLASS"))
 
         with llm:
             model_name = "GPT-OSS/20B-MXFP4"
@@ -5376,7 +5642,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("one_model", [True, False],
                              ids=["one_model", "two_model"])
-    def test_eagle3_vswa_reuse_4gpus(self, one_model, mocker):
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_eagle3_vswa_reuse_4gpus(self, v2_kv_cache, one_model, mocker):
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -5387,11 +5655,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
+        if v2_kv_cache and not one_model:
+            pytest.skip(
+                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
+            )
+
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         dtype="auto",
                                         enable_block_reuse=True,
-                                        max_attention_window=[128, 32768])
+                                        max_attention_window=[128, 32768],
+                                        use_kv_cache_manager_v2=v2_kv_cache)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
@@ -5491,8 +5765,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
-    def test_eagle3_2gpus(self, moe_backend, one_model, overlap_scheduler,
-                          mocker):
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_eagle3_2gpus(self, v2_kv_cache, moe_backend, one_model,
+                          overlap_scheduler, mocker):
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -5503,13 +5779,19 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
+        if v2_kv_cache and not one_model and overlap_scheduler:
+            pytest.skip(
+                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
+            )
+
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(
             max_batch_size=8,
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8))
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                        dtype="auto")
+                                        dtype="auto",
+                                        use_kv_cache_manager_v2=v2_kv_cache)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
@@ -5565,7 +5847,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
-    def test_eagle3_1gpu(self, moe_backend, one_model, mocker):
+    # I-7 (§2d): parametrize V1/V2 for KVCacheManagerV2 Eagle3 parity at TP=1.
+    # two_model runs overlap-off here (disable_overlap_scheduler=not one_model),
+    # so V2 needs no skip. Cf. docs/source/kv_cache_manager_v2_bringup/
+    # model_bringup.html §2d I-7.
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_eagle3_1gpu(self, moe_backend, one_model, mocker, v2_kv_cache):
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.object(GSM8K, "NUM_SAMPLES", 300)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
@@ -5577,7 +5865,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(max_batch_size=8))
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
                                         dtype="auto",
-                                        enable_block_reuse=False)
+                                        enable_block_reuse=False,
+                                        use_kv_cache_manager_v2=v2_kv_cache)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 5

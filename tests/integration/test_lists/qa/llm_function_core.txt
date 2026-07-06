@@ -484,8 +484,10 @@ accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_fp8_prequantized
 accuracy/test_llm_api_pytorch.py::TestGLM5FP8::test_8gpus[tp_size=8-ep_size=8]
 accuracy/test_llm_api_pytorch.py::TestGLM52::test_nvfp4[tp_size=8-ep_size=8]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[cutlass-one_model-overlap_scheduler]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[triton-one_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[v1_kv_cache-cutlass-one_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[v1_kv_cache-triton-one_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[v1_kv_cache-cutlass-two_model-overlap_scheduler]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_2gpus[v1_kv_cache-triton-two_model-overlap_scheduler]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-one_model-no_overlap_scheduler]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-one_model-overlap_scheduler]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-triton-one_model-no_overlap_scheduler]
@@ -499,15 +501,17 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trit
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-no_overlap_scheduler]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-overlap_scheduler]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_guided_decoding_4gpus[one_model]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[one_model]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-auto]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-cutlass-fp8]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-triton-auto]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-fp8]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-cutlass-auto]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-fp8]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[v1_kv_cache-one_model]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-cuda_graph-overlap_scheduler-cutlass-auto]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-cuda_graph-overlap_scheduler-cutlass-fp8]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-cuda_graph-overlap_scheduler-triton-auto]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-cuda_graph-overlap_scheduler-trtllm-auto]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-cuda_graph-overlap_scheduler-trtllm-fp8]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-cuda_graph-overlap_scheduler-cutlass-auto]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-cuda_graph-overlap_scheduler-trtllm-auto]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-cuda_graph-overlap_scheduler-trtllm-fp8]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_guided_decoding_4gpus[two_model]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_vswa_reuse_4gpus[v1_kv_cache-two_model]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu_piecewise_cuda_graph
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-cutlass-auto]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_2gpus[dp2-triton-auto]
@@ -941,26 +945,6 @@ test_e2e.py::test_openai_chat_harmony_perf_metrics
 test_e2e.py::test_openai_kv_cache_contamination
 test_e2e.py::test_ptp_quickstart_advanced[Qwen3-30B-A3B-Qwen3/Qwen3-30B-A3B]
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
-disaggregated/test_auto_scaling.py::test_service_discovery[etcd-round_robin]
-disaggregated/test_auto_scaling.py::test_service_discovery[etcd-load_balancing]
-disaggregated/test_auto_scaling.py::test_service_discovery[etcd-kv_cache_aware]
-disaggregated/test_auto_scaling.py::test_service_discovery[http-round_robin]
-disaggregated/test_auto_scaling.py::test_service_discovery[http-load_balancing]
-disaggregated/test_auto_scaling.py::test_service_discovery[http-kv_cache_aware]
-disaggregated/test_auto_scaling.py::test_minimal_instances[etcd-round_robin]
-disaggregated/test_auto_scaling.py::test_minimal_instances[http-round_robin]
-disaggregated/test_auto_scaling.py::test_worker_restart[etcd-round_robin]
-disaggregated/test_auto_scaling.py::test_worker_restart[etcd-load_balancing]
-disaggregated/test_auto_scaling.py::test_worker_restart[etcd-kv_cache_aware]
-disaggregated/test_auto_scaling.py::test_worker_restart[http-round_robin]
-disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
-disaggregated/test_auto_scaling.py::test_worker_restart[http-kv_cache_aware]
-disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
-disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
-disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python[DeepSeek-V3-Lite-fp8]
-disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
 test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_w4afp8_8gpus[DeepSeek-R1-W4AFP8-DeepSeek-R1/DeepSeek-R1-W4AFP8]
 test_e2e.py::test_ptp_quickstart_advanced_pp_enabled[Llama3.3-70B-FP8-llama-3.3-models/Llama-3.3-70B-Instruct-FP8-2-2-False]
@@ -986,19 +970,15 @@ accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm_4g
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm_4gpus[tp4-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm_4gpus[ep4-cuda_graph=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_bf16_gemm_4gpus[ep4-cuda_graph=True]
-
 # llm-api promote pytorch to default
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_tensorrt
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_default
-llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
-
 # Routed-expert (MoE) LoRA
 llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[eager] TIMEOUT (90)
 llmapi/test_llm_api_pytorch_moe_lora.py::test_qwen_moe_routed_expert_multi_lora_varying_ranks[cudagraph] TIMEOUT (90)
 llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[eager] TIMEOUT (90)
 llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[cudagraph] TIMEOUT (90)
-
 # CuteDSL NVFP4 tests
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_nvfp4[fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_cute_dsl_nvfp4[fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-torch_compile=True]

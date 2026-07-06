@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bring-Up — Session 01 Starter Prompt</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --fg: #1f2937;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --code-bg: #f3f4f6;
+    --code-block-bg: #0f172a;
+    --code-block-fg: #e5e7eb;
+    --accent: #1f4e8c;
+    --accent-bg: #eef4fb;
+    --yellow: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+    line-height: 1.55;
+    font-size: 15px;
+  }
+  main {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 40px 28px 80px;
+  }
+  h1 { font-size: 26px; margin: 0 0 8px; }
+  h2 { font-size: 18px; margin: 28px 0 10px; }
+  p { margin: 8px 0 12px; }
+  ul { margin: 8px 0 12px; padding-left: 24px; }
+  li { margin: 3px 0; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 0.92em;
+  }
+  .meta { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .callout {
+    border-left: 4px solid var(--yellow);
+    background: #fff7ed;
+    padding: 10px 14px;
+    margin: 14px 0 20px;
+    border-radius: 0 6px 6px 0;
+    font-size: 14px;
+  }
+  .prompt-wrap {
+    position: relative;
+    margin: 18px 0 0;
+  }
+  pre.prompt {
+    background: var(--code-block-bg);
+    color: var(--code-block-fg);
+    padding: 18px 20px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  button.copy {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    background: #334155;
+    color: #fff;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 5px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  button.copy:hover { background: #475569; }
+  button.copy.copied { background: #10b981; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Bring-Up — Session 01 Starter Prompt</h1>
+<div class="meta">For pasting verbatim into the next session. Scope: §2b audit + first cells of §2c backend configuration matrix from <code>model_bringup.html</code> (GPT-OSS-120B, Phase 1).</div>
+
+<p>Paste the block below verbatim to start the next session. It's self-contained: it points to the plan, scopes session 01 to <strong>audit + Backend configuration</strong> (the first of three matrices per the rollout structure), and lists explicit done criteria. Inference configuration (§2d) and Deployment configuration (§2e) are deliberately held for sessions 02 and 03.</p>
+
+<div class="callout">Why this order: the backend coupling contract (which V1 attributes the manager exposes, which <code>PageIndexMode</code> each attention backend uses) is the floor under everything else. A broken cell here cascades into every inference-feature test in §2d and every multi-GPU run in §2e.</div>
+
+<h2>Prompt</h2>
+<div class="prompt-wrap">
+<button class="copy" onclick="copyPrompt(this)">Copy</button>
+<pre class="prompt" id="prompt-block">Context: We have a model-bring-up plan for KVCacheManagerV2 at
+`tensorrt_llm/runtime/kv_cache_manager_v2/model_bringup.html`. The gap
+matrix that motivates it is at `~/Downloads/kv_cache_v1_v2_gap_20260512.pdf`.
+V1 lives at `tensorrt_llm/_torch/pyexecutor/resource_manager.py:303`,
+V2 at `:1807`, toggle at `KvCacheConfig.use_kv_cache_manager_v2`. Phase 1
+targets GPT-OSS-120B and is structured as three matrices:
+
+  - §2c Backend configuration   (execution backend × attention backend × V1/V2)
+  - §2d Inference configuration (V2 feature interactions; fix the backend)
+  - §2e Deployment configuration (B200, multi-GPU, disagg, multi-node)
+
+Goal for this session: land **§2b audit** and the first cells of
+**§2c backend configuration matrix**. Nothing in §2d or §2e yet.
+
+Part 1 — §2b audit (where we are today)
+1. Read the existing §2b table in `model_bringup.html`. Verify each row
+   against the repo:
+     - `TestGPTOSS::*` methods in
+       `tests/integration/defs/accuracy/test_llm_api_pytorch.py` (around
+       line 5314). For each method, confirm whether it parametrizes
+       `v2_kv_cache` today.
+     - The disagg test at
+       `tests/integration/defs/disaggregated/test_disaggregated.py:2066`
+       (`test_disaggregated_gpt_oss_120b_harmony`).
+     - The AutoDeploy patch at
+       `tensorrt_llm/_torch/auto_deploy/models/patches/gptoss-mxfp4.py`.
+     - L0 test-list entries in `tests/integration/test_lists/test-db/`
+       (search for `TestGPTOSS` and `gpt_oss`).
+   If anything in the audit table is wrong or stale, edit §2b in the doc
+   to match reality and explain the correction in the commit message.
+
+2. Append a short "Backend-coupling contract" subsection inside §1d (NOT
+   a new top-level section). For each attribute V1 attention backends
+   read directly off the KV cache manager (start with
+   `blocks_in_primary_pool`; grep `tensorrt_llm/_torch/attention_backend/`
+   for `kv_cache_manager.` access), confirm whether V2
+   (`tensorrt_llm.runtime.kv_cache_manager_v2.KVCacheManager`) exposes the
+   same name with the same semantics. Produce a small table:
+   "attribute / V1 ✓ / V2 ✓-or-✗ / call site". This is the contract that
+   the backend matrix in §2c verifies.
+
+Part 2 — §2c backend configuration matrix (first cells)
+3. Add a smoke test under `tests/unittest/_torch/attention/` that
+   parametrizes `attn_backend ∈ {TRTLLM, TRTLLM_GEN, FlashInfer,
+   FlashAttention, Vanilla}` and `use_kv_cache_manager_v2 ∈ {True, False}`,
+   loads a small model that's already in that file's CI, generates one
+   token, asserts no AttributeError on the manager. Skip backends not
+   supported on the runner's SM. This is the floor under §2c.
+
+4. Fill the **PyTorch × TRTLLM × V1/V2** anchor cell of §2c. This already
+   exists as `TestGPTOSS::test_w4_1gpu` parametrized on `v2_kv_cache`. Add
+   an explicit subcase (or `@pytest.mark.parametrize` id) with
+   `enable_block_reuse=False`, no CUDA graph, no overlap, so the §2c
+   matrix has a clean minimal baseline. Confirm V1 and V2 both pass on
+   B200.
+
+5. Add the **PyTorch × FlashInfer × V1/V2** cell to §2c. FlashInfer reads
+   `blocks_in_primary_pool` directly off the manager
+   (`_torch/attention_backend/flashinfer.py:237`), so the V2 cell is the
+   load-bearing one. If V2 does not expose `blocks_in_primary_pool` with
+   the same semantics, expose it on V2 — do NOT add a fallback in
+   FlashInfer.
+
+Constraints
+- Do NOT touch §2d (inference) or §2e (deployment) tests yet — separate
+  sessions.
+- Do NOT cross-product attention backends with inference features (reuse,
+  SWA, host offload, …); that's §2d work.
+- Do NOT touch beam search, disagg, kv connector, events, stats,
+  per-request salting, two-model spec dec — all V2-unsupported per §1c.
+- Do NOT introduce new fallback-to-V1 paths inside the manager wrapper;
+  if V2 lacks an API a backend needs, expose it on V2.
+- Update the §6 tracking-table cells for: Audit, B-PyTorch-TRTLLM,
+  B-PyTorch-FlashInfer. Mark with platform, date, and the test ID.
+- Commit with `git commit -s`; PR title format
+  `[None][test] KVCacheManagerV2 bring-up: GPT-OSS-120B §2b audit + §2c backend`.
+
+Done criteria
+- §2b audit table verified against the repo and any corrections merged.
+- §1d gains a "Backend-coupling contract" subsection with the
+  attribute/V1/V2/call-site table.
+- The cross-backend smoke test passes on at least one GPU; skipped cells
+  use a clear `pytest.skip` reason naming the SM/GPU.
+- `TestGPTOSS::test_w4_1gpu` minimal-baseline subcase is green on B200
+  for both V1 and V2.
+- The FlashInfer × V2 cell in §2c passes (or, if V2 needs an API change,
+  the change lands in this PR and the cell passes after it).
+- §6 tracking-table rows for Audit, B-PyTorch-TRTLLM, B-PyTorch-FlashInfer
+  flipped to green with platform/date.
+
+Out of scope (next sessions)
+- Session 02: rest of §2c (TRTLLM-gen, FlashAttention, Triton-prefill,
+  AutoDeploy cells).
+- Session 03: §2d inference matrix (I-0 through I-11).
+- Session 04: §2e deployment matrix on B200 (D-0 through D-6, including
+  disagg fallback).</pre>
+</div>
+
+<script>
+  function copyPrompt(btn) {
+    const text = document.getElementById('prompt-block').innerText;
+    navigator.clipboard.writeText(text).then(() => {
+      btn.textContent = 'Copied';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 1500);
+    }).catch(() => {
+      btn.textContent = 'Press Ctrl/Cmd+C';
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
+    });
+  }
+</script>
+
+</main>
+</body>
+</html>

@@ -189,6 +189,17 @@
   <li><strong>Toggle</strong>: <code>KvCacheConfig.use_kv_cache_manager_v2</code> (see <code>llmapi/llm_args.py:2626</code>). V2 is auto-selected for Gemma4 hybrid (per-layer <code>head_dim</code>) regardless of the flag (<code>_torch/pyexecutor/_util.py:67</code>).</li>
 </ul>
 
+<div class="callout" id="build-under-test">
+<strong>Build under test (provenance).</strong> The results in <a href="#sec6">§6</a> are produced with the following exact build. Per-cell dates in §6 distinguish the two phases.
+<table>
+  <tr><td><strong>Wheel</strong></td><td><code>tensorrt_llm 1.3.0rc21</code> — full source rebuild (torch <strong>nv26.04</strong> devel image; NVIDIA B200 / SM100).</td></tr>
+  <tr><td><strong>Base commit on <code>main</code></strong></td><td><code>ef6ebc2f2c149ab653558649b67ba60b6ab857e6</code> (<code>ef6ebc2f2c</code>) — <em>"[None][test] Waive 1 failed cases for main in QA CI (#15977)"</em>, 2026-07-06. This is the <code>NVIDIA/TensorRT-LLM</code> <code>main</code> tip the coverage branch was rebased onto for Phase C (verified on <code>origin/main</code>).</td></tr>
+  <tr><td><strong>Key PR under test</strong></td><td><strong>#15633</strong> (<code>0b65e4fd52</code>, <em>"DSv4 follow-up: runtime KV and cache foundations"</em>) — reworks V2 pool/storage foundations and adds the per-pool-group iteration stats (<code>get_stats()["kvCacheIterationStatsByPoolGroup"]</code> → <code>iterOnboardBytes</code>/<code>iterOffloadBytes</code>). Confirmed ancestor of the base commit above.</td></tr>
+  <tr><td><strong>Test branch</strong></td><td><code>kvcv2-monitoring</code> @ <code>5a64d80956</code> on the fork <code>eopXD/TensorRT-LLM</code> — <em>test/doc commits only; no product-code changes</em> on top of the base commit.</td></tr>
+  <tr><td><strong>Phases</strong></td><td><strong>Phase A/B</strong>: <code>1.3.0rc20</code>, <em>pre</em>-#15633 (2026-07-03/06). <strong>Phase C (current)</strong>: <code>1.3.0rc21</code>, post-#15633 rebuild (2026-07-07/08) — the two V2 findings below (VSWA OOM regression; I-1 intermittent reuse divergence) are Phase C.</td></tr>
+</table>
+</div>
+
 <hr>
 
 <h2 id="sec1-0">1.0 V1 ↔ V2 architectural deltas (lens for everything below)</h2>

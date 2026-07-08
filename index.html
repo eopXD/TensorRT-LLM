@@ -32,8 +32,9 @@
 <body>
 <div class="wrap">
   <h1>KV Cache Manager V2 — Model Bring-up Coverage Map</h1>
-  <p class="sub">Branch <code>kv-cache-manager-v2-bringup</code> · tip <code>da0a878382</code> · generated 2026-06-25 · GPT-OSS-120B on B200 (sm100), wheel <code>1.3.0rc20</code></p>
-  <p class="sub">Plan source: <code>docs/source/kv_cache_manager_v2_bringup/model_bringup.html</code> (commit <code>a022d0fe41</code>). This page tracks the drafted coverage map and what has actually been executed.</p>
+  <p class="sub">Branch <code>kvcv2-monitoring</code> (fork <code>eopXD</code>) · tip <code>20eae61410</code> · updated 2026-07-08 · GPT-OSS-120B on B200 (sm100) · wheel <code>1.3.0rc21</code></p>
+  <p class="sub"><b>Build under test:</b> <code>1.3.0rc21</code> = NVIDIA <code>main</code> @ <code>ef6ebc2f2c</code> (<i>"Waive 1 failed cases for main in QA CI (#15977)"</i>, 2026-07-06) + test/doc-only commits (no product-code changes). Includes <b>#15633</b> (<code>0b65e4fd52</code>, "DSv4 follow-up: runtime KV and cache foundations" — the V2 pool-group stats). Phase A/B were <code>rc20</code> (pre-#15633); Phase C is <code>rc21</code>.</p>
+  <p class="sub">Plan source: <code>docs/source/kv_cache_manager_v2_bringup/model_bringup.html</code> (commit <code>20eae61410</code>) — the detailed §6 tracking table + per-cell evidence. This page is the summary.</p>
 
   <div class="legend card">
     <span class="badge b-ok">DONE</span> executed &amp; passed &nbsp;
@@ -47,7 +48,7 @@
     <div class="card"><div class="kpi" style="color:var(--ok)">V2 91.05</div><div class="muted">GSM8K (flex-extract) — §2c baseline anchor</div></div>
     <div class="card"><div class="kpi">V1 90.37</div><div class="muted">GSM8K — parity reference (thr 81.80)</div></div>
     <div class="card"><div class="kpi" style="color:var(--ok)">8 / 10</div><div class="muted">A1 contract cases pass (2 design-skips)</div></div>
-    <div class="card"><div class="kpi">aggregated</div><div class="muted">scope this pass (disagg deferred)</div></div>
+    <div class="card"><div class="kpi" style="color:var(--block)">1 regression</div><div class="muted">I-7 VSWA V2 OOM (rc21, #15633 suspect) — under investigation. Aggregated scope; disagg deferred.</div></div>
   </div>
 
   <!-- ================= SECTION 1: DRAFTED MAP ================= -->
@@ -71,14 +72,14 @@
   <table>
     <tr><th>#</th><th>Feature</th><th>Status</th></tr>
     <tr><td>I-0</td><td>Baseline (reuse off, no graph, no overlap)</td><td><span class="badge b-ok">DONE</span> V2 90.22 vs V1 90.52 GSM8K (2026-07-01, thr 81.8)</td></tr>
-    <tr><td>I-1</td><td>Cross-request + partial block reuse</td><td><span class="badge b-ok">DONE</span> V1+V2 reuse counted (<code>reusedBlocks</code>/<code>iterReusedBlocks &gt; 0</code>). V2 initial 0 was <code>enable_stats</code> not wired in the V2 factory (radix-tree reuse was real but uncounted); fixed by wiring <code>enable_iter_perf_stats</code> (commit ba390c84af)</td></tr>
+    <tr><td>I-1</td><td>Cross-request + partial block reuse</td><td><span class="badge b-ok">DONE</span> V1+V2 reuse counted (<code>reusedBlocks</code>/<code>iterReusedBlocks &gt; 0</code>). V2 initial 0 was <code>enable_stats</code> not wired in the V2 factory (radix-tree reuse was real but uncounted); fixed by wiring <code>enable_iter_perf_stats</code> (commit ba390c84af). <b>rc21:</b> reuse still counted; warm==cold in 5/6 V2 runs, but 1/6 showed an intermittent last-token divergence — flaky, <i>not</i> a confirmed regression (V1 0/5)</td></tr>
     <tr><td>I-2</td><td>Sliding window + attention sinks</td><td><span class="badge b-plan">PLANNED</span> — not stressed (no window override)</td></tr>
     <tr><td>I-3</td><td>KV dtype FP8 / NVFP4</td><td><span class="badge b-ok">fp8 DONE</span> V2 91.05 vs V1 90.67 GSM8K; <span class="badge b-skip">nvfp4 xfail</span> missing TRTLLM-GEN decode kernel for GPT-OSS head_dim=64 (V1+V2, not a V2 bug)</td></tr>
     <tr><td>I-4</td><td>CUDA graph + overlap scheduler</td><td><span class="badge b-ok">DONE</span> V2 90.52 vs V1 89.92 GSM8K (2026-07-01)</td></tr>
-    <tr><td>I-5</td><td>Chunked prefill</td><td><span class="badge b-plan">PLANNED</span></td></tr>
-    <tr><td>I-6</td><td>Host offloading</td><td><span class="badge b-plan">PLANNED</span></td></tr>
-    <tr><td>I-7</td><td>MTP / Eagle3 (one-model)</td><td><span class="badge b-plan">PLANNED</span></td></tr>
-    <tr><td>I-8</td><td>LoRA</td><td><span class="badge b-plan">PLANNED</span></td></tr>
+    <tr><td>I-5</td><td>Chunked prefill</td><td><span class="badge b-ok">DONE</span> chunked-prefill output == single-prefill (greedy) on V1 &amp; V2 (rc21, TP=1)</td></tr>
+    <tr><td>I-6</td><td>Host offloading</td><td><span class="badge b-ok">DONE</span> GPU→host→GPU round-trip on V1 &amp; V2. rc21 stats (#15633): V2 <b>iterOffloadBytes 72 MiB</b> / <b>iterOnboardBytes 54 MiB</b> / reused 24; identical tokens</td></tr>
+    <tr><td>I-7</td><td>MTP / Eagle3 (one-model)</td><td><span class="badge b-ok">TP=1/2/4 DONE</span> V2≈V1 (GSM8K + GPQA-Diamond). <span class="badge b-block">VSWA V2 OOM</span> — rc21 regression: <code>CuOOMError</code> in V2 storage init, fraction-independent (0.4/0.3/0.2); V1 VSWA passes and V2 passed at rc20 with identical config → <b>#15633</b> suspect. V2 two-model+overlap <span class="badge b-skip">SKIP</span> (incompatible)</td></tr>
+    <tr><td>I-8</td><td>LoRA</td><td><span class="badge b-ok">DONE</span> GPT-OSS-20B + adapter: V1 == V2 byte-identical output (rc21)</td></tr>
     <tr><td>I-9</td><td>Capacity stress (eviction; dynamic pool)</td><td><span class="badge b-plan">PLANNED</span> — <b>dynamic-pool-adjust gap</b></td></tr>
     <tr><td>I-10</td><td>Suspend / resume (V2-only; dynamic pool)</td><td><span class="badge b-plan">PLANNED</span> — <b>dynamic-pool-adjust gap</b></td></tr>
     <tr><td>I-11</td><td>NVFP4 + tokens_per_block_override</td><td><span class="badge b-plan">PLANNED</span></td></tr>
@@ -143,6 +144,10 @@
     <tr><td><code>a022d0fe41</code></td><td>[doc] KV cache manager v2 model bring-up notes (the plan)</td></tr>
     <tr><td><code>9ffa69172a</code></td><td>[test] §2c aggregated bring-up tests — A1 unit floor, A2 baseline anchor, A3 flashinfer cell, test-list ID refresh</td></tr>
     <tr><td><code>da0a878382</code></td><td>[test] skip GPT-OSS test_w4_1gpu_flashinfer (TRTLLM-only)</td></tr>
+    <tr><td><code>a904d6a7c6</code></td><td>[test] §2c/§2d bring-up coverage I-0..I-8 (squashed; rebased onto main <code>ef6ebc2f2c</code> incl. #15633)</td></tr>
+    <tr><td><code>475997b1cf</code></td><td>[doc] Phase C rc21: I-6 offload/onboard bytes + I-7 VSWA V2 regression</td></tr>
+    <tr><td><code>5a64d80956</code></td><td>[doc] I-0..I-4 rc21 re-run: I-1 intermittent reuse divergence (flaky)</td></tr>
+    <tr><td><code>20eae61410</code></td><td>[doc] Build-under-test provenance (rc21 = main ef6ebc2f2c + #15633)</td></tr>
   </table>
 
   <h3>Test configuration notes</h3>
@@ -154,7 +159,7 @@
   </ul>
 
   <footer>
-    Generated from the bring-up run on 2026-06-25. Logs on computelab scratch under <code>/home/scratch.yuehtingc_gpu/</code>. Plan: <code>docs/source/kv_cache_manager_v2_bringup/model_bringup.html</code>.
+    Generated 2026-06-25; last updated <b>2026-07-08</b> (Phase C, wheel <code>1.3.0rc21</code>, main base <code>ef6ebc2f2c</code> + #15633). Logs on computelab scratch under <code>/home/scratch.yuehtingc_gpu/tekit2/.kvcv2-mon/</code>. Plan: <code>docs/source/kv_cache_manager_v2_bringup/model_bringup.html</code>.
   </footer>
 </div>
 </body>

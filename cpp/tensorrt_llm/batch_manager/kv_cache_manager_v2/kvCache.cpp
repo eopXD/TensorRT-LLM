@@ -1301,8 +1301,7 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
                 auto& bp = sb.pages[bi][lcIdx];
                 if (blockPageIsNull(bp))
                 {
-                    TLLM_CHECK_DEBUG(mEnableSwaScratchReuse);
-                    continue; // Scratch block — already null.
+                    continue; // Scratch or skipped stale block — no page to unlock
                 }
                 TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
                 auto holder = blockPageGetPage(bp)->hold();
@@ -1687,8 +1686,7 @@ void KvCache::_onStopCommitting()
                 auto& bp = beamPages[lcIdx];
                 if (blockPageIsNull(bp))
                 {
-                    TLLM_CHECK_DEBUG(mEnableSwaScratchReuse);
-                    continue; // Scratch block — already handled
+                    continue; // Scratch or skipped stale block — no page to release
                 }
                 TLLM_CHECK_DEBUG(std::holds_alternative<SharedPtr<PageHolder>>(bp));
                 bp = std::monostate{};

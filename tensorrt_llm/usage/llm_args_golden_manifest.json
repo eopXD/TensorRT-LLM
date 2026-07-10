@@ -682,9 +682,11 @@
         "auto",
         "v1_block_key",
         "v2_sha256",
-        "v2_sha256_64"
+        "v2_sha256_64",
+        "v2_blake3",
+        "v2_blake3_64"
       ],
-      "annotation": "Literal['auto', 'v1_block_key', 'v2_sha256', 'v2_sha256_64']",
+      "annotation": "Literal['auto', 'v1_block_key', 'v2_sha256', 'v2_sha256_64', 'v2_blake3', 'v2_blake3_64']",
       "converter": "",
       "kind": "categorical",
       "path": "kv_cache_config.kv_cache_event_hash_algo"

@@ -67,6 +67,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReuseScope,
     SwaScratchReuseConfig,
     TokenIdExt,
+    _cpp_introspection,
     _KVCache,
     exact_div,
     gen_multimodal_cache_key_tokens,
@@ -1409,6 +1410,13 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
     def _format_kv_cache_pool_lifecycle_entry(self, layer_id: LayerId, role: DataRole) -> str:
+        if _cpp_introspection is not None:
+            lifecycle_id = self.impl.get_layer_group_id(layer_id)
+            layer = self.kv_cache_manager_py_config.layers[int(layer_id)]
+            return (
+                f"role={str(role)}, lifecycle_id={int(lifecycle_id)}, "
+                f"sliding_window_size={layer.sliding_window_size}"
+            )
         attr = self.impl._storage.get_buffer_attr(layer_id, role)
         pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
         lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
@@ -2484,13 +2492,18 @@ class KVCacheManagerV2(BaseResourceManager):
         return self._stats_window_size(life_cycle.window_size)
 
     def _get_storage_statistics(self, cache_level: CacheLevel):
+        if _cpp_introspection is not None:
+            return _cpp_introspection.storage_statistics(self.impl, cache_level)
         return self.impl._storage.get_statistics(cache_level)
 
     def _stats_life_cycle_metadata(self) -> dict[int, tuple[int, Optional[int], str]]:
-        pool_groups_by_life_cycle = [
-            self.impl._storage.get_pool_group_index(LifeCycleId(life_cycle_id))
-            for life_cycle_id in range(len(self.impl.layer_grouping))
-        ]
+        if _cpp_introspection is not None:
+            pool_groups_by_life_cycle = _cpp_introspection.life_cycle_pool_group_indices(self.impl)
+        else:
+            pool_groups_by_life_cycle = [
+                self.impl._storage.get_pool_group_index(LifeCycleId(life_cycle_id))
+                for life_cycle_id in range(len(self.impl.layer_grouping))
+            ]
 
         metadata: dict[int, tuple[int, Optional[int], str]] = {}
         for life_cycle_id, layer_ids in enumerate(self.impl.layer_grouping):

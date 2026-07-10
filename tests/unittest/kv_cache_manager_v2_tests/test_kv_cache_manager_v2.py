@@ -151,6 +151,19 @@ with temporary_sys_path(os.path.dirname(os.path.abspath(__file__))):
 
 
 def get_cached_cuda_event_type():
+    backend = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
+    if backend == "cpp":
+        try:
+            from bindings.internal.batch_manager.kv_cache_manager_v2 import CachedCudaEvent
+
+            return CachedCudaEvent
+        except ImportError:
+            from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2 import (
+                CachedCudaEvent,
+            )
+
+            return CachedCudaEvent
+
     if find_spec("kv_cache_manager_v2") is not None:
         from kv_cache_manager_v2._utils import CachedCudaEvent
 

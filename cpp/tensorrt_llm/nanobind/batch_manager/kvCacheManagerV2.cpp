@@ -429,10 +429,10 @@ static std::string peakBlockStatsRepr(kv::PoolGroupPeakBlockStats const& stats)
     return stream.str();
 }
 
-static nb::object castRequestIds(std::unordered_set<int64_t> const& requestIds)
+static nb::object castRequestIds(std::unordered_set<kv::RequestIdType> const& requestIds)
 {
     nb::object result = nb::module_::import_("builtins").attr("set")();
-    for (int64_t const requestId : requestIds)
+    for (kv::RequestIdType const requestId : requestIds)
     {
         result.attr("add")(requestId);
     }
@@ -1614,7 +1614,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def(
             "create_kv_cache",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
-                std::optional<int64_t> id, nb::object customPriorityCallback, std::optional<int> expectedPromptLength)
+                std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
+                std::optional<int> expectedPromptLength)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 std::vector<kv::TokenIdExt> tokens;

@@ -154,7 +154,7 @@ void KvCacheManager::clearReusableBlocks()
 }
 
 std::shared_ptr<KvCache> KvCacheManager::createKvCache(ReuseScope reuseScope,
-    std::vector<TokenIdExt> const& inputTokens, std::optional<int64_t> id, KvCache::PriorityCb priorityCb,
+    std::vector<TokenIdExt> const& inputTokens, std::optional<RequestIdType> id, KvCache::PriorityCb priorityCb,
     std::optional<int> expectedPromptLength)
 {
     if (!priorityCb)
@@ -508,7 +508,7 @@ PeakBlockStatsByPoolGroup KvCacheManager::getAndResetIterationPeakBlockStats(Cac
     return peak;
 }
 
-void KvCacheManager::markStatsDirty(std::optional<int64_t> kvCacheId)
+void KvCacheManager::markStatsDirty(std::optional<RequestIdType> kvCacheId)
 {
     if (kvCacheId.has_value())
     {
@@ -516,7 +516,7 @@ void KvCacheManager::markStatsDirty(std::optional<int64_t> kvCacheId)
     }
 }
 
-void KvCacheManager::clearStatsDirty(std::optional<int64_t> kvCacheId)
+void KvCacheManager::clearStatsDirty(std::optional<RequestIdType> kvCacheId)
 {
     if (kvCacheId.has_value())
     {
@@ -524,12 +524,12 @@ void KvCacheManager::clearStatsDirty(std::optional<int64_t> kvCacheId)
     }
 }
 
-std::unordered_set<int64_t> KvCacheManager::getDirtyStatsKvCacheIds() const
+std::unordered_set<RequestIdType> KvCacheManager::getDirtyStatsKvCacheIds() const
 {
     return mDirtyStatsKvCacheIds;
 }
 
-void KvCacheManager::markStatsExcluded(std::optional<int64_t> kvCacheId)
+void KvCacheManager::markStatsExcluded(std::optional<RequestIdType> kvCacheId)
 {
     if (kvCacheId.has_value())
     {
@@ -538,7 +538,7 @@ void KvCacheManager::markStatsExcluded(std::optional<int64_t> kvCacheId)
     }
 }
 
-void KvCacheManager::clearStatsExcluded(std::optional<int64_t> kvCacheId)
+void KvCacheManager::clearStatsExcluded(std::optional<RequestIdType> kvCacheId)
 {
     if (kvCacheId.has_value())
     {
@@ -546,7 +546,7 @@ void KvCacheManager::clearStatsExcluded(std::optional<int64_t> kvCacheId)
     }
 }
 
-bool KvCacheManager::isStatsExcluded(std::optional<int64_t> kvCacheId) const
+bool KvCacheManager::isStatsExcluded(std::optional<RequestIdType> kvCacheId) const
 {
     return kvCacheId.has_value() && mStatsExcludedKvCacheIds.find(*kvCacheId) != mStatsExcludedKvCacheIds.end();
 }

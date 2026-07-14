@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/utils/typedIndex.h"
+#include "tensorrt_llm/batch_manager/common.h"
 
 #include <array>
 #include <cstdint>
@@ -77,6 +78,9 @@ inline constexpr CacheLevel kGpuLevel{0};
 
 // Vocabulary token identifier (normal tokens only).
 using TokenId = int64_t;
+
+// Opaque request identifier shared with the rest of the batch manager.
+using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;
 
 // 32-byte aligned to enable SIMD.
 inline constexpr int kDIGEST_LEN = 32;

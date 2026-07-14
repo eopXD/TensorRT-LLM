@@ -136,7 +136,7 @@ public:
     // input_tokens: optional sequence to match against existing cached blocks.
     // priorityCb:   optional priority override per block.
     std::shared_ptr<KvCache> createKvCache(ReuseScope reuseScope = {}, std::vector<TokenIdExt> const& inputTokens = {},
-        std::optional<int64_t> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
+        std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt);
 
     BlockRadixTree::ReuseMatch matchReuse(
@@ -219,12 +219,12 @@ public:
     IterationStatsByLifeCycle getAndResetIterationStats();
     PeakBlockStatsByPoolGroup getAndResetIterationPeakBlockStats(CacheLevel cacheLevel);
 
-    void markStatsDirty(std::optional<int64_t> kvCacheId);
-    void clearStatsDirty(std::optional<int64_t> kvCacheId);
-    std::unordered_set<int64_t> getDirtyStatsKvCacheIds() const;
-    void markStatsExcluded(std::optional<int64_t> kvCacheId);
-    void clearStatsExcluded(std::optional<int64_t> kvCacheId);
-    bool isStatsExcluded(std::optional<int64_t> kvCacheId) const;
+    void markStatsDirty(std::optional<RequestIdType> kvCacheId);
+    void clearStatsDirty(std::optional<RequestIdType> kvCacheId);
+    std::unordered_set<RequestIdType> getDirtyStatsKvCacheIds() const;
+    void markStatsExcluded(std::optional<RequestIdType> kvCacheId);
+    void clearStatsExcluded(std::optional<RequestIdType> kvCacheId);
+    bool isStatsExcluded(std::optional<RequestIdType> kvCacheId) const;
 
     // Mirrors Python's need_adjustment property and adjust() method.
     // All KvCaches must be suspended before calling adjust().
@@ -329,8 +329,8 @@ private:
     KVCacheStatsDelta mCommittedStats;
     IterationStatsByLifeCycle mIterationStatsByLifeCycle;
     PeakBlockStatsByCacheLevel mIterationPeakNumBlocksByCacheLevel;
-    std::unordered_set<int64_t> mDirtyStatsKvCacheIds;
-    std::unordered_set<int64_t> mStatsExcludedKvCacheIds;
+    std::unordered_set<RequestIdType> mDirtyStatsKvCacheIds;
+    std::unordered_set<RequestIdType> mStatsExcludedKvCacheIds;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

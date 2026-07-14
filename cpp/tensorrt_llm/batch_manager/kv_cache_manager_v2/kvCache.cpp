@@ -57,7 +57,7 @@ void copySlotData(StorageManager& storageMgr, CacheLevel dstLevel, CacheLevel sr
 // ---------------------------------------------------------------------------
 
 KvCache::KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::vector<TokenIdExt> const& inputTokens,
-    std::optional<int64_t> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength)
+    std::optional<RequestIdType> mId, PriorityCb priorityCb, std::optional<int> expectedPromptLength)
     : id(mId)
     , mManager(manager.shared_from_this())
     , mReuseScope(std::move(reuseScope))

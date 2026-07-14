@@ -178,7 +178,7 @@ public:
     using PriorityCb = std::function<Priority(BlockOrdinal, LifeCycleId)>;
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::vector<TokenIdExt> const& inputTokens,
-        std::optional<int64_t> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt);
+        std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt);
 
     ~KvCache();
 
@@ -395,7 +395,7 @@ public:
 
     int updateBasePageIndex(BeamIndex bi, BlockOrdinal ord, LifeCycleId lc, int value);
 
-    std::optional<int64_t> id; // opaque identifier (mirrors Python's id field)
+    std::optional<RequestIdType> id; // opaque identifier (mirrors Python's id field)
 
 private:
     friend class KvCacheIntrospection;

@@ -26,6 +26,7 @@
 #include <cuda_runtime_api.h>
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <memory>
 
 namespace
@@ -174,6 +175,17 @@ TEST(KvCacheManagerV2StatsTest, ManagerCommitResetAndRequestIdTracking)
     EXPECT_TRUE(cache->commitPendingStats().empty());
     EXPECT_TRUE(manager->getDirtyStatsKvCacheIds().empty());
     cache->close();
+
+    RequestIdType const cudaGraphDummyRequestId = std::numeric_limits<RequestIdType>::max();
+    auto dummyCache = manager->createKvCache({}, {}, cudaGraphDummyRequestId);
+    ASSERT_TRUE(dummyCache->id.has_value());
+    EXPECT_EQ(*dummyCache->id, cudaGraphDummyRequestId);
+    manager->markStatsDirty(cudaGraphDummyRequestId);
+    EXPECT_EQ(manager->getDirtyStatsKvCacheIds(), std::unordered_set<RequestIdType>{cudaGraphDummyRequestId});
+    manager->markStatsExcluded(cudaGraphDummyRequestId);
+    EXPECT_TRUE(manager->isStatsExcluded(cudaGraphDummyRequestId));
+    EXPECT_TRUE(manager->getDirtyStatsKvCacheIds().empty());
+    dummyCache->close();
 }
 
 TEST(KvCacheManagerV2StatsTest, DisabledStatsSuppressManagerCommit)

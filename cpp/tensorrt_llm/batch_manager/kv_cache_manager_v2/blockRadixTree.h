@@ -211,12 +211,24 @@ struct Block : NodeBase, EnableSharedFromThis<Block>
 
     // Break the bidirectional link to the cached page for a lifecycle.
     // Returns the previously-stored CommittedPage* (nullptr if already unlinked).
-    CommittedPage* unlinkPage(LifeCycleId lcIdx);
+    // If `expectedPage` is non-null and the stored page differs from it, the link
+    // is left untouched and nullptr is returned (mirrors Python's unset_page
+    // `expected_page` guard: a newer page may already occupy the slot).
+    CommittedPage* unlinkPage(LifeCycleId lcIdx, CommittedPage* expectedPage = nullptr);
 
     // Clear stale tree nodes after a lifecycle page has been unlinked.
     // Returns detached blocks that must stay alive until cleanup completes.
     static std::vector<SharedPtr<Block>> clearStaleBlocksAfterPageUnlink(
         Block& block, LifeCycleId lcIdx, LifeCycle const& lc);
+
+    // Reclaim every page held by this block: null each page's back-pointer and, for
+    // DROPPABLE pages still scheduled for eviction, remove them from the eviction
+    // controller (releasing their storage slots). Idempotent. Must run during tree
+    // teardown (removeSubtree) rather than being deferred to ~Block(), so page
+    // reclamation does not depend on this Block's destruction timing — an external
+    // reference can keep a Block alive past StorageManager teardown, after which
+    // page->manager would be dangling. Mirrors Python's Block._release_pages().
+    void releasePages();
 
 private:
     BlockOrdinal mOrdinal;

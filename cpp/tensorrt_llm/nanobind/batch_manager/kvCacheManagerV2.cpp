@@ -40,6 +40,7 @@
 #include <nanobind/stl/function.h>
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
@@ -488,6 +489,23 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     static nb::object sLogicError = nb::exception<kv::LogicError>(m, "LogicError");
     static nb::object sResourceBusyError = nb::exception<kv::ResourceBusyError>(m, "ResourceBusyError");
     static nb::object sOutOfPagesError = nb::exception<kv::OutOfPagesError>(m, "OutOfPagesError");
+
+    // Map kv::AssertionError to Python's builtin AssertionError so shared tests see
+    // the same exception type as the pure-Python backend (which uses `assert`).
+    // Registered last so it is tried before the generic std::exception fallback.
+    nb::register_exception_translator(
+        [](std::exception_ptr const& p, void*)
+        {
+            try
+            {
+                if (p)
+                    std::rethrow_exception(p);
+            }
+            catch (kv::AssertionError const& e)
+            {
+                PyErr_SetString(PyExc_AssertionError, e.what());
+            }
+        });
 
     // ---- Enums -------------------------------------------------------------
     nb::enum_<kv::PageStatus>(m, "PageStatus")
@@ -1169,14 +1187,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("kv_caches", &kv::BatchDesc::kvCaches)
         .def_rw("system_prompt_length", &kv::BatchDesc::systemPromptLength) DEF_COPY(kv::BatchDesc);
 
-    nb::class_<kv::HelixConfig>(m, "HelixConfig")
-        .def(nb::init<int, int, int, int>(), nb::arg("helix_group_size"), nb::arg("helix_gpu_rank"),
-            nb::arg("helix_shard_size"), nb::arg("shared_comm_port"))
-        .def_rw("helix_group_size", &kv::HelixConfig::helixGroupSize)
-        .def_rw("helix_gpu_rank", &kv::HelixConfig::helixGpuRank)
-        .def_rw("helix_shard_size", &kv::HelixConfig::helixShardSize)
-        .def_rw("shared_comm_port", &kv::HelixConfig::sharedCommPort) DEF_COPY(kv::HelixConfig);
-
     nb::class_<kv::SwaScratchReuseConfig>(m, "SwaScratchReuseConfig")
         .def(
             "__init__",
@@ -1195,9 +1205,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](kv::KVCacheManagerConfig* cfg, int tokensPerBlock, std::vector<kv::CacheTierConfig> cacheTiers,
                 nb::list layers, float maxUtilForResume, bool enablePartialReuse,
                 std::optional<kv::BatchDesc> typicalStep, std::vector<kv::BatchDesc> constraints,
-                std::optional<std::vector<float>> initialPoolRatio, int ssmReuseInterval,
-                std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool enableStats,
-                std::optional<kv::HelixConfig> helixConfig)
+                std::optional<std::vector<float>> initialPoolRatio,
+                std::optional<kv::SwaScratchReuseConfig> swaScratchReuse, bool commitMinSnapshot, bool enableStats)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -1215,17 +1224,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->typicalStep = std::move(typicalStep);
                 cfg->constraints = std::move(constraints);
                 cfg->initialPoolRatio = std::move(initialPoolRatio);
-                cfg->ssmReuseInterval = ssmReuseInterval;
                 cfg->swaScratchReuse = std::move(swaScratchReuse);
+                cfg->commitMinSnapshot = commitMinSnapshot;
                 cfg->enableStats = enableStats;
-                cfg->helixConfig = std::move(helixConfig);
+                // Mirror Python's __post_init__: validate at construction. Config-integrity
+                // failures raise AssertionError (translated below).
+                cfg->validate();
             },
             nb::arg("tokens_per_block"), nb::arg("cache_tiers"), nb::arg("layers"),
             nb::arg("max_util_for_resume") = 0.97f, nb::arg("enable_partial_reuse") = true,
             nb::arg("typical_step") = std::nullopt, nb::arg("constraints") = std::vector<kv::BatchDesc>{},
-            nb::arg("initial_pool_ratio").none() = std::nullopt, nb::arg("ssm_reuse_interval") = 512,
-            nb::arg("swa_scratch_reuse").none() = std::nullopt, nb::arg("enable_stats") = true,
-            nb::arg("helix_config").none() = std::nullopt)
+            nb::arg("initial_pool_ratio").none() = std::nullopt, nb::arg("swa_scratch_reuse").none() = std::nullopt,
+            nb::arg("commit_min_snapshot") = false, nb::arg("enable_stats") = true)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -1234,30 +1244,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_rw("typical_step", &kv::KVCacheManagerConfig::typicalStep)
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
         .def_rw("initial_pool_ratio", &kv::KVCacheManagerConfig::initialPoolRatio)
-        .def_rw("ssm_reuse_interval", &kv::KVCacheManagerConfig::ssmReuseInterval)
         .def_rw("swa_scratch_reuse", &kv::KVCacheManagerConfig::swaScratchReuse)
+        .def_rw("commit_min_snapshot", &kv::KVCacheManagerConfig::commitMinSnapshot)
         .def_rw("enable_stats", &kv::KVCacheManagerConfig::enableStats)
         .def_prop_ro("enable_swa_scratch_reuse", &kv::KVCacheManagerConfig::enableSwaScratchReuse)
-        .def_prop_rw(
-            "helix_config",
-            [](kv::KVCacheManagerConfig const& self) -> nb::object
-            {
-                if (!self.helixConfig.has_value())
-                {
-                    return nb::none();
-                }
-                return nb::cast(*self.helixConfig);
-            },
-            [](kv::KVCacheManagerConfig& self, nb::handle value)
-            {
-                if (value.is_none())
-                {
-                    self.helixConfig.reset();
-                    return;
-                }
-                self.helixConfig = nb::cast<kv::HelixConfig>(value);
-            },
-            nb::arg("helix_config").none())
         .def("validate", &kv::KVCacheManagerConfig::validate) DEF_COPY(kv::KVCacheManagerConfig);
 
 #undef DEF_COPY
@@ -1290,22 +1280,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "commit",
-            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices)
+            [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd)
             {
                 auto vec = castTokenIterable(acceptedInputTokens);
-                if (vec.empty())
-                {
-                    return;
-                }
                 if (!beamSearchIndices.is_none())
                 {
                     PyErr_SetString(PyExc_AssertionError, "beam_search_indices must be None");
                     throw nb::python_error();
                 }
+                // Note: an empty token list with is_end=True must still stop committing,
+                // so we do not early-return on empty; commit() handles it.
                 nb::gil_scoped_release release;
-                self.commit(vec);
+                self.commit(vec, isEnd);
             },
-            nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none())
+            nb::arg("accepted_input_tokens"), nb::arg("beam_search_indices").none() = nb::none(),
+            nb::arg("is_end") = false)
         .def("stop_committing", &kv::KvCache::stopCommitting, nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_base_page_indices",
@@ -1487,6 +1476,75 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return result;
         },
         nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    // White-box reuse-tree introspection: mirror the Python manager's _life_cycles
+    // and _radix_tree attributes so shared tests can inspect reuse state.
+    mIntrospection.def(
+        "attention_life_cycle_ids",
+        [](kv::KvCacheManager& manager)
+        {
+            std::vector<int> result;
+            for (auto const& [lcId, attn] : manager.lifeCycles().attentionLifeCycles())
+                result.push_back(lcId.value());
+            return result;
+        },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "swa_life_cycle_ids",
+        [](kv::KvCacheManager& manager)
+        {
+            std::vector<int> result;
+            for (auto const& [lcId, attn] : manager.lifeCycles().attentionLifeCycles())
+                if (attn->windowSize.has_value())
+                    result.push_back(lcId.value());
+            return result;
+        },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "ssm_life_cycle_id",
+        [](kv::KvCacheManager& manager) -> std::optional<int>
+        {
+            auto id = manager.lifeCycles().ssmLifeCycleId();
+            if (id.has_value())
+                return id->value();
+            return std::nullopt;
+        },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    // Returns (num_tokens, pages) where pages[i] is None for a block with no page in
+    // this lifecycle, else (slot_id, num_tokens_in_block) with num_tokens_in_block = -1
+    // for a non-SSM (attention) page.
+    mIntrospection.def(
+        "reuse_match_pages",
+        [](kv::KvCacheManager& manager, nb::object reuseScope, nb::object tokens, int lcId, bool enablePartial)
+        {
+            auto rs = castReuseScope(reuseScope);
+            auto vec = castTokenIterable(tokens);
+            int numTokens = 0;
+            std::vector<std::optional<std::pair<int, int>>> pages;
+            {
+                nb::gil_scoped_release release;
+                auto matchResult = manager.radixTree().match(rs, vec, enablePartial);
+                numTokens = matchResult.numTokens;
+                kv::LifeCycleId lc{lcId};
+                pages.reserve(matchResult.blocks.size());
+                for (auto* block : matchResult.blocks)
+                {
+                    auto* page = block->storage.at(lc);
+                    if (page == nullptr)
+                    {
+                        pages.emplace_back(std::nullopt);
+                        continue;
+                    }
+                    int const slotId = page->slotId().value();
+                    int numTokensInBlock = -1;
+                    if (auto* ssm = dynamic_cast<kv::SsmCommittedPage*>(page))
+                        numTokensInBlock = ssm->numTokensInBlock;
+                    pages.emplace_back(std::make_pair(slotId, numTokensInBlock));
+                }
+            }
+            return std::make_tuple(numTokens, std::move(pages));
+        },
+        nb::arg("manager"), nb::arg("reuse_scope"), nb::arg("tokens"), nb::arg("lc_id"),
+        nb::arg("enable_partial") = false);
     mIntrospection.def(
         "storage_utilization",
         [](kv::KvCacheManager& manager, int cacheLevel)
@@ -1645,7 +1703,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return nb::cast(*result);
             },
             nb::arg("mode"))
-        .def_prop_ro("ssm_reuse_interval", &kv::KvCacheManager::ssmReuseInterval)
+        .def_prop_ro("commit_min_snapshot", &kv::KvCacheManager::commitMinSnapshot)
         .def_prop_ro("num_layers", &kv::KvCacheManager::numLayers)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
         .def_prop_ro("layer_grouping", [](kv::KvCacheManager const& self) { return self.layerGrouping().raw(); })

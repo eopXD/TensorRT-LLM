@@ -330,12 +330,12 @@ int Block::tokensPerBlock() const noexcept
     return static_cast<int>(static_cast<Block const*>(prev)->tokens.size());
 }
 
-Block::~Block()
+void Block::releasePages()
 {
-    // Mirrors Python Block.__del__: for each stored page, if alive and
-    // DROPPABLE and scheduled for eviction, exclude from eviction.
-    // Also null out the page's back-pointer so that CommittedPage::~CommittedPage()
-    // doesn't attempt cleanup through this dead Block.
+    // Mirrors Python Block._release_pages(): for each stored page, if alive and
+    // DROPPABLE and scheduled for eviction, exclude from eviction. Also null out
+    // the page's back-pointer so that CommittedPage::~CommittedPage() doesn't
+    // attempt cleanup through this Block. Idempotent — storage is empty afterwards.
     for (LifeCycleId lcIdx{0}; lcIdx < storage.size(); ++lcIdx)
     {
         auto const page = storage[lcIdx];
@@ -349,6 +349,11 @@ Block::~Block()
             }
         }
     }
+}
+
+Block::~Block()
+{
+    releasePages();
 }
 
 bool Block::isOrphan() const noexcept
@@ -369,15 +374,16 @@ int Block::partialMatchThisNode(TokenIdExt const* otherTokens, size_t otherCount
     return count;
 }
 
-CommittedPage* Block::unlinkPage(LifeCycleId lcIdx)
+CommittedPage* Block::unlinkPage(LifeCycleId lcIdx, CommittedPage* expectedPage)
 {
     auto& slot = storage.at(lcIdx);
     CommittedPage* page = slot;
-    if (page != nullptr)
-    {
-        page->block = nullptr;
-        slot = nullptr;
-    }
+    if (page == nullptr)
+        return nullptr;
+    if (expectedPage != nullptr && page != expectedPage)
+        return nullptr;
+    page->block = nullptr;
+    slot = nullptr;
     return page;
 }
 
@@ -507,8 +513,10 @@ SharedPtr<Block> removeSubtree(Block& root)
 
     // Post-order traversal using prev/next links — O(1) extra space.
     // Descend to leaves first, remove on the way back up.
-    // ~Block() handles page cleanup (nulling back-pointers, excludeFromEviction).
-    // Mirrors Python's remove_subtree().
+    // Each block's pages are reclaimed eagerly via releasePages() while the
+    // StorageManager is still alive, rather than deferring to ~Block(): an external
+    // reference can keep a Block alive past StorageManager teardown, after which
+    // page->manager would be dangling. Mirrors Python's remove_subtree().
     while (true)
     {
         // Descend: if the current block has children, go to the first child.
@@ -518,6 +526,7 @@ SharedPtr<Block> removeSubtree(Block& root)
         }
         else
         {
+            current->releasePages();
             // Remove this block from its parent's next map.
             // Null prev to detach — the block may outlive the tree if held
             // externally (e.g., by nanobind/Python shared_ptr).
@@ -752,13 +761,25 @@ BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> m
     {
         if (ssmLcId.has_value())
         {
+            // Truncate to the last block whose SSM snapshot is reusable at that
+            // block's matched-token count, then clamp the tail entry's matched
+            // token count to the snapshot length (mirrors _block_radix_tree.py).
             int ssmTrunc = 0;
+            int ssmMatchLen = 0;
             for (int i = static_cast<int>(matched.size()) - 1; i >= 0; --i)
             {
-                if (hasPage(*matched[static_cast<size_t>(i)].block, *ssmLcId))
+                CommittedPage* page = matched[static_cast<size_t>(i)].block->storage.at(*ssmLcId);
+                if (page == nullptr)
                 {
-                    TLLM_CHECK_DEBUG(matched[static_cast<size_t>(i)].numMatchedTokens == mTokensPerBlock);
+                    continue;
+                }
+                auto* ssmPage = dynamic_cast<SsmCommittedPage*>(page);
+                TLLM_CHECK_DEBUG(ssmPage != nullptr);
+                int const snapshotLen = ssmPage->numTokensInBlock;
+                if (matched[static_cast<size_t>(i)].numMatchedTokens >= snapshotLen)
+                {
                     ssmTrunc = i + 1;
+                    ssmMatchLen = snapshotLen;
                     break;
                 }
             }
@@ -767,6 +788,7 @@ BlockRadixTree::ReuseMatch BlockRadixTree::pruneMatch(std::vector<MatchResult> m
             {
                 break;
             }
+            matched.back().numMatchedTokens = ssmMatchLen;
         }
 
         int const numTok = numMatchedTokens(matched, mTokensPerBlock);

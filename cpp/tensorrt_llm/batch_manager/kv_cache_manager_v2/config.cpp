@@ -16,6 +16,7 @@
  */
 
 #include "kv_cache_manager_v2/config.h"
+#include "kv_cache_manager_v2/exceptions.h"
 
 #include <filesystem>
 #include <set>
@@ -43,9 +44,11 @@ void KVCacheManagerConfig::validate() const
         swaScratchReuse->validate();
     }
 
+    // These mirror Python's KVCacheManagerConfig.__post_init__ asserts, so they
+    // throw AssertionError (translated in the binding layer) rather than ValueError.
     if (cacheTiers.empty() || cacheTierOf(cacheTiers[0]) != CacheTier::GPU_MEM)
     {
-        throw std::invalid_argument("KVCacheManagerConfig: first cache tier must be GPU memory");
+        throw AssertionError("KVCacheManagerConfig: first cache tier must be GPU memory");
     }
 
     // Check for duplicate layer ids.
@@ -57,13 +60,13 @@ void KVCacheManagerConfig::validate() const
             {
                 if (!seenLayerIds.insert(cfg.layerId).second)
                 {
-                    throw std::invalid_argument("KVCacheManagerConfig: duplicate layer id");
+                    throw AssertionError("KVCacheManagerConfig: duplicate layer id");
                 }
                 for (auto const& buf : cfg.buffers)
                 {
                     if (buf.tokensPerBlockOverride.has_value() && tokensPerBlock % *buf.tokensPerBlockOverride != 0)
                     {
-                        throw std::invalid_argument(
+                        throw AssertionError(
                             "KVCacheManagerConfig: tokensPerBlockOverride must be a divisor of "
                             "tokensPerBlock");
                     }
@@ -84,14 +87,8 @@ void KVCacheManagerConfig::validate() const
     }
     if (hasSSM)
     {
-        if (ssmReuseInterval <= 0)
-            throw std::invalid_argument("KVCacheManagerConfig: ssm_reuse_interval must be positive");
-        if (ssmReuseInterval % tokensPerBlock != 0)
-            throw std::invalid_argument(
-                "KVCacheManagerConfig: ssm_reuse_interval must be a multiple of tokens_per_block");
-        if (enablePartialReuse)
-            throw std::invalid_argument(
-                "KVCacheManagerConfig: enable_partial_reuse must be false when SSM layers are present");
+        if (!commitMinSnapshot)
+            throw AssertionError("KVCacheManagerConfig: commit_min_snapshot must be True when SSM layers are present");
     }
 }
 

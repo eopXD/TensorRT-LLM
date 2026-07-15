@@ -215,17 +215,6 @@ struct BatchDesc
 };
 
 // ---------------------------------------------------------------------------
-// Helix (disaggregated serving) configuration — unsupported yet.
-// ---------------------------------------------------------------------------
-struct HelixConfig
-{
-    int helixGroupSize = 1;
-    int helixGpuRank = 0;
-    int helixShardSize = 0;
-    int sharedCommPort = 0;
-};
-
-// ---------------------------------------------------------------------------
 // SWA scratch reuse configuration.
 // ---------------------------------------------------------------------------
 struct SwaScratchReuseConfig
@@ -266,15 +255,16 @@ struct KVCacheManagerConfig
     std::optional<BatchDesc> typicalStep;               // typical step for initial ratio computation
     std::optional<std::vector<float>> initialPoolRatio; // explicit initial ratio, overrides inferred sizing inputs
 
-    // Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
-    // Must be a positive multiple of tokensPerBlock. Only takes effect when SSM layers are present.
-    int ssmReuseInterval = 512;
-
     // When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
     // Scratch blocks share coalesced slot sub-pages across blocks for the currently executing
     // layer, reducing peak memory. Trade-off: KV cache reuse is degraded because scratch blocks
     // have no preserved data after the step.
     std::optional<SwaScratchReuseConfig> swaScratchReuse;
+
+    // If true, commit() records only the minimum cache snapshot reusable at the post-call
+    // numCommittedTokens. Only the minimum amount of pages required for such reuse will be
+    // preserved. Required when SSM layers are present.
+    bool commitMinSnapshot = false;
 
     // Collect V2 KV cache allocation, reuse, and transfer statistics.
     bool enableStats = true;
@@ -283,8 +273,6 @@ struct KVCacheManagerConfig
     {
         return swaScratchReuse.has_value();
     }
-
-    std::optional<HelixConfig> helixConfig; // unsupported yet
 
     void validate() const;
 };

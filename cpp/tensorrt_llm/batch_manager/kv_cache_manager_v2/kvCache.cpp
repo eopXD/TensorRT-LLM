@@ -773,21 +773,26 @@ void KvCache::_clearBlocks()
 }
 
 // ---------------------------------------------------------------------------
-// _snapshotSsmToTreeBlock: copy live SSM state to a new page and attach to radix tree block.
-// Called at ssm_reuse_interval boundaries during commit.
+// _copyPageToTreeBlock: copy a page into a new committed (or SSM committed) page
+// attached to a radix tree block. Mirrors Python's _copy_page_to_tree_block.
 // ---------------------------------------------------------------------------
 
-void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, BeamIndex beamIdx)
+void KvCache::_copyPageToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId lcIdx, SharedPtr<Page> const& srcPage,
+    std::optional<int> ssmNumTokensInBlock)
 {
+    if (treeBlock->storage.at(lcIdx) != nullptr)
+    {
+        return; // block already holds a page for this lifecycle
+    }
+    auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    bool const isSsm = ssmLcId.has_value() && lcIdx == *ssmLcId;
+    TLLM_CHECK_DEBUG(isSsm == ssmNumTokensInBlock.has_value());
+
     auto& storageMgr = mManager->storage();
-    auto* ssmLock = std::get_if<SharedPageLock>(&mSsmBlocks[beamIdx][ssmLcId]);
-    TLLM_CHECK_DEBUG(ssmLock && ssmLock->isValid());
-    auto srcPage = ssmLock->page();
-    PoolGroupIndex pgIdx = storageMgr.getPoolGroupIndex(ssmLcId);
+    PoolGroupIndex pgIdx = storageMgr.getPoolGroupIndex(lcIdx);
 
     for (CacheLevel lvl = srcPage->cacheLevel; lvl < storageMgr.numCacheLevels(); ++lvl)
     {
-
         Slot newSlot;
         try
         {
@@ -804,12 +809,17 @@ void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCyc
         copySlotData(storageMgr, lvl, srcPage->cacheLevel, pgIdx, newSlot.slotId(), srcPage->slotId(), stream);
 
         CachedCudaEvent readyEv(reinterpret_cast<CudaStream>(stream));
-        TLLM_CHECK_DEBUG(
-            mTokensPerBlock * (treeBlock->ordinal() + 1).value() == static_cast<int>(mCommittedTokens.size()));
-
-        auto tempPage = makeShared<UncommittedPage>(*this, treeBlock->ordinal(), ssmLcId, lvl, beamIdx);
+        auto tempPage = makeShared<UncommittedPage>(*this, treeBlock->ordinal(), lcIdx, lvl, kDefaultBeamIndex);
         tempPage->setSlot(newSlot);
-        auto committed = tempPage->convertToCommitted(treeBlock, std::move(readyEv));
+        SharedPtr<CommittedPage> committed;
+        if (ssmNumTokensInBlock.has_value())
+        {
+            committed = tempPage->convertToSsmCommitted(treeBlock, std::move(readyEv), *ssmNumTokensInBlock);
+        }
+        else
+        {
+            committed = tempPage->convertToCommitted(treeBlock, std::move(readyEv));
+        }
 
         // Schedule for eviction so eviction controller keeps a strong reference,
         // preventing the page from being destroyed.
@@ -817,6 +827,126 @@ void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCyc
         return; // success
     }
     // No pages available in any level, silently skip snapshot (matches Python).
+}
+
+// ---------------------------------------------------------------------------
+// _snapshotSsmToTreeBlock: snapshot live SSM state to a radix tree block for the
+// given committed token count. Mirrors Python's _snapshot_ssm_to_tree_block.
+// ---------------------------------------------------------------------------
+
+void KvCache::_snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens, bool move)
+{
+    int const numTokensInBlock = numTokens - treeBlock->ordinal().value() * mTokensPerBlock;
+    TLLM_CHECK_DEBUG(0 < numTokensInBlock && numTokensInBlock <= mTokensPerBlock);
+
+    CommittedPage* existingRaw = treeBlock->storage.at(ssmLcId);
+    int existingNumTokens = 0;
+    if (existingRaw != nullptr)
+    {
+        auto* existingSsm = dynamic_cast<SsmCommittedPage*>(existingRaw);
+        TLLM_CHECK_DEBUG(existingSsm != nullptr);
+        existingNumTokens = existingSsm->numTokensInBlock;
+    }
+    if (existingNumTokens >= numTokensInBlock)
+    {
+        return;
+    }
+    if (existingRaw != nullptr)
+    {
+        // Detach the smaller snapshot; the CommittedPage dtor's expected-page guard
+        // makes the later unlink a no-op (the slot is already null).
+        treeBlock->storage.at(ssmLcId) = nullptr;
+        if (existingRaw->scheduledForEviction())
+        {
+            existingRaw->manager->excludeFromEviction(*existingRaw);
+        }
+    }
+
+    auto& ssmBlock = mSsmBlocks[kDefaultBeamIndex];
+    auto* ssmLock = std::get_if<SharedPageLock>(&ssmBlock[ssmLcId]);
+    TLLM_CHECK_DEBUG(ssmLock && ssmLock->isValid());
+    auto srcPage = ssmLock->page();
+    if (move)
+    {
+        auto unlocked = ssmLock->unlock();
+        auto up = dynamicPointerCast<UncommittedPage>(unlocked);
+        TLLM_CHECK_DEBUG(up != nullptr);
+        ssmBlock[ssmLcId] = std::monostate{};
+        auto committed = up->convertToSsmCommitted(treeBlock, finishEvent(), numTokensInBlock);
+        mManager->storage().scheduleForEviction(*committed);
+        return;
+    }
+
+    _copyPageToTreeBlock(treeBlock, ssmLcId, srcPage, numTokensInBlock);
+}
+
+// ---------------------------------------------------------------------------
+// _snapshotPartialBlockToTree: snapshot a partial final block into the radix
+// tree. Mirrors Python's _snapshot_partial_block_to_tree.
+// ---------------------------------------------------------------------------
+
+void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
+{
+    int const start = ordinal.value() * mTokensPerBlock;
+    int const end = std::min(start + mTokensPerBlock, static_cast<int>(mCommittedTokens.size()));
+    std::vector<TokenIdExt> tokens(mCommittedTokens.begin() + start, mCommittedTokens.begin() + end);
+    int const numTokens = static_cast<int>(tokens.size());
+    TLLM_CHECK_DEBUG(0 < numTokens && numTokens < mTokensPerBlock);
+
+    LifeCycleId numLc = mManager->storage().numLifeCycles();
+    NodeBase* prevNode = nullptr;
+    RootBlock& root = mManager->radixTree().addOrGetExisting(mReuseScope);
+    if (ordinal == BlockOrdinal{0})
+    {
+        prevNode = &root;
+    }
+    else
+    {
+        prevNode = _getTreeBlock(BlockOrdinal{ordinal.value() - 1}).get();
+    }
+
+    bool isNew = false;
+    SharedPtr<Block> treeBlock;
+    try
+    {
+        treeBlock = addOrGetExistingBlock(prevNode, numLc, tokens, &isNew);
+    }
+    catch (UselessBlockError const& e)
+    {
+        treeBlock = e.block;
+        isNew = false;
+    }
+    TLLM_CHECK_DEBUG(treeBlock);
+    TLLM_CHECK_DEBUG(isNew || std::equal(tokens.begin(), tokens.end(), treeBlock->tokens.begin()));
+
+    auto& beamBlock = mBlocks.at(ordinal).pages[kDefaultBeamIndex];
+    auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    // Only attach partial attention pages to a tree block whose token span is
+    // exactly the partial snapshot. A longer existing sibling may already have
+    // full attention pages; otherwise a partial page would make it look more
+    // reusable than it is.
+    if (static_cast<int>(treeBlock->tokens.size()) == numTokens)
+    {
+        for (auto const& [lcIdx, attn] : mManager->lifeCycles().attentionLifeCycles())
+        {
+            (void) attn;
+            auto& bp = beamBlock[lcIdx];
+            if (blockPageIsNull(bp) || treeBlock->storage.at(lcIdx) != nullptr)
+            {
+                continue;
+            }
+            _copyPageToTreeBlock(treeBlock, lcIdx, blockPageGetPage(bp));
+        }
+    }
+    if (commitSsm)
+    {
+        TLLM_CHECK_DEBUG(ssmLcId.has_value());
+        _snapshotSsmToTreeBlock(treeBlock, *ssmLcId, start + numTokens);
+    }
+    if (isNew && treeBlock->eventSink)
+    {
+        treeBlock->eventSink->addStoredBlock(*treeBlock);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,14 +1424,17 @@ std::vector<KvCache::StaleBackup> KvCache::_unlockStaleBlocks(int newHistoryLeng
         {
             auto& sb = mBlocks[ord];
             bool isCommitted = sb.isCommitted();
-            bool holdForCommit = !isCommitted && (mCommitState == CommitState::ALLOWED);
+            bool holdForCommit
+                = !mManager->commitMinSnapshot() && !isCommitted && (mCommitState == CommitState::ALLOWED);
 
             for (BeamIndex bi{0}; bi < sb.pages.size(); ++bi)
             {
                 auto& bp = sb.pages[bi][lcIdx];
                 if (blockPageIsNull(bp))
                 {
-                    continue; // Scratch or skipped stale block — no page to unlock
+                    // No page to unlock: scratch block, commit_min_snapshot early
+                    // release, or a stale block created unallocated by resize().
+                    continue;
                 }
                 TLLM_CHECK_DEBUG(std::holds_alternative<SharedPageLock>(bp));
                 auto holder = blockPageGetPage(bp)->hold();
@@ -1369,7 +1502,7 @@ TypedVec<LifeCycleId, KvCache::TakenPage> KvCache::_takeUncommittedPage(
 // calls _onStopCommitting() — callers do not need post-call cleanup.
 // ---------------------------------------------------------------------------
 
-void KvCache::_commitBlock(int ord, bool isLast)
+void KvCache::_commitBlock(int ord, bool isLast, bool commitSsm, bool moveSsm)
 {
     TLLM_CHECK_DEBUG(mCommitState == CommitState::ALLOWED);
     TLLM_CHECK_DEBUG(ord == mNumCommittedBlocks);
@@ -1420,6 +1553,7 @@ void KvCache::_commitBlock(int ord, bool isLast)
     TLLM_CHECK_DEBUG(blockIsNew || std::equal(tokenBlock.begin(), tokenBlock.end(), newBlock->tokens.begin()));
 
     auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    bool didCommit = false;
 
     if (blockIsNew)
     {
@@ -1439,26 +1573,13 @@ void KvCache::_commitBlock(int ord, bool isLast)
             else
                 sb.pages[kDefaultBeamIndex][lc] = committed->hold();
         }
-        // SSM snapshot: copy live SSM state at interval boundaries.
-        if (ssmLcId.has_value())
-        {
-            int numCommitted = static_cast<int>(mCommittedTokens.size());
-            int blockEnd = (ord + 1) * mTokensPerBlock;
-            if (blockEnd == numCommitted && numCommitted > 0 && numCommitted % mManager->ssmReuseInterval() == 0)
-            {
-                _snapshotSsmToTreeBlock(newBlock, *ssmLcId, kDefaultBeamIndex);
-            }
-            else
-            {
-                newBlock->storage[*ssmLcId] = nullptr;
-            }
-        }
         TLLM_CHECK_DEBUG(_getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
         ++mNumCommittedBlocks;
         if (newBlock->eventSink)
         {
             newBlock->eventSink->addStoredBlock(*newBlock);
         }
+        didCommit = true;
     }
     else if (newBlock->isFull() && mManager->allowSeqRebasing() && isFull)
     {
@@ -1536,11 +1657,18 @@ void KvCache::_commitBlock(int ord, bool isLast)
         sb.treeBlock = newBlock;
         TLLM_CHECK_DEBUG(_getTreeBlock(static_cast<BlockOrdinal>(ord)) == newBlock);
         ++mNumCommittedBlocks;
+        didCommit = true;
     }
     else
     {
         // Can't commit and can't reuse existing block. Just stop committing.
         mCommitState = CommitState::VIRTUAL_STOP;
+    }
+
+    if (didCommit && commitSsm)
+    {
+        TLLM_CHECK_DEBUG(ssmLcId.has_value());
+        _snapshotSsmToTreeBlock(newBlock, *ssmLcId, start + static_cast<int>(tokenBlock.size()), moveSsm);
     }
 
     if (sb.isCommitted())
@@ -1583,46 +1711,82 @@ void KvCache::_commitBlock(int ord, bool isLast)
 // commit
 // ---------------------------------------------------------------------------
 
-void KvCache::commit(std::vector<TokenIdExt> const& tokens)
+void KvCache::commit(std::vector<TokenIdExt> const& tokens, bool isEnd)
 {
     TLLM_CHECK_DEBUG(mStatus == Status::ACTIVE);
     if (mBeamWidth != BeamIndex{1})
         throw LogicError("Not implemented yet for beam search");
     if (tokens.empty())
+    {
+        if (isEnd)
+            stopCommitting();
         return;
+    }
     if (mCommitState == CommitState::USER_STOP)
         throw LogicError("Cannot commit tokens after stop_committing()");
-    if (mCommitState == CommitState::VIRTUAL_STOP)
+
+    bool const commitMinSnapshot = mManager->commitMinSnapshot();
+    auto ssmLcId = mManager->lifeCycles().ssmLifeCycleId();
+    if (commitMinSnapshot)
     {
-        mCommittedTokens.insert(mCommittedTokens.end(), tokens.begin(), tokens.end());
-        return;
+        int const newNumCommitted = static_cast<int>(mCommittedTokens.size()) + static_cast<int>(tokens.size());
+        if (mHistoryLength != static_cast<int>(mCommittedTokens.size()) && mHistoryLength != newNumCommitted)
+        {
+            throw AssertionError("commit_min_snapshot requires commit() to start or end at history_length");
+        }
     }
 
     // Append tokens to committed list.
     mCommittedTokens.insert(mCommittedTokens.end(), tokens.begin(), tokens.end());
-
-    // Commit full blocks — wrapped in recordEventScope() so SharedPageLock::unlock()
-    // shares one finish event (mirrors Python's `with self._record_event()`).
+    if (mCommitState == CommitState::VIRTUAL_STOP)
     {
-        int numCommittedBefore = mNumCommittedBlocks;
-        int newNumFullBlocks = static_cast<int>(mCommittedTokens.size()) / mTokensPerBlock;
-        if (newNumFullBlocks > numCommittedBefore)
+        if (isEnd)
+            mCommitState = CommitState::USER_STOP;
+        return;
+    }
+
+    // Bump history_length to cover newly committed tokens (mirrors Python — done
+    // BEFORE the commit loop so stale-range computation sees the new history).
+    int const numCommitted = static_cast<int>(mCommittedTokens.size());
+    if (mHistoryLength < numCommitted)
+        setHistoryLength(numCommitted);
+
+    int const numCommittedBlocksBefore = mNumCommittedBlocks;
+    int const newNumFullBlocks = numCommitted / mTokensPerBlock;
+    bool const hasPartialSnapshot = commitMinSnapshot && (numCommitted % mTokensPerBlock != 0) && numCommitted > 0;
+    bool const hasNewFullBlocks = newNumFullBlocks > numCommittedBlocksBefore;
+    if (hasNewFullBlocks || hasPartialSnapshot)
+    {
+        // Block whose end is the last committed token — where the SSM snapshot lives.
+        int const ssmSnapshotOrdinal = (numCommitted - 1) / mTokensPerBlock;
+        // Wrapped in recordEventScope() so SharedPageLock::unlock() shares one finish
+        // event (mirrors Python's `with self._record_event()`).
+        auto scope = recordEventScope();
+        for (int ordinal = numCommittedBlocksBefore; ordinal < newNumFullBlocks; ++ordinal)
         {
-            auto scope = recordEventScope();
-            while (static_cast<int>(mCommittedTokens.size()) >= mTokensPerBlock * (mNumCommittedBlocks + 1))
+            bool const commitSsm = commitMinSnapshot && ssmLcId.has_value() && ordinal == ssmSnapshotOrdinal;
+            _commitBlock(ordinal, /*isLast=*/false, commitSsm, /*moveSsm=*/isEnd);
+            // _commitBlock transitions to USER_STOP on VIRTUAL_STOP internally.
+            if (mCommitState != CommitState::ALLOWED)
+                break;
+        }
+        if (hasPartialSnapshot && mCommitState == CommitState::ALLOWED)
+        {
+            BlockOrdinal const partialOrdinal{newNumFullBlocks};
+            if (isEnd)
             {
-                _commitBlock(mNumCommittedBlocks, /*isLast=*/false);
-                // _commitBlock transitions to USER_STOP on VIRTUAL_STOP internally.
-                if (mCommitState != CommitState::ALLOWED)
-                    break;
+                _commitBlock(newNumFullBlocks, /*isLast=*/true, /*commitSsm=*/ssmLcId.has_value(),
+                    /*moveSsm=*/ssmLcId.has_value());
+            }
+            else
+            {
+                _snapshotPartialBlockToTree(partialOrdinal, /*commitSsm=*/ssmLcId.has_value());
             }
         }
     }
 
-    // Bump history_length to cover newly committed tokens (mirrors Python's behavior).
-    int numCommitted = static_cast<int>(mCommittedTokens.size());
-    if (mHistoryLength < numCommitted)
-        setHistoryLength(numCommitted);
+    if (isEnd && mCommitState != CommitState::USER_STOP)
+        stopCommitting();
 }
 
 void KvCache::stopCommitting()
@@ -1686,7 +1850,9 @@ void KvCache::_onStopCommitting()
                 auto& bp = beamPages[lcIdx];
                 if (blockPageIsNull(bp))
                 {
-                    continue; // Scratch or skipped stale block — no page to release
+                    // Nothing to release: scratch block, commit_min_snapshot early
+                    // release, or a stale block created unallocated by resize().
+                    continue;
                 }
                 TLLM_CHECK_DEBUG(std::holds_alternative<SharedPtr<PageHolder>>(bp));
                 bp = std::monostate{};
@@ -1891,7 +2057,7 @@ bool KvCache::_checkSanity() const
                         // For the decoder-side disagg case, for the first step, we will skip the
                         // out-of-window blocks.
                         TLLM_CHECK_DEBUG(std::holds_alternative<SharedPtr<PageHolder>>(bp)
-                            || (blockPageIsNull(bp) && mCommittedTokens.empty()));
+                            || (blockPageIsNull(bp) && (mCommittedTokens.empty() || mManager->commitMinSnapshot())));
                     }
                 }
                 else

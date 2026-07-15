@@ -1117,10 +1117,42 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstrain
     std::vector<BatchDesc> const& constraints, int tokensPerBlock,
     std::optional<SwaScratchReuseConfig> const& swaScratchReuse) const
 {
-    // Default floor: 1 slot per life cycle in each pool group.
+    // All returned elements are positive.
     TypedVec<PoolGroupIndex, SlotCount> maxSlots(numPoolGroups(), 0);
-    for (auto pgIdx : mLifeCycleGrouping)
-        maxSlots[pgIdx] += 1;
+
+    auto swaFloorBlocks = [tokensPerBlock](AttnLifeCycle const& lc) -> int
+    {
+        int window = *lc.windowSize;
+        // Handle oscillation of slot count required by SWA while the window slides.
+        return lc.numSinkBlocks + (window + tokensPerBlock - 2) / tokensPerBlock + 1;
+    };
+
+    // Full-attention lifecycles share the largest SWA floor: all attention
+    // lifecycles see the same seq_len, so this is a valid lower bound.
+    int floorNumBlocks = 1;
+    for (auto const& [lcId, attn] : mLifeCycles.attentionLifeCycles())
+    {
+        if (attn->windowSize.has_value())
+            floorNumBlocks = std::max(floorNumBlocks, swaFloorBlocks(*attn));
+    }
+    for (auto const& [lcIdx, lc] : mLifeCycles)
+    {
+        PoolGroupIndex pgIdx = getPoolGroupIndex(lcIdx);
+        auto const* attn = std::get_if<AttnLifeCycle>(&lc);
+        if (attn == nullptr)
+        {
+            // SSM / non-attention: 1 slot floor per life cycle.
+            maxSlots[pgIdx] += 1;
+        }
+        else if (attn->windowSize.has_value())
+        {
+            maxSlots[pgIdx] += swaFloorBlocks(*attn);
+        }
+        else
+        {
+            maxSlots[pgIdx] += floorNumBlocks;
+        }
+    }
     for (auto const& batch : constraints)
     {
         auto slots = computeSlotsForBatch(batch, tokensPerBlock, swaScratchReuse);

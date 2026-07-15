@@ -47,6 +47,9 @@ struct AttnLifeCycle
         BlockOrdinal start{std::min(numBlocks, numSinkBlocks)};
         if (!windowSize.has_value())
             return {start, start};
+        // `+ 1` is intentional: attention always runs for >= 1 in-flight input
+        // token at position `historyLength`, so the live window is
+        // [historyLength + 1 - windowSize, historyLength]. Do not drop it.
         BlockOrdinal windowStart{(historyLength + 1 - *windowSize) / tokensPerBlock};
         return {start, std::max(start, windowStart)};
     }

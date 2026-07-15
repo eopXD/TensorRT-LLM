@@ -76,6 +76,18 @@ public:
     }
 };
 
+// Mirrors a Python `assert` failure: the binding layer translates this to a
+// Python AssertionError so shared tests observe the same exception type as the
+// pure-Python backend.
+class AssertionError : public std::logic_error
+{
+public:
+    explicit AssertionError(std::string const& msg)
+        : std::logic_error(msg)
+    {
+    }
+};
+
 // Wraps a CUDA driver API error (CUresult).
 class CuError : public std::runtime_error
 {

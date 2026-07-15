@@ -170,9 +170,9 @@ public:
     int tokensPerBlock() const noexcept;
     bool enablePartialMatch() const noexcept;
 
-    int ssmReuseInterval() const noexcept
+    bool commitMinSnapshot() const noexcept
     {
-        return mConfig.ssmReuseInterval;
+        return mConfig.commitMinSnapshot;
     }
 
     bool isSwaScratchReuseEnabled() const noexcept

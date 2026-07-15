@@ -106,6 +106,22 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// SsmCommittedPage — a committed SSM snapshot page.
+//
+// Unlike attention CommittedPages (which always cover a full block), an SSM
+// snapshot may cover only a prefix of its block. `numTokensInBlock` records how
+// many tokens of the block this snapshot is reusable for.
+// ---------------------------------------------------------------------------
+class SsmCommittedPage : public CommittedPage
+{
+public:
+    int numTokensInBlock;
+
+    SsmCommittedPage(StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio,
+        int numTokensInBlock);
+};
+
+// ---------------------------------------------------------------------------
 // UncommittedPage — page associated with a live KvCache sequence.
 // ---------------------------------------------------------------------------
 class UncommittedPage : public Page
@@ -128,6 +144,11 @@ public:
     // Convert this UncommittedPage into a CommittedPage and attach to `block`.
     // The UncommittedPage becomes invalid (slot transferred to CommittedPage).
     SharedPtr<CommittedPage> convertToCommitted(SharedPtr<Block> block, CachedCudaEvent readyEvent);
+
+    // Convert this UncommittedPage into an SsmCommittedPage covering
+    // `numTokensInBlock` tokens and attach to `block`. Invalidates this page.
+    SharedPtr<SsmCommittedPage> convertToSsmCommitted(
+        SharedPtr<Block> block, CachedCudaEvent readyEvent, int numTokensInBlock);
 };
 
 // ---------------------------------------------------------------------------

@@ -220,7 +220,11 @@ public:
     // Commit tokens: finalises the oldest uncommitted block and makes it
     // available for reuse by other KvCaches.
     // tokens must contain exactly tokensPerBlock tokens per call (until the last).
-    void commit(std::vector<TokenIdExt> const& tokens);
+    // is_end: if true, records a final reusable snapshot and stops committing.
+    // This is a terminal-memory contract: callers must not perform later writes
+    // to this KvCache's memory. The final live pages may be moved into the radix
+    // tree instead of copied (SSM state and the last partial block).
+    void commit(std::vector<TokenIdExt> const& tokens, bool isEnd = false);
 
     // Stop committing (called by close() automatically).
     void stopCommitting();
@@ -405,8 +409,22 @@ private:
     // Internal helpers.
     void _setupForReuse(std::vector<TokenIdExt> const& inputTokens);
     void _clearBlocks();
-    // Snapshot live SSM state to a new page and attach to radix tree block.
-    void _snapshotSsmToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, BeamIndex beamIdx);
+    // Copy `srcPage` into a new committed page attached to `treeBlock` for lifecycle
+    // `lcIdx`. When `ssmNumTokensInBlock` is set, the copy is an SsmCommittedPage
+    // covering that many tokens; otherwise a plain attention CommittedPage. No-op if
+    // the block already holds a page for this lifecycle, or on OOM in all levels.
+    void _copyPageToTreeBlock(SharedPtr<Block> const& treeBlock, LifeCycleId lcIdx, SharedPtr<Page> const& srcPage,
+        std::optional<int> ssmNumTokensInBlock = std::nullopt);
+
+    // Snapshot live SSM state to `treeBlock` reusable at `numTokens` committed tokens.
+    // If `move`, the live SSM page is moved (not copied) into the tree — the caller
+    // must guarantee no later writes to this KvCache's memory.
+    void _snapshotSsmToTreeBlock(
+        SharedPtr<Block> const& treeBlock, LifeCycleId ssmLcId, int numTokens, bool move = false);
+
+    // Snapshot a partial (non-full) final block at `ordinal` into the radix tree,
+    // copying partial attention pages and optionally the SSM snapshot.
+    void _snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm);
     // Returns [stale_begin, stale_end) block ordinal range for a SWA lifecycle.
     HalfOpenRange<BlockOrdinal> _getStaleRange(int historyLength, LifeCycle const& lc) const;
 
@@ -466,8 +484,10 @@ private:
     // `isLast` mirrors Python's is_last parameter: when True (or on VIRTUAL_STOP),
     // transitions to USER_STOP and calls _onStopCommitting() internally.
     // Caller must have recordEventScope() open so finishEvent() works.
-    // Mirrors Python's _commit_block(ordinal, is_last).
-    void _commitBlock(int ord, bool isLast);
+    // `commitSsm` snapshots the current SSM state for this block; `moveSsm`
+    // moves (vs copies) the live SSM page into the tree (caller must guarantee
+    // no later writes to this KvCache's memory). Mirrors Python's _commit_block.
+    void _commitBlock(int ord, bool isLast, bool commitSsm = false, bool moveSsm = false);
 
     struct TakenPage
     {

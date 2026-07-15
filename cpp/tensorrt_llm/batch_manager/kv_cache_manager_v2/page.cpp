@@ -102,17 +102,30 @@ CommittedPage::CommittedPage(StorageManager* mgr, SharedPtr<Block> blk, LifeCycl
 {
 }
 
+SsmCommittedPage::SsmCommittedPage(
+    StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio, int numTokensInBlock_)
+    : CommittedPage(mgr, std::move(blk), lc, level, prio)
+    , numTokensInBlock(numTokensInBlock_)
+{
+    TLLM_CHECK_DEBUG(numTokensInBlock_ > 0);
+}
+
 CommittedPage::~CommittedPage()
 {
     if (block != nullptr)
     {
         // unlinkPage nulls storage[lc]->block (i.e. our member), so capture
-        // the block pointer via the returned previous-page identity check.
+        // the block pointer first. Pass `this` as the expected page: if a newer
+        // page already replaced us in the slot (e.g. a larger SSM snapshot), the
+        // slot is left alone and prev is nullptr — skip stale-block cleanup then.
         Block* blk = block;
-        [[maybe_unused]] auto* prev = blk->unlinkPage(lifeCycle);
-        TLLM_CHECK_DEBUG_WITH_INFO(prev == this, "unlinkPage returned unexpected page");
-        LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
-        Block::clearStaleBlocksAfterPageUnlink(*blk, lifeCycle, lc);
+        auto* prev = blk->unlinkPage(lifeCycle, this);
+        if (prev != nullptr)
+        {
+            TLLM_CHECK_DEBUG_WITH_INFO(prev == this, "unlinkPage returned unexpected page");
+            LifeCycle const& lc = manager->lifeCycles().getLifeCycle(lifeCycle);
+            Block::clearStaleBlocksAfterPageUnlink(*blk, lifeCycle, lc);
+        }
     }
     // Delegate slot release to Page::~Page().
 }
@@ -180,6 +193,30 @@ SharedPtr<CommittedPage> UncommittedPage::convertToCommitted(SharedPtr<Block> bl
     TLLM_CHECK_DEBUG_WITH_INFO(committed->hasValidSlot(), "committed page must have a valid slot after transfer");
 
     // Register in block storage.
+    blk->storage.at(lifeCycle) = committed.get();
+
+    return committed;
+}
+
+SharedPtr<SsmCommittedPage> UncommittedPage::convertToSsmCommitted(
+    SharedPtr<Block> blk, CachedCudaEvent readyEv, int numTokensInBlock)
+{
+    TLLM_CHECK_DEBUG(!scheduledForEviction());
+    TLLM_CHECK_DEBUG_WITH_INFO(
+        blk->storage.at(lifeCycle) == nullptr, "Block slot for this lifecycle already has a committed page");
+    TLLM_CHECK_DEBUG_WITH_INFO(status() == PageStatus::DROPPABLE, "Release holder/lock before converting");
+
+    this->readyEvent = std::move(readyEv);
+
+    auto committed = makeShared<SsmCommittedPage>(manager, blk, lifeCycle, cacheLevel, priority, numTokensInBlock);
+    committed->setSlotId(slotId()); // asserts valid
+    committed->readyEvent = std::move(readyEvent);
+    resetSlot();
+    readyEvent = CachedCudaEvent::makeNull();
+
+    TLLM_CHECK_DEBUG(!hasValidSlot() && readyEvent.isClosed());
+    TLLM_CHECK_DEBUG_WITH_INFO(committed->hasValidSlot(), "committed page must have a valid slot after transfer");
+
     blk->storage.at(lifeCycle) = committed.get();
 
     return committed;

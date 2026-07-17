@@ -76,13 +76,13 @@ std::pair<EventManager::HashAlgorithm, std::string> EventManager::parseHashAlgor
     {
         return {HashAlgorithm::kV1, "v1_block_key"};
     }
-    if (hashAlgo == "v2_blake3" || hashAlgo == "v2_sha256")
+    if (hashAlgo == "v2_sha256")
     {
-        return {HashAlgorithm::kV2Blake3, "v2_blake3"};
+        return {HashAlgorithm::kV2Sha256, "v2_sha256"};
     }
-    if (hashAlgo == "v2_blake3_64" || hashAlgo == "v2_sha256_64")
+    if (hashAlgo == "v2_sha256_64")
     {
-        return {HashAlgorithm::kV2Blake3_64, "v2_blake3_64"};
+        return {HashAlgorithm::kV2Sha256_64, "v2_sha256_64"};
     }
     throw std::invalid_argument("Unsupported V2 KV cache event hash algorithm: " + hashAlgo);
 }
@@ -497,7 +497,7 @@ uint64_t EventManager::truncateDigestToInt64(Digest const& digest)
 
 EventBlockHash EventManager::normalizeDigest(Digest const& digest) const
 {
-    if (mHashAlgo == HashAlgorithm::kV2Blake3_64)
+    if (mHashAlgo == HashAlgorithm::kV2Sha256_64)
     {
         return truncateDigestToInt64(digest);
     }
@@ -667,7 +667,7 @@ uint64_t EventManager::fallbackV1Hash(Digest const& blockKey)
     {
         TLLM_LOG_WARNING(
             "V2 KV cache event hash algorithm v1_block_key only matches v1 for text-token radix blocks. "
-            "Falling back to truncated BLAKE3 block hash for unsupported blocks.");
+            "Falling back to truncated SHA-256 block hash for unsupported blocks.");
         mWarnedV1HashFallback = true;
     }
     return truncateDigestToInt64(blockKey);

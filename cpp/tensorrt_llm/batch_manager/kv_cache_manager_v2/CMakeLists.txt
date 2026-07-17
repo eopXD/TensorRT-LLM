@@ -16,35 +16,26 @@
 # Sources for the C++ KVCacheManagerV2 implementation. These are added to the
 # tensorrt_llm_batch_manager_static target by the parent CMakeLists.txt.
 
-# BLAKE3 C sources — needed by blockRadixTree.cpp. Always include the portable
-# dispatch core.
-set(BLAKE3_SRCS
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/blake3/blake3.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/blake3/blake3_dispatch.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/blake3/blake3_portable.c)
-# x86/x86-64 SIMD back-ends
+# Bitcoin Core SHA-256 (vendored, MIT; see 3rdparty/sha256/README.md) — needed
+# by blockRadixTree.cpp. Slimmed to the single-block CSHA256 path: portable
+# scalar core + runtime dispatch (sha256.cpp) plus a per-architecture hardware
+# transform. Plain C++17; the include root 3rdparty/sha256 is added on the
+# batch_manager target so "sha256.h" resolves.
+set(SHA256_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/sha256)
+set(SHA256_SRCS ${SHA256_DIR}/sha256.cpp)
+# x86/x86-64: Intel SHA-NI transform.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
-  set(BLAKE3_SSE2
-      ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/blake3/blake3_sse2.c)
-  set(BLAKE3_SSE41
-      ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/blake3/blake3_sse41.c)
-  set(BLAKE3_AVX2
-      ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/blake3/blake3_avx2.c)
-  set(BLAKE3_AVX512
-      ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/blake3/blake3_avx512.c)
-  set_source_files_properties(${BLAKE3_SSE2} PROPERTIES COMPILE_FLAGS "-msse2")
-  set_source_files_properties(${BLAKE3_SSE41} PROPERTIES COMPILE_FLAGS
-                                                         "-msse4.1 -mssse3")
-  set_source_files_properties(${BLAKE3_AVX2} PROPERTIES COMPILE_FLAGS "-mavx2")
-  set_source_files_properties(${BLAKE3_AVX512}
-                              PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512vl")
-  list(APPEND BLAKE3_SRCS ${BLAKE3_SSE2} ${BLAKE3_SSE41} ${BLAKE3_AVX2}
-       ${BLAKE3_AVX512})
+  set(SHA256_X86_SHANI ${SHA256_DIR}/sha256_x86_shani.cpp)
+  set_source_files_properties(
+    ${SHA256_X86_SHANI} PROPERTIES COMPILE_OPTIONS "-msse4.1;-msse4;-msha")
+  list(APPEND SHA256_SRCS ${SHA256_X86_SHANI})
 endif()
-# ARM NEON back-end (AArch64 and 32-bit ARM with NEON)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64|armv7|armv8")
-  list(APPEND BLAKE3_SRCS
-       ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/blake3/blake3_neon.c)
+# AArch64: ARMv8 crypto-extension (SHA-256) transform.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+  set(SHA256_ARM_SHANI ${SHA256_DIR}/sha256_arm_shani.cpp)
+  set_source_files_properties(
+    ${SHA256_ARM_SHANI} PROPERTIES COMPILE_OPTIONS "-march=armv8-a+crypto")
+  list(APPEND SHA256_SRCS ${SHA256_ARM_SHANI})
 endif()
 
 set(KV_CACHE_MANAGER_V2_SRCS
@@ -65,7 +56,7 @@ set(KV_CACHE_MANAGER_V2_SRCS
     kv_cache_manager_v2/introspection.cpp
     kv_cache_manager_v2/kvCache.cpp
     kv_cache_manager_v2/kvCacheManager.cpp
-    ${BLAKE3_SRCS})
+    ${SHA256_SRCS})
 
 # Headers and sources are co-located; the include root is batch_manager/ so that
 # #include "kv_cache_manager_v2/common.h" resolves correctly. NOTE: this file is

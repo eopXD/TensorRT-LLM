@@ -21,7 +21,7 @@
 #include "kv_cache_manager_v2/storageManager.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
-#include "blake3.h"
+#include "sha256.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
@@ -71,43 +71,56 @@ std::vector<uint8_t> ReuseScope::toBytes() const
 // Hasher
 // ---------------------------------------------------------------------------
 
-static void hashInt64(blake3_hasher* h, int64_t v)
+namespace
 {
-    uint8_t buf[8];
+// Select the best available SHA-256 back-end (x86 SHA-NI, ARMv8 crypto, SSE4,
+// AVX2) once, falling back to a portable scalar transform. CSHA256 dispatches
+// through function pointers that SHA256AutoDetect() installs; the magic-static
+// guarantees this runs exactly once and is thread-safe.
+void ensureSha256Detected()
+{
+    static std::string const impl = SHA256AutoDetect();
+    (void) impl;
+}
+} // namespace
+
+static void hashInt64(CSHA256& h, int64_t v)
+{
+    unsigned char buf[8];
     auto const unsignedValue = static_cast<uint64_t>(v);
     for (int i = 0; i < 8; ++i)
     {
-        buf[i] = static_cast<uint8_t>((unsignedValue >> (8 * i)) & 0xFFU);
+        buf[i] = static_cast<unsigned char>((unsignedValue >> (8 * i)) & 0xFFU);
     }
-    blake3_hasher_update(h, buf, sizeof(buf));
+    h.Write(buf, sizeof(buf));
 }
 
 Hasher::Hasher()
 {
-    blake3_hasher_init(&mState);
+    ensureSha256Detected();
 }
 
 Hasher::Hasher(ReuseScope const& seed)
 {
-    blake3_hasher_init(&mState);
+    ensureSha256Detected();
     update(seed.toBytes());
 }
 
 Hasher& Hasher::update(TokenId token)
 {
-    hashInt64(&mState, static_cast<int64_t>(token));
+    hashInt64(mState, static_cast<int64_t>(token));
     return *this;
 }
 
 Hasher& Hasher::update(BlockKey const& key)
 {
-    blake3_hasher_update(&mState, reinterpret_cast<uint8_t const*>(key.data()), key.size());
+    mState.Write(reinterpret_cast<unsigned char const*>(key.data()), key.size());
     return *this;
 }
 
 Hasher& Hasher::update(std::vector<uint8_t> const& bytes)
 {
-    blake3_hasher_update(&mState, bytes.data(), bytes.size());
+    mState.Write(bytes.data(), bytes.size());
     return *this;
 }
 
@@ -118,9 +131,9 @@ Hasher& Hasher::update(TokenIdExt const& tokenExt)
         {
             using T = std::decay_t<decltype(v)>;
             if constexpr (std::is_same_v<T, TokenId>)
-                hashInt64(&mState, static_cast<int64_t>(v));
+                hashInt64(mState, static_cast<int64_t>(v));
             else
-                blake3_hasher_update(&mState, reinterpret_cast<uint8_t const*>(v.data()), v.size());
+                mState.Write(reinterpret_cast<unsigned char const*>(v.data()), v.size());
         },
         tokenExt);
     return *this;
@@ -138,11 +151,11 @@ Hasher& Hasher::update(TokenIdExt const* tokens, size_t count)
 
 BlockKey Hasher::digest() const
 {
-    // BLAKE3 supports streaming output; finalize into a 32-byte key.
+    // Finalize into a 32-byte key. CSHA256::Finalize consumes the state, so we
+    // finalize a copy to keep this method const and allow further updates.
     BlockKey out;
-    // We need a copy of the hasher state to finalize without mutating.
-    blake3_hasher copy = mState;
-    blake3_hasher_finalize(&copy, reinterpret_cast<uint8_t*>(out.data()), out.size());
+    CSHA256 copy = mState;
+    copy.Finalize(reinterpret_cast<unsigned char*>(out.data()));
     return out;
 }
 

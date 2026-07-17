@@ -3737,8 +3737,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Whether KV cache manager v2 uses SWA scratch reuse during prefill.")
 
     kv_cache_event_hash_algo: Literal[
-        "auto", "v1_block_key", "v2_sha256", "v2_sha256_64", "v2_blake3",
-        "v2_blake3_64"] = Field(
+        "auto", "v1_block_key", "v2_sha256", "v2_sha256_64"] = Field(
             default="auto",
             status="prototype",
             description=

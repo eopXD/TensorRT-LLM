@@ -22,7 +22,7 @@
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/utils/sharedPtr.h"
 
-#include "blake3.h"
+#include "sha256.h"
 
 #include <array>
 #include <cstdint>
@@ -60,15 +60,15 @@ struct ReuseScope
 };
 
 // ---------------------------------------------------------------------------
-// BlockKey — BLAKE3 digest (32 bytes), used as radix-tree node identifier.
-// (Replaces Python SHA-256 32-byte digest.)
+// BlockKey — SHA-256 digest (32 bytes), used as radix-tree node identifier.
+// Matches Python's hashlib.sha256 32-byte digest.
 // ---------------------------------------------------------------------------
 using BlockKey = Digest;
-static_assert(kDIGEST_LEN == BLAKE3_OUT_LEN); // 32 bytes
+static_assert(kDIGEST_LEN == CSHA256::OUTPUT_SIZE); // 32 bytes
 
 // ---------------------------------------------------------------------------
-// Hasher — thin wrapper around BLAKE3 for incremental digests.
-// Mirrors Python's Hasher class.
+// Hasher — thin wrapper around SHA-256 (CSHA256) for incremental digests.
+// Mirrors Python's Hasher class (hashlib.sha256).
 // ---------------------------------------------------------------------------
 class Hasher
 {
@@ -85,7 +85,7 @@ public:
     BlockKey digest() const;
 
 private:
-    blake3_hasher mState;
+    CSHA256 mState;
 };
 
 // ---------------------------------------------------------------------------

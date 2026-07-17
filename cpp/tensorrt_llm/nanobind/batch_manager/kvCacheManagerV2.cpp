@@ -707,7 +707,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("max_kv_event_entries"), nb::kw_only(), nb::arg("window_size") = 0,
             nb::arg("attention_dp_rank") = std::nullopt, nb::arg("attention_dp_gather") = nb::none(),
-            nb::arg("hash_algo") = "v2_blake3", nb::arg("window_size_by_layer_group").none() = nb::none())
+            nb::arg("hash_algo") = "v2_sha256", nb::arg("window_size_by_layer_group").none() = nb::none())
         .def("add_created_event", &kv::EventManager::addCreatedEvent, nb::arg("num_blocks_per_cache_level"),
             nb::arg("layer_group_ids") = std::nullopt, nb::call_guard<nb::gil_scoped_release>())
         .def("set_layer_group_window_sizes", &kv::EventManager::setLayerGroupWindowSizes, nb::arg("window_sizes"),

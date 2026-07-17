@@ -22,7 +22,6 @@ from importlib.util import find_spec
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from blake3 import blake3
 
 from tensorrt_llm._utils import KVCacheEventSerializer
 from tensorrt_llm.runtime.kv_cache_hash import (
@@ -154,20 +153,6 @@ def _token_ids(start, end):
     return [TokenId(token_id) for token_id in range(start, end)]
 
 
-def _blake3_block_keys(tokens_per_block, reuse_scope, tokens):
-    digest = blake3(reuse_scope.to_bytes()).digest()
-    result = []
-    for block_start in range(0, len(tokens), tokens_per_block):
-        hasher = blake3(digest)
-        for token in tokens[block_start : block_start + tokens_per_block]:
-            hasher.update(
-                int(token).to_bytes(8, "little", signed=False) if isinstance(token, int) else token
-            )
-        digest = hasher.digest()
-        result.append(digest)
-    return result
-
-
 def _flush_serialized_events(event_manager):
     event_manager.flush_iteration_events()
     return KVCacheEventSerializer.serialize(event_manager.get_latest_events(0))
@@ -216,7 +201,7 @@ def test_native_event_manager_queue_and_stored_coalescing():
     event_manager = NativeKVCacheEventManager(
         max_kv_event_entries=8,
         window_size=128,
-        hash_algo="v2_blake3",
+        hash_algo="v2_sha256",
     )
     event_manager.add_stored_event(
         None,
@@ -246,7 +231,7 @@ def test_native_event_manager_queue_and_stored_coalescing():
     events = KVCacheEventSerializer.serialize(event_objects)
 
     assert len(events) == 1
-    assert events[0]["hash_algo"] == "v2_blake3"
+    assert events[0]["hash_algo"] == "v2_sha256"
     assert [block["block_hash"] for block in events[0]["data"]["blocks"]] == [
         "block0",
         "block1",
@@ -1209,19 +1194,16 @@ def test_v2_stored_events_match_block_hash_chain():
         stored_events = _stored_events(events)
         assert len(stored_events) == 1
 
-        if _USING_CPP_BACKEND:
-            expected_hashes = [
-                block_key.hex()
-                for block_key in _blake3_block_keys(tokens_per_block, ReuseScope(), tokens)
-            ]
-        else:
-            root_key = RootBlock.make_key(ReuseScope())
-            block0_key = Block.make_key(root_key, tokens[:tokens_per_block])
-            block1_key = Block.make_key(block0_key, tokens[tokens_per_block:])
-            expected_hashes = [block0_key.hex(), block1_key.hex()]
+        # Both the Python and C++ backends hash blocks with SHA-256 over the same
+        # little-endian token encoding, so the block-key chain matches the
+        # pure-Python Block.make_key implementation on either backend.
+        root_key = RootBlock.make_key(ReuseScope())
+        block0_key = Block.make_key(root_key, tokens[:tokens_per_block])
+        block1_key = Block.make_key(block0_key, tokens[tokens_per_block:])
+        expected_hashes = [block0_key.hex(), block1_key.hex()]
 
         assert _stored_block_hashes(stored_events) == expected_hashes
-        assert stored_events[0]["hash_algo"] == ("v2_blake3" if _USING_CPP_BACKEND else "v2_sha256")
+        assert stored_events[0]["hash_algo"] == "v2_sha256"
         assert stored_events[0]["data"]["parent_hash"] is None
         assert [
             block["block_hash"] for block in stored_events[0]["data"]["blocks"]
@@ -1313,19 +1295,12 @@ def test_v2_reused_prefix_does_not_emit_duplicate_stored_events():
         reuse_events = _flush_serialized_events(event_manager)
         reused_hashes = _stored_block_hashes(reuse_events)
 
-        if _USING_CPP_BACKEND:
-            prefix_keys = _blake3_block_keys(tokens_per_block, ReuseScope(), prefix_tokens)
-            block2_key = _blake3_block_keys(
-                tokens_per_block,
-                ReuseScope(),
-                [*prefix_tokens, *new_tokens],
-            )[-1]
-        else:
-            root_key = RootBlock.make_key(ReuseScope())
-            block0_key = Block.make_key(root_key, prefix_tokens[:tokens_per_block])
-            block1_key = Block.make_key(block0_key, prefix_tokens[tokens_per_block:])
-            block2_key = Block.make_key(block1_key, new_tokens)
-            prefix_keys = [block0_key, block1_key]
+        # SHA-256 block-key chain is identical across both backends.
+        root_key = RootBlock.make_key(ReuseScope())
+        block0_key = Block.make_key(root_key, prefix_tokens[:tokens_per_block])
+        block1_key = Block.make_key(block0_key, prefix_tokens[tokens_per_block:])
+        block2_key = Block.make_key(block1_key, new_tokens)
+        prefix_keys = [block0_key, block1_key]
 
         assert prefix_hashes == [block_key.hex() for block_key in prefix_keys]
         assert reused_hashes == [block2_key.hex()]

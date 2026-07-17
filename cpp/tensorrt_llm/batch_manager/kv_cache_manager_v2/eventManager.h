@@ -163,7 +163,7 @@ public:
     using AttentionDpGatherFn = std::function<std::vector<std::vector<KVCacheEvent>>(std::vector<KVCacheEvent> const&)>;
 
     EventManager(int maxKvEventEntries, int windowSize = 0, std::optional<int> attentionDpRank = std::nullopt,
-        AttentionDpGatherFn attentionDpGather = {}, std::string hashAlgo = "v2_blake3",
+        AttentionDpGatherFn attentionDpGather = {}, std::string hashAlgo = "v2_sha256",
         std::map<int, int> windowSizeByLayerGroup = {});
 
     void addCreatedEvent(
@@ -198,8 +198,8 @@ private:
     enum class HashAlgorithm
     {
         kV1,
-        kV2Blake3,
-        kV2Blake3_64,
+        kV2Sha256,
+        kV2Sha256_64,
     };
 
     struct StoredBlockState

@@ -228,7 +228,7 @@ struct std::hash<tensorrt_llm::batch_manager::kv_cache_manager_v2::Digest>
 {
     size_t operator()(tensorrt_llm::batch_manager::kv_cache_manager_v2::Digest const& k) const noexcept
     {
-        // First 8 bytes of a BLAKE3 digest are already well-distributed.
+        // First 8 bytes of a SHA-256 digest are already well-distributed.
         uint64_t v;
         std::memcpy(&v, k.data(), sizeof(v));
         return static_cast<size_t>(v);

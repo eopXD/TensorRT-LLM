@@ -127,6 +127,7 @@ void hostPrefaultChunk(MemAddress ptr, size_t size, HostMadviseFn madviseFn, Hos
 {
     HostMadviseFn const advise = madviseFn != nullptr ? madviseFn : ::madvise;
     HostMemsetFn const touch = memsetFn != nullptr ? memsetFn : ::memset;
+#ifdef MADV_POPULATE_WRITE
     if (advise(reinterpret_cast<void*>(ptr), size, MADV_POPULATE_WRITE) == 0)
     {
         return;
@@ -143,6 +144,13 @@ void hostPrefaultChunk(MemAddress ptr, size_t size, HostMadviseFn madviseFn, Hos
         throw HostOOMError("madvise(MADV_POPULATE_WRITE) failed: " + std::string(std::strerror(errorCode)));
     }
     throw std::system_error(errorCode, std::generic_category(), "madvise(MADV_POPULATE_WRITE) failed");
+#else
+    // MADV_POPULATE_WRITE requires glibc >= 2.34 / Linux >= 5.14 headers and is not defined in
+    // older build environments (e.g. Rocky8 package-sanity images). Fall back to explicitly
+    // touching the pages to force population, matching the EINVAL/ENOSYS runtime path above.
+    (void) advise;
+    touch(reinterpret_cast<void*>(ptr), 0, size);
+#endif
 }
 
 // ---------------------------------------------------------------------------

@@ -51,8 +51,6 @@ struct ReuseScope
     std::optional<LoraTaskIdType> loraId;
     std::optional<std::uint64_t> salt;
 
-    std::vector<uint8_t> toBytes() const;
-
     bool operator==(ReuseScope const& other) const noexcept
     {
         return loraId == other.loraId && salt == other.salt;
@@ -78,6 +76,7 @@ public:
 
     Hasher& update(TokenId token);
     Hasher& update(BlockKey const& key);
+    Hasher& update(ReuseScope const& scope);
     Hasher& update(std::vector<uint8_t> const& bytes);
     Hasher& update(TokenIdExt const& tokenExt);
     Hasher& update(TokenIdExt const* tokens, size_t count);

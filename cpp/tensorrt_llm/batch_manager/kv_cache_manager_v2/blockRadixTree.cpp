@@ -37,34 +37,32 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // ReuseScope
 // ---------------------------------------------------------------------------
 
-static void appendUint64Bytes(std::vector<uint8_t>& dst, std::uint64_t value)
+// Serialized layout of a ReuseScope, consumed by Hasher::update(ReuseScope).
+// Must stay byte-identical to the Python ReuseScope.to_bytes(): a mask byte
+// followed by one little-endian uint64 per present field (signed=False).
+template <typename Emit>
+static void emitReuseScopeBytes(ReuseScope const& scope, Emit&& emit)
 {
-    auto const* bytes = reinterpret_cast<uint8_t const*>(&value);
-    dst.insert(dst.end(), bytes, bytes + sizeof(value));
-}
-
-std::vector<uint8_t> ReuseScope::toBytes() const
-{
-    std::vector<uint8_t> ret;
     uint8_t mask = 0;
-    if (loraId.has_value())
+    if (scope.loraId.has_value())
     {
         mask |= 1U << 0;
     }
-    if (salt.has_value())
+    if (scope.salt.has_value())
     {
         mask |= 1U << 1;
     }
-    ret.push_back(mask);
-    if (loraId.has_value())
+    emit(&mask, sizeof(mask));
+    if (scope.loraId.has_value())
     {
-        appendUint64Bytes(ret, *loraId);
+        std::uint64_t const value = *scope.loraId;
+        emit(reinterpret_cast<uint8_t const*>(&value), sizeof(value));
     }
-    if (salt.has_value())
+    if (scope.salt.has_value())
     {
-        appendUint64Bytes(ret, *salt);
+        std::uint64_t const value = *scope.salt;
+        emit(reinterpret_cast<uint8_t const*>(&value), sizeof(value));
     }
-    return ret;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +101,15 @@ Hasher::Hasher()
 Hasher::Hasher(ReuseScope const& seed)
 {
     ensureSha256Detected();
-    update(seed.toBytes());
+    update(seed);
+}
+
+Hasher& Hasher::update(ReuseScope const& scope)
+{
+    // Feed the serialized ReuseScope straight into the hash state without any
+    // intermediate heap buffer.
+    emitReuseScopeBytes(scope, [this](uint8_t const* data, size_t count) { mState.Write(data, count); });
+    return *this;
 }
 
 Hasher& Hasher::update(TokenId token)

@@ -964,12 +964,6 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("lora_id").none() = std::nullopt, nb::arg("salt").none() = std::nullopt)
         .def_ro("lora_id", &kv::ReuseScope::loraId)
         .def_ro("salt", &kv::ReuseScope::salt)
-        .def("to_bytes",
-            [](kv::ReuseScope const& self)
-            {
-                auto bytes = self.toBytes();
-                return nb::bytes(reinterpret_cast<char const*>(bytes.data()), bytes.size());
-            })
         .def("__len__", [](kv::ReuseScope const&) { return 2; })
         .def(
             "__getitem__",

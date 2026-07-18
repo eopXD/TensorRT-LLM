@@ -24,7 +24,11 @@ _BACKEND = os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower()
 
 if _BACKEND == "python":
     from . import rawref  # noqa: F401
-    from ._block_radix_tree import ReuseScope, gen_multimodal_cache_key_tokens  # noqa: F401
+    from ._block_radix_tree import ReuseScope  # noqa: F401
+    from ._cache_key import (  # noqa: F401
+        gen_multimodal_cache_key_tokens,
+        sequence_to_blockchain_keys,
+    )
     from ._common import (  # noqa: F401
         BAD_PAGE_INDEX,
         CACHE_LEVEL1,
@@ -225,17 +229,10 @@ else:
         SHARED = 0
         PER_LAYER = 1
 
-    def gen_multimodal_cache_key_tokens(
-        id_offset: int, multi_modal_data_digest: bytes, num_tokens: int, token_offset: int = 0
-    ) -> list[TokenIdExt]:
-        assert num_tokens > 0
-        assert token_offset >= 0
-        return [
-            multi_modal_data_digest
-            if token_offset + i == 0
-            else TokenId(id_offset + token_offset + i)
-            for i in range(num_tokens)
-        ]
+    from ._cache_key import (  # noqa: F401
+        gen_multimodal_cache_key_tokens,
+        sequence_to_blockchain_keys,
+    )
 
     def exact_div(x: int, y: int) -> int:
         assert x % y == 0
@@ -313,6 +310,7 @@ __all__ = [
     "_KVCache",
     "exact_div",
     "gen_multimodal_cache_key_tokens",
+    "sequence_to_blockchain_keys",
     "rawref",
     "typed_range",
 ]

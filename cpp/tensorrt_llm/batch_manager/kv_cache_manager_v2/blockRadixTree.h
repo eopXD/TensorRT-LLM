@@ -48,8 +48,8 @@ struct Block;
 // ---------------------------------------------------------------------------
 struct ReuseScope
 {
-    std::optional<int64_t> loraId;
-    std::optional<int64_t> salt;
+    std::optional<LoraTaskIdType> loraId;
+    std::optional<std::uint64_t> salt;
 
     std::vector<uint8_t> toBytes() const;
 

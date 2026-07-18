@@ -82,6 +82,9 @@ using TokenId = int64_t;
 // Opaque request identifier shared with the rest of the batch manager.
 using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;
 
+// Opaque LoRA task identifier shared with the rest of the batch manager.
+using LoraTaskIdType = tensorrt_llm::runtime::LoraTaskIdType;
+
 // 32-byte aligned to enable SIMD.
 inline constexpr int kDIGEST_LEN = 32;
 

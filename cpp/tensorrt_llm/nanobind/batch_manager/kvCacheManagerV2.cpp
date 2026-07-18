@@ -145,7 +145,7 @@ static nb::tuple bufferIdTuple(kv::BufferId const& self)
     return nb::make_tuple(self.layerId, self.role);
 }
 
-static nb::object optionalIntToObject(std::optional<int64_t> value)
+static nb::object optionalIntToObject(std::optional<std::uint64_t> value)
 {
     if (!value.has_value())
     {
@@ -439,7 +439,7 @@ static nb::object castRequestIds(std::unordered_set<kv::RequestIdType> const& re
     return result;
 }
 
-static std::optional<int64_t> castOptionalIntAttr(nb::handle obj, char const* attrName)
+static std::optional<std::uint64_t> castOptionalIntAttr(nb::handle obj, char const* attrName)
 {
     nb::object attr = nb::steal(PyObject_GetAttrString(obj.ptr(), attrName));
     if (!attr)
@@ -450,7 +450,7 @@ static std::optional<int64_t> castOptionalIntAttr(nb::handle obj, char const* at
     {
         return std::nullopt;
     }
-    return nb::cast<int64_t>(attr);
+    return nb::cast<std::uint64_t>(attr);
 }
 
 static kv::ReuseScope castReuseScope(nb::object reuseScope)
@@ -466,7 +466,7 @@ static kv::ReuseScope castReuseScope(nb::object reuseScope)
     // Backward-compatible bridge for old callers that still pass lora_task_id as the first argument.
     if (PyLong_Check(reuseScope.ptr()))
     {
-        return {nb::cast<int64_t>(reuseScope), std::nullopt};
+        return {nb::cast<kv::LoraTaskIdType>(reuseScope), std::nullopt};
     }
     if (PyObject_HasAttrString(reuseScope.ptr(), "lora_id") && PyObject_HasAttrString(reuseScope.ptr(), "salt"))
     {
@@ -960,8 +960,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
     // ---- ReuseScope --------------------------------------------------------
     nb::class_<kv::ReuseScope>(m, "ReuseScope")
-        .def(nb::init<std::optional<int64_t>, std::optional<int64_t>>(), nb::arg("lora_id").none() = std::nullopt,
-            nb::arg("salt").none() = std::nullopt)
+        .def(nb::init<std::optional<kv::LoraTaskIdType>, std::optional<std::uint64_t>>(),
+            nb::arg("lora_id").none() = std::nullopt, nb::arg("salt").none() = std::nullopt)
         .def_ro("lora_id", &kv::ReuseScope::loraId)
         .def_ro("salt", &kv::ReuseScope::salt)
         .def("to_bytes",

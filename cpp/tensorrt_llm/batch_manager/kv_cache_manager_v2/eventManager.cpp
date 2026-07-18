@@ -575,7 +575,7 @@ std::optional<KVCacheStoredBlockData> EventManager::storedBlockFromBlock(
 }
 
 uint64_t EventManager::hashV1BlockKey(std::vector<TokenId> const& tokens, uint64_t parentHash,
-    std::optional<int64_t> loraTaskId, std::optional<int64_t> cacheSaltId)
+    std::optional<LoraTaskIdType> loraTaskId, std::optional<std::uint64_t> cacheSaltId)
 {
     uint64_t seed = static_cast<uint64_t>(tokens.size()) ^ (parentHash * kParentHashConst);
     if (parentHash == 0 && cacheSaltId.has_value())

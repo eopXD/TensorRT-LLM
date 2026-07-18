@@ -37,7 +37,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 // ReuseScope
 // ---------------------------------------------------------------------------
 
-static void appendInt64Bytes(std::vector<uint8_t>& dst, int64_t value)
+static void appendUint64Bytes(std::vector<uint8_t>& dst, std::uint64_t value)
 {
     auto const* bytes = reinterpret_cast<uint8_t const*>(&value);
     dst.insert(dst.end(), bytes, bytes + sizeof(value));
@@ -58,11 +58,11 @@ std::vector<uint8_t> ReuseScope::toBytes() const
     ret.push_back(mask);
     if (loraId.has_value())
     {
-        appendInt64Bytes(ret, *loraId);
+        appendUint64Bytes(ret, *loraId);
     }
     if (salt.has_value())
     {
-        appendInt64Bytes(ret, *salt);
+        appendUint64Bytes(ret, *salt);
     }
     return ret;
 }

@@ -185,7 +185,8 @@ public:
     }
 
     static uint64_t hashV1BlockKey(std::vector<TokenId> const& tokens, uint64_t parentHash = 0,
-        std::optional<int64_t> loraTaskId = std::nullopt, std::optional<int64_t> cacheSaltId = std::nullopt);
+        std::optional<LoraTaskIdType> loraTaskId = std::nullopt,
+        std::optional<std::uint64_t> cacheSaltId = std::nullopt);
 
     void addStoredBlock(Block const& block) override;
     void addStoredLifeCycle(Block const& block, LifeCycleId lifeCycle) override;
@@ -208,7 +209,7 @@ private:
         std::set<int> lifeCycleIds;
     };
 
-    using V1RootAttrs = std::pair<std::optional<int64_t>, std::optional<int64_t>>;
+    using V1RootAttrs = std::pair<std::optional<LoraTaskIdType>, std::optional<std::uint64_t>>;
 
     static std::pair<HashAlgorithm, std::string> parseHashAlgorithm(std::string const& hashAlgo);
     static std::string digestToHex(Digest const& digest);

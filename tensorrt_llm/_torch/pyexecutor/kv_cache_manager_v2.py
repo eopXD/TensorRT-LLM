@@ -1937,11 +1937,17 @@ class KVCacheManagerV2(BaseResourceManager):
             page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
             page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
             converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
-        except KeyError:
+        except (KeyError, IndexError):
             # INDEX_KEY not registered for this layer (default V2 manager
             # registers only K/V/scale; sparse subclasses register
             # INDEX_KEY only on sparse layers via
             # ``_extra_buffers_per_layer``).
+            #
+            # The python backend raises ``KeyError`` from the missing dict
+            # lookup; the C++ backend's ``getBufferAttr`` throws
+            # ``std::out_of_range`` for an unknown buffer id, which nanobind
+            # maps to ``IndexError``. Catch both so the "role not registered
+            # -> None" contract holds on either backend.
             return None
 
         if isinstance(dtype, DataType):

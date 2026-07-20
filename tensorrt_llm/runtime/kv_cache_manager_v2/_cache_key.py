@@ -48,6 +48,17 @@ def gen_multimodal_cache_key_tokens(
 
 
 class Hasher:
+    # SECURITY INVARIANT: the block-key hash MUST stay cryptographically
+    # collision-resistant and >= 256-bit. The radix tree is a globally shared,
+    # cross-request/cross-tenant cache index; prefix matches are decided purely by
+    # digest equality with NO re-check of the underlying tokens; and the hashed
+    # input (tokens, the user-supplied cache_salt, multimodal content bytes) is
+    # attacker-influenceable. A collision therefore silently reuses another
+    # request's KV blocks (cross-request corruption / data leak), and cache_salt
+    # tenant isolation relies entirely on this hash's collision resistance. Do NOT
+    # swap in a non-cryptographic hash (xxHash, HighwayHash, ...) or truncate below
+    # 256 bits without first adding a token-content equality check on match. The
+    # C++ backend (blockRadixTree) mirrors this with SHA-256 (CSHA256).
     __slots__ = "_hasher"
     _hasher: "hashlib._Hash"
 

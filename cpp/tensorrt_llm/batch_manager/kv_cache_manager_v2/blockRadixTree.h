@@ -60,13 +60,26 @@ struct ReuseScope
 // ---------------------------------------------------------------------------
 // BlockKey — SHA-256 digest (32 bytes), used as radix-tree node identifier.
 // Matches Python's hashlib.sha256 32-byte digest.
+//
+// SECURITY INVARIANT: the block hash MUST remain cryptographically
+// collision-resistant and >= 256-bit. The radix tree is a globally shared,
+// cross-request/cross-tenant cache index, prefix matching is decided purely by
+// digest equality with NO re-verification of the underlying tokens, and the
+// hashed input (tokens, the user-supplied cache_salt in ReuseScope, multimodal
+// content bytes) is attacker-influenceable. A hash collision therefore silently
+// reuses another request's KV blocks (cross-request corruption / data leak),
+// and tenant isolation via cache_salt relies entirely on this hash's collision
+// resistance. Do NOT substitute a non-cryptographic hash (xxHash, HighwayHash,
+// City, ...) or truncate below 256 bits without first adding a token-content
+// equality check on match.
 // ---------------------------------------------------------------------------
 using BlockKey = Digest;
 static_assert(kDIGEST_LEN == CSHA256::OUTPUT_SIZE); // 32 bytes
 
 // ---------------------------------------------------------------------------
 // Hasher — thin wrapper around SHA-256 (CSHA256) for incremental digests.
-// Mirrors Python's Hasher class (hashlib.sha256).
+// Mirrors Python's Hasher class (hashlib.sha256). See the SECURITY INVARIANT on
+// BlockKey above before changing the hash algorithm or digest width.
 // ---------------------------------------------------------------------------
 class Hasher
 {

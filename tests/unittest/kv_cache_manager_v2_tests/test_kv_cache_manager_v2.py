@@ -2522,8 +2522,16 @@ class TestInitRatioConfig(unittest.TestCase):
             kv_cache.close()
         manager.shutdown()
 
-    def test_initial_pool_ratio_overrides_typical_step_and_constraints(self):
-        """Explicit initial_pool_ratio takes precedence over inferred sizing inputs."""
+    def test_constraint_floor_overrides_infeasible_initial_pool_ratio(self):
+        """A constraint's feasibility floor overrides an infeasible initial_pool_ratio.
+
+        initial_pool_ratio is the target split and still overrides typical_step, but
+        constraints stay feasibility floors (mirrors PR #16269): if a declared batch
+        needs more slots than its target share can hold, that pool group's share is
+        clamped up so the batch can be resumed, rather than starving it during warmup.
+        Here pool group 1's 0.2 target cannot satisfy the 256-request constraint, so
+        its share is clamped above 0.2 and pool group 0 gives up the remainder.
+        """
         typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)
         constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=256, history_length=128)] * 256)
         cfg = self._make_config(
@@ -2534,7 +2542,8 @@ class TestInitRatioConfig(unittest.TestCase):
         manager = KVCacheManager(cfg)
         ratio = _introspection.current_gpu_ratio(manager)
 
-        self.assertGreater(ratio[0], ratio[1])
+        self.assertGreater(ratio[1], 0.2)
+        self.assertLess(ratio[0], 0.8)
         self.assertAlmostEqual(sum(ratio), 1.0, places=6)
         manager.shutdown()
 

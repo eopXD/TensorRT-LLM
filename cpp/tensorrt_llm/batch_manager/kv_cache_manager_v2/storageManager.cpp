@@ -160,11 +160,11 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     size_t gpuQuota = cacheTierQuota(config.cacheTiers[kGpuLevel]);
     size_t gpuGranularity = CacheLevelManager::cacheTierGranularity(CacheTier::GPU_MEM, gpuQuota);
 
-    // Explicit ratios override constraints for both initial sizing and minimum slot
-    // counts. Constraint-derived floors include headroom for the utilization gate
-    // checked by KvCache::resume (scaled by 1/maxUtilForResume). Mirrors PR#16484.
-    mMinSlots = computeMinSlotsFromConstraints(initialPoolRatio.has_value() ? std::vector<BatchDesc>{} : constraints,
-        tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
+    // Constraints stay feasibility floors even under an explicit initial pool
+    // ratio (a share below what a declared batch needs is clamped up), and the
+    // floors are scaled by 1/maxUtilForResume because KvCache::resume rejects any
+    // pool group above that utilization. Mirrors PR#16269 on the Python side.
+    mMinSlots = computeMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
 
     // Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
     TypedVec<PoolGroupIndex, float> initRatio;
@@ -1119,6 +1119,7 @@ TypedVec<PoolGroupIndex, SlotCount> StorageManager::computeMinSlotsFromConstrain
     std::vector<BatchDesc> const& constraints, int tokensPerBlock,
     std::optional<SwaScratchReuseConfig> const& swaScratchReuse, float maxUtilForResume) const
 {
+    TLLM_CHECK_DEBUG(maxUtilForResume > 0.0f && maxUtilForResume <= 1.0f);
     // All returned elements are positive. Constraint-derived floors include headroom
     // for the utilization gate checked by KvCache::resume.
     TypedVec<PoolGroupIndex, SlotCount> maxSlots(numPoolGroups(), 0);

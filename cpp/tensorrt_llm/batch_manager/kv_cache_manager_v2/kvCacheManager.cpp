@@ -114,8 +114,9 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     mRadixTree = std::make_shared<BlockRadixTree>(mLifeCycles, mConfig.tokensPerBlock, mEventSink);
 
     StorageConfig storageConfig = createStorageConfig(mConfig);
-    mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
-        mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio, mEventSink);
+    mStorage
+        = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock, mConfig.swaScratchReuse,
+            mConfig.typicalStep, mConfig.constraints, mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume);
 
     mTargetRatioListGpu = _currentGpuRatio();
     mTargetRatioListOther = _currentOtherRatios();

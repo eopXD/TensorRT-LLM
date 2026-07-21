@@ -27,6 +27,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -1819,6 +1820,114 @@ void KvCache::stopCommitting()
         _onStopCommitting();
     }
     TLLM_CHECK_DEBUG(mCommitState == CommitState::USER_STOP);
+}
+
+// ---------------------------------------------------------------------------
+// PlannedDropHandle — mirrors Python's PlannedDropHandle.
+// ---------------------------------------------------------------------------
+
+PlannedDropHandle::PlannedDropHandle(std::vector<CommittedPage*> const& pages)
+{
+    // Deduplicate by identity (mirrors Python's {id(page): page} dict).
+    std::vector<CommittedPage*> unique;
+    std::unordered_set<CommittedPage*> seen;
+    unique.reserve(pages.size());
+    for (auto* page : pages)
+    {
+        if (seen.insert(page).second)
+            unique.push_back(page);
+    }
+
+    std::vector<WeakPtr<CommittedPage>> refs;
+    refs.reserve(unique.size());
+    for (auto* page : unique)
+    {
+        refs.emplace_back(dynamicPointerCast<CommittedPage>(page->sharedFromThis()));
+        page->plannedDropCount += 1;
+    }
+    mPageRefs = std::move(refs);
+}
+
+void PlannedDropHandle::drop()
+{
+    if (!mPageRefs.has_value())
+        throw std::invalid_argument("Planned drop handle has already been dropped");
+
+    std::vector<SharedPtr<CommittedPage>> pages;
+    for (auto const& ref : *mPageRefs)
+    {
+        auto page = ref.lock();
+        if (page)
+        {
+            if (page->plannedDropCount <= 0)
+                throw std::invalid_argument("Committed page has no planned drop");
+            pages.push_back(std::move(page));
+        }
+    }
+
+    mPageRefs.reset();
+    for (auto const& page : pages)
+    {
+        page->plannedDropCount -= 1;
+        if (page->plannedDropCount == 0 && page->status() == PageStatus::DROPPABLE && page->scheduledForEviction())
+        {
+            page->manager->excludeFromEviction(*page);
+        }
+    }
+}
+
+PlannedDropHandle::~PlannedDropHandle()
+{
+    if (mPageRefs.has_value())
+    {
+        // Mirror Python's __del__: apply the plan if not already dropped.
+        // Destructors must not throw; swallow any error.
+        try
+        {
+            drop();
+        }
+        catch (...)
+        {
+        }
+    }
+}
+
+std::shared_ptr<PlannedDropHandle> KvCache::planCommittedBlockDrop()
+{
+    if (mCommitState != CommitState::USER_STOP)
+        throw LogicError("plan_committed_block_drop() requires stop_committing()");
+
+    BlockOrdinal const end{mNumCommittedBlocks};
+    std::vector<CommittedPage*> pagesToDrop;
+    for (auto const item : mManager->lifeCycles())
+    {
+        LifeCycleId const lcIdx = item.id;
+        LifeCycle const& lc = item.lc;
+        auto const* attn = std::get_if<AttnLifeCycle>(&lc);
+        if (attn == nullptr)
+        {
+            // SsmLifeCycle: TODO — support recording reusable SSM state pages.
+            continue;
+        }
+        if (!attn->windowSize.has_value())
+        {
+            // Full-attention blocks may still be needed by later turns.
+            continue;
+        }
+        auto const staleRange = _getStaleRange(numCommittedTokens(), lc);
+        BlockOrdinal const windowStart = std::min(staleRange.end, end);
+        for (BlockOrdinal ordinal = windowStart; ordinal < end; ++ordinal)
+        {
+            SharedPtr<Block> const& treeBlock = mBlocks[ordinal].treeBlock;
+            if (treeBlock == nullptr)
+                return nullptr;
+            CommittedPage* page = treeBlock->storage[lcIdx];
+            if (page == nullptr)
+                return nullptr;
+            pagesToDrop.push_back(page);
+        }
+    }
+    return std::make_shared<PlannedDropHandle>(pagesToDrop);
 }
 
 // ---------------------------------------------------------------------------

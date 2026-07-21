@@ -1246,6 +1246,10 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
 
 #undef DEF_COPY
 
+    // ---- PlannedDropHandle -------------------------------------------------
+    nb::class_<kv::PlannedDropHandle>(m, "PlannedDropHandle")
+        .def("drop", &kv::PlannedDropHandle::drop, nb::call_guard<nb::gil_scoped_release>());
+
     // ---- KvCache -----------------------------------------------------------
     nb::class_<kv::KvCache>(m, "_KVCache")
         .def(
@@ -1358,6 +1362,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::rv_policy::reference_internal)
         .def_prop_ro("committed_tokens", &committedTokensList)
         .def_prop_ro("reuse_scope", &kv::KvCache::reuseScope)
+        .def(
+            "plan_committed_block_drop", [](kv::KvCache& self) { return self.planCommittedBlockDrop(); },
+            nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_aggregated_page_indices",
             [](kv::KvCache const& self, int layerGroupId, int beamIdx, bool validOnly) {

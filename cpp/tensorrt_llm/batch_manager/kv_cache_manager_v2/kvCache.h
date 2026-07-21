@@ -155,6 +155,39 @@ struct Span
 };
 
 // ---------------------------------------------------------------------------
+// PlannedDropHandle — tracks committed pages planned for dropping without
+// owning them. Mirrors Python's PlannedDropHandle in _core/_kv_cache.py.
+//
+// The handle stores weak references and does not keep pages alive. Dropping it
+// decrements each live page's planned-drop count and removes an already-
+// droppable page from eviction tracking when no plans remain.
+// ---------------------------------------------------------------------------
+class PlannedDropHandle
+{
+public:
+    // Deduplicates `pages` by identity, stores weak references, and increments
+    // each page's plannedDropCount.
+    explicit PlannedDropHandle(std::vector<CommittedPage*> const& pages);
+
+    // Mirrors Python's __del__: applies the plan if not already dropped.
+    ~PlannedDropHandle();
+
+    PlannedDropHandle(PlannedDropHandle const&) = delete;
+    PlannedDropHandle& operator=(PlannedDropHandle const&) = delete;
+
+    // Apply this drop plan and invalidate the handle.
+    //
+    // A live page is removed from eviction tracking only when this is its final
+    // plan and it is already droppable and queued for eviction. Calling this
+    // method twice throws (translated to Python ValueError).
+    void drop();
+
+private:
+    // nullopt once dropped (mirrors Python's `_page_refs is None`).
+    std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
+};
+
+// ---------------------------------------------------------------------------
 // KvCache — manages the per-sequence KV cache state.
 // Mirrors Python's _KVCache.
 // ---------------------------------------------------------------------------
@@ -297,6 +330,16 @@ public:
     {
         return mReuseScope;
     }
+
+    // Plan dropping SWA blocks needed only by the next conversation turn.
+    //
+    // The plan covers committed pages in each SWA life cycle's current attention
+    // window. Full-attention and attention-sink blocks are excluded because
+    // later turns may still need them. SSM state is not yet supported. Must be
+    // called after stopCommitting(). Returns nullptr without creating a plan if
+    // any required SWA page is unavailable. Mirrors Python's
+    // _KVCache.plan_committed_block_drop().
+    std::shared_ptr<PlannedDropHandle> planCommittedBlockDrop();
 
     int historyLength() const noexcept
     {

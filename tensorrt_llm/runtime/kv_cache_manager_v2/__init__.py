@@ -169,6 +169,7 @@ else:
     _KVCache = _cpp._KVCache
     _cpp_introspection = getattr(_cpp, "_introspection", None)
     _KV_CACHE_ITERATION_STATS_DELTA_FIELDS = tuple(KVCacheIterationStatsDelta._field_names)
+    PlannedDropHandle = _cpp.PlannedDropHandle
 
     # Symbols added on main that are not yet ported to the C++ backend.
     # TODO(kvCacheManagerV2-cpp): port these and replace the fallbacks.
@@ -176,7 +177,6 @@ else:
     CuError = getattr(_cpp, "CuError", RuntimeError)
     OutOfMemoryError = getattr(_cpp, "OutOfMemoryError", MemoryError)
     PageIndexConverter = getattr(_cpp, "PageIndexConverter", None)
-    PlannedDropHandle = getattr(_cpp, "PlannedDropHandle", None)
     ReuseScope = getattr(_cpp, "ReuseScope", ReuseScope)
     ScratchDesc = getattr(_cpp, "ScratchDesc", None)
     SwaScratchReuseConfig = getattr(_cpp, "SwaScratchReuseConfig", None)

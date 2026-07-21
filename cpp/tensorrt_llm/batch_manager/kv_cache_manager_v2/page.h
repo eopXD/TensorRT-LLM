@@ -95,6 +95,10 @@ class CommittedPage : public Page
 public:
     Block* block;
 
+    // Number of outstanding PlannedDropHandles that intend to drop this page.
+    // Mirrors Python's CommittedPage.planned_drop_count.
+    int plannedDropCount{0};
+
     CommittedPage(StorageManager* mgr, SharedPtr<Block> blk, LifeCycleId lc, CacheLevel level, Priority prio);
 
     ~CommittedPage() override;

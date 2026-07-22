@@ -16,14 +16,15 @@ import asyncio
 import json
 import os
 import sys
+import time
 from unittest import mock
 
 import pytest
 import torch
 from datasets import load_dataset
-from defs.conftest import get_sm_version, is_sm_100f
 from mpi4py.futures import MPIPoolExecutor
 
+from defs.conftest import get_sm_version, is_sm_100f
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 
@@ -38,14 +39,30 @@ from tensorrt_llm.llmapi import (
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (check_device_contain, get_device_count, llm_models_root,
-                        parametrize_with_ids, skip_no_hopper,
-                        skip_no_mxfp4_swizzle, skip_post_blackwell,
-                        skip_post_hopper, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper, skip_ray)
-from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
-                            JsonModeEval, LlmapiAccuracyTestHarness,
-                            LongBenchV1, LongBenchV2)
+from ..conftest import (
+    check_device_contain,
+    get_device_count,
+    llm_models_root,
+    parametrize_with_ids,
+    skip_no_hopper,
+    skip_no_mxfp4_swizzle,
+    skip_post_blackwell,
+    skip_post_hopper,
+    skip_pre_ada,
+    skip_pre_blackwell,
+    skip_pre_hopper,
+    skip_ray,
+)
+from .accuracy_core import (
+    GSM8K,
+    MMLU,
+    CnnDailymail,
+    GPQADiamond,
+    JsonModeEval,
+    LlmapiAccuracyTestHarness,
+    LongBenchV1,
+    LongBenchV2,
+)
 
 
 # Keep helper definitions below imports so new imports do not need E402
@@ -4942,10 +4959,27 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         [
             "auto",
             pytest.param("fp8", marks=skip_pre_blackwell),
-            # I-3 (§2d): NVFP4 KV dtype variant. Blackwell-only, same GSM8K parity
-            # tolerance as auto/fp8. Cf. docs/source/kv_cache_manager_v2_bringup/
-            # model_bringup.html §2d I-3.
-            pytest.param("nvfp4", marks=skip_pre_blackwell),
+            # I-3 / I-11 (§2d): NVFP4 KV dtype variant. Blackwell-only. Currently
+            # xfail on GPT-OSS: the trtllm-gen/XQA *decode* attention kernel has
+            # no variant for head_dim=64 with an NVFP4 (E2M1) KV cache, so engine
+            # init raises "Missing TRTLLM-GEN kernel (decode)"
+            # (trtllm_fmha_kernel_launcher.cu:272, kernelType=2, headDim{Qk,V}=64).
+            # This is an attention-backend kernel-availability gap: it fails on
+            # BOTH V1 and V2, so it is not a KV-cache-manager regression, and
+            # NVFP4 KV itself works at head_dim=128 (see test_nvfp4_kv). The
+            # marker flips to xpass if/when the head_dim=64 decode cubin is added.
+            # Cf. docs/source/kv_cache_manager_v2_bringup/model_bringup.html
+            # §2d I-3/I-11.
+            pytest.param(
+                "nvfp4",
+                marks=[
+                    skip_pre_blackwell,
+                    pytest.mark.xfail(
+                        reason="Missing TRTLLM-GEN decode kernel for GPT-OSS "
+                        "head_dim=64 with NVFP4 (E2M1) KV; fails at engine init "
+                        "on both V1 and V2 (trtllm_fmha_kernel_launcher.cu:272)."
+                    ),
+                ]),
         ])
     @pytest.mark.parametrize("moe_backend", [
         "CUTLASS",
@@ -5202,6 +5236,477 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                 "expected host->GPU onboard on the warm request; "
                 f"iterOnboardBytes={warm_onboard} was 0 (blocks not recalled "
                 "from the host tier)")
+
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_w4_1gpu_host_offload_victim_churn(self, v2_kv_cache):
+        # I-6 (§2d) victim-cache characterization. The V2 manager migrates
+        # blocks host<->GPU with MOVE semantics: promoting a block back to GPU
+        # frees its host copy (StorageManager._batched_migrate update_src=True
+        # -> src_pool_group.release(src), tensorrt_llm/runtime/
+        # kv_cache_manager_v2/_storage_manager.py:618-624), so a later
+        # re-eviction re-writes the same block to host from scratch. This is a
+        # deliberate design choice (exclusive/victim cache: one physical copy
+        # per block -> more host capacity, higher hit rate) whose cost is extra
+        # D2H traffic. This cell bounces one shared prefix GPU<->host across
+        # several rounds and pins the resulting redundant D2H: the SAME prefix
+        # is offloaded in multiple distinct rounds (cumulative offload exceeds
+        # a single round's worth), each preceded by a host->GPU onboard, while
+        # host occupancy is reclaimed on promotion. Correctness is unaffected
+        # (every recalled generation is byte-identical to the cold one). V1 is
+        # an inclusive cache that retains the host copy on promotion, so here it
+        # serves as the correctness/reuse parity baseline only -- the
+        # per-pool-group offload/onboard counters (PR #15633) are V2-only.
+        # Purpose: document the intended behavior AND turn offload volume into
+        # an asserted metric so a D2H-bound regression becomes detectable.
+        # Cf. docs/source/kv_cache_manager_v2_bringup/model_bringup.html §2d I-6.
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.7,
+            # Same tight primary pool as test_w4_1gpu_host_offload_reuse: holds
+            # the ~840-token prefix but not prefix + a concurrent filler, so a
+            # filler forces the cached prefix out to the host tier.
+            max_tokens=1024,
+            enable_block_reuse=True,
+            host_cache_size=2 * (1 << 30),  # 2 GiB host tier
+            use_kv_cache_manager_v2=v2_kv_cache)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=8,
+                  max_seq_len=1024,
+                  disable_overlap_scheduler=True,
+                  enable_iter_perf_stats=True,
+                  moe_config=MoeConfig(backend="CUTLASS"))
+
+        # ~840-token shared prefix (spans many KV blocks); the churn victim.
+        prefix = (
+            "In large language model inference, the key-value cache stores the "
+            "attention keys and values computed for each token so they are not "
+            "recomputed on later decoding steps. ") * 24
+        # One distinct long filler per round: each is a different prompt so it
+        # never reuses the prefix (or a prior filler), and each independently
+        # overflows the small GPU pool, re-evicting the prefix to host.
+        filler_bases = [
+            ("Distributed training partitions model weights and optimizer "
+             "state across many accelerators to fit models that exceed the "
+             "memory of a single device. "),
+            ("Speculative decoding drafts several future tokens with a small "
+             "model and verifies them in parallel with the target model to "
+             "reduce end-to-end generation latency. "),
+            ("Quantization reduces the numerical precision of weights and "
+             "activations so a model occupies less memory and executes with "
+             "higher arithmetic throughput on the tensor cores. "),
+        ]
+        fillers = [base * 24 for base in filler_bases]
+        num_rounds = len(fillers)
+        sampling = SamplingParams(max_tokens=16, temperature=0.0)
+
+        def _drain_stats():
+            # Accumulate per-drain reuse + host<->GPU transfer counters. Byte
+            # counters (iterOffloadBytes/iterOnboardBytes) are per-iteration
+            # deltas -> summed; secondaryUsedNumBlocks is a gauge -> we keep the
+            # most recent iteration's host occupancy (post-onboard steady state).
+            reused = offload = onboard = 0
+            secondary_last = 0
+            for s in llm.get_stats(timeout=10):
+                for _, w in (s.get("kvCacheIterationStats") or {}).items():
+                    reused = max(reused, w.get("iterReusedBlocks", 0))
+                reused = max(reused, (s.get("kvCacheStats")
+                                      or {}).get("reusedBlocks", 0))
+                pgs = s.get("kvCacheIterationStatsByPoolGroup")
+                if pgs:
+                    for _, pg in pgs.items():
+                        offload += pg.get("iterOffloadBytes", 0)
+                        onboard += pg.get("iterOnboardBytes", 0)
+                    secondary_last = sum(
+                        pg.get("secondaryUsedNumBlocks", 0)
+                        for pg in pgs.values())
+            return reused, offload, onboard, secondary_last
+
+        per_round_offload = []
+        per_round_onboard = []
+        per_round_reused = []
+        sec_after_filler = []
+        sec_after_warm = []
+        warm_texts = []
+
+        with llm:
+            cold = llm.generate([prefix], sampling)
+            _drain_stats()  # discard the cold request's warm-up stats
+            for r in range(num_rounds):
+                # A distinct filler evicts the cached prefix GPU->host.
+                llm.generate([fillers[r]], sampling)
+                _, filler_offload, _, sec_filler = _drain_stats()
+                # The warm request recalls the prefix host->GPU (onboard),
+                # which under V2 move semantics frees the prefix's host copy.
+                warm = llm.generate([prefix], sampling)
+                warm_reused, _, warm_onboard, sec_warm = _drain_stats()
+                per_round_offload.append(filler_offload)
+                per_round_onboard.append(warm_onboard)
+                per_round_reused.append(warm_reused)
+                sec_after_filler.append(sec_filler)
+                sec_after_warm.append(sec_warm)
+                warm_texts.append(warm[0].outputs[0].text)
+
+        cold_text = cold[0].outputs[0].text
+        print(f"[I-6 churn] v2_kv_cache={v2_kv_cache} rounds={num_rounds} "
+              f"per_round_offload={per_round_offload} "
+              f"per_round_onboard={per_round_onboard} "
+              f"per_round_reused={per_round_reused} "
+              f"sec_after_filler={sec_after_filler} "
+              f"sec_after_warm={sec_after_warm}")
+
+        # Correctness: the recalled prefix never changes generated tokens, no
+        # matter how many GPU<->host round trips it takes. This holds for both
+        # V1 and V2 -- the churn is a performance property, not a correctness
+        # one (matches the field report: outputs/cache-hit stayed good).
+        for r, text in enumerate(warm_texts):
+            assert text == cold_text, (
+                "host-offload churn changed generated tokens on round "
+                f"{r} (v2_kv_cache={v2_kv_cache}): cold={cold_text!r} "
+                f"warm={text!r}")
+        # Reuse must survive the round trip on every warm request.
+        assert all(x > 0 for x in per_round_reused), (
+            "expected KV block reuse on every warm request "
+            f"(v2_kv_cache={v2_kv_cache}); per_round_reused={per_round_reused}")
+
+        if v2_kv_cache:
+            rounds_with_offload = sum(1 for x in per_round_offload if x > 0)
+            rounds_with_onboard = sum(1 for x in per_round_onboard if x > 0)
+            total_offload = sum(per_round_offload)
+            # (1) Redundant re-offload -- the crux of the victim-cache design.
+            # The SAME prefix is written GPU->host in >= 2 distinct rounds. An
+            # inclusive/write-through cache would keep the host copy across the
+            # promotion, so only the first round would offload and later
+            # evictions would be no-ops.
+            assert rounds_with_offload >= 2, (
+                "expected the shared prefix to be re-offloaded GPU->host in "
+                ">=2 distinct rounds (victim-cache churn); "
+                f"per_round_offload={per_round_offload}")
+            # (2) Each re-offload is preceded by a host->GPU onboard, i.e. the
+            # prefix genuinely round-trips rather than staying resident.
+            assert rounds_with_onboard >= 2, (
+                "expected the shared prefix to be onboarded host->GPU in >=2 "
+                f"rounds; per_round_onboard={per_round_onboard}")
+            # (3) Quantify the redundancy: cumulative D2H exceeds a single
+            # round's worth, i.e. identical blocks are re-written (mirrors the
+            # field report's ~89%-redundant host writes).
+            assert total_offload >= 1.5 * max(per_round_offload), (
+                "expected cumulative GPU->host offload to exceed one round's "
+                "worth (redundant re-writes of byte-identical blocks); "
+                f"total={total_offload} max_round={max(per_round_offload)} "
+                f"per_round_offload={per_round_offload}")
+            # (4) Move semantics: host occupancy is reclaimed on promotion. In
+            # at least one round the host tier holds fewer blocks after the
+            # warm/onboard than right after the filler evicted the prefix (an
+            # inclusive cache would retain them). Lenient (any-round) to absorb
+            # filler blocks that also transit the host tier.
+            assert max(sec_after_filler) > 0, (
+                "expected the prefix to reach the host tier under filler "
+                f"pressure; sec_after_filler={sec_after_filler}")
+            assert any(
+                w < f for w, f in zip(sec_after_warm, sec_after_filler)), (
+                    "expected host occupancy to drop after onboard (host copy "
+                    "freed on promotion = move semantics); "
+                    f"sec_after_filler={sec_after_filler} "
+                    f"sec_after_warm={sec_after_warm}")
+
+    @pytest.mark.parametrize(
+        "v2_kv_cache,max_util_for_resume", [(True, 0.95), (True, 0.7),
+                                            (False, 0.95)],
+        ids=["v2_kv_cache-util0.95", "v2_kv_cache-util0.7", "v1_kv_cache"])
+    def test_w4_1gpu_capacity_stress(self, v2_kv_cache, max_util_for_resume):
+        # I-9 (§2d): capacity-pressure ROBUSTNESS -- deliberately distinct from
+        # I-6 (which owns reuse correctness across GPU<->host). This cell asks a
+        # different question: does the V2 manager + capacity scheduler SURVIVE
+        # raw concurrent pressure without OOM, deadlock, or block leak? It does
+        # NOT re-check recalled-data correctness (that is I-6's job).
+        #
+        # Mechanism (grounded in the V2 source): the total GPU KV quota is
+        # allocated EAGERLY at init and is FIXED -- there is no "grow the pool
+        # on demand" path; reactive pressure is absorbed by eviction / admission
+        # deferral / suspend (kv_cache_manager_v2.py:1884). So real pressure is
+        # forced with a hard `max_tokens` cap -- NOT `free_gpu_memory_fraction`
+        # alone, which on a B200 can leave the pool far larger than the working
+        # set and never actually evict. Many DISTINCT (non-reusing) requests are
+        # pushed through a pool sized for only a few, so blocks MUST recycle
+        # across the run: if a finished request failed to release its pages (a
+        # rawref/__del__ leak -- the V2-specific concern the rawref module
+        # exists to prevent), the capped pool would exhaust partway and the
+        # remaining requests would hang or OOM. Completing far more requests
+        # than the pool can hold at once is therefore the black-box leak check;
+        # a second identical burst doubles the sensitivity and must not grow the
+        # steady-state peak. `max_util_for_resume` (a V2-only knob, ignored by
+        # V1) is swept to exercise admission/deferral at two thresholds.
+        # enable_kv_pool_rebalance stays False (the gated, zero-sum ratio
+        # rebalance is Phase-3/VSWA scope and not reachable here). The literal
+        # `_living_kv_caches == 0` object check is not observable black-box (TP=1
+        # runs the manager in a spawned worker) -- tracked as a single-process
+        # follow-up. Cf. docs/source/kv_cache_manager_v2_bringup/
+        # model_bringup.html §2d I-9.
+        kv_cache_config = KvCacheConfig(
+            # Hard token cap so aggregate demand deterministically exceeds
+            # capacity and eviction/recycling is FORCED (free_gpu_memory_fraction
+            # alone is not tight enough to guarantee pressure). Sized to hold a
+            # few requests, so 64 must recycle blocks many times over the run.
+            max_tokens=2048,
+            free_gpu_memory_fraction=0.5,
+            max_util_for_resume=max_util_for_resume,
+            # Distinct requests, no reuse: stress raw allocation/eviction.
+            enable_block_reuse=False,
+            # A host tier so a suspended request's pages can offload rather than
+            # hard-block the pool.
+            host_cache_size=4 * (1 << 30),
+            use_kv_cache_manager_v2=v2_kv_cache)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=64,
+                  max_seq_len=2048,
+                  disable_overlap_scheduler=True,
+                  enable_iter_perf_stats=True,
+                  moe_config=MoeConfig(backend="CUTLASS"))
+
+        # Many distinct prompts (unique index prefix => no cross-request reuse),
+        # each ~450 tokens, so the aggregate working set far exceeds the
+        # 2048-token pool and blocks must recycle many times over the run.
+        num_requests = 64
+        base = (
+            "In large language model inference, the key-value cache stores the "
+            "attention keys and values computed for each token so they are not "
+            "recomputed on later decoding steps. ")
+        prompts = [
+            f"Request {i}: {base * 12}Answer in one word."
+            for i in range(num_requests)
+        ]
+        sampling = SamplingParams(max_tokens=32, temperature=0.0)
+
+        def _peak_used_and_groups():
+            # Peak GPU-tier used blocks + how many pool groups reported (GPT-OSS
+            # is VSWA => 2 groups). V2-only per-pool-group keys.
+            peak = 0
+            num_groups = 0
+            for s in llm.get_stats(timeout=10):
+                pgs = s.get("kvCacheIterationStatsByPoolGroup")
+                if not pgs:
+                    continue
+                num_groups = max(num_groups, len(pgs))
+                used = sum(
+                    pg.get("primaryUsedNumBlocks", 0) for pg in pgs.values())
+                peak = max(peak, used)
+            return peak, num_groups
+
+        peaks = []
+        groups_seen = 0
+        with llm:
+            for burst in range(2):
+                start = time.monotonic()
+                results = llm.generate(prompts, sampling)
+                elapsed = time.monotonic() - start
+                peak, num_groups = _peak_used_and_groups()
+                peaks.append(peak)
+                groups_seen = max(groups_seen, num_groups)
+                # Core robustness gate: every request finished with a non-empty
+                # completion on every burst. Because the pool holds only a few
+                # requests' worth, completing all 64 (x2 bursts = 128) proves
+                # blocks are released after each request -- no OOM, no deadlock,
+                # no rawref/__del__ leak (a leak would exhaust the capped pool
+                # partway and hang/OOM the rest).
+                assert len(results) == num_requests
+                assert all(len(r.outputs[0].token_ids) > 0 for r in results), (
+                    "a request produced no tokens under capacity pressure "
+                    f"(v2_kv_cache={v2_kv_cache}, "
+                    f"max_util_for_resume={max_util_for_resume}, burst={burst}) "
+                    "-- possible OOM / deadlock / block leak")
+                throughput = num_requests / elapsed if elapsed > 0 else 0.0
+                print(f"[I-9 capacity] v2_kv_cache={v2_kv_cache} "
+                      f"max_util_for_resume={max_util_for_resume} "
+                      f"burst={burst} num_requests={num_requests} "
+                      f"elapsed={elapsed:.2f}s throughput={throughput:.2f} "
+                      f"req/s peak_primary={peak} num_pool_groups={num_groups}")
+
+        if v2_kv_cache:
+            # Pressure was real: the capped pool actually filled.
+            assert peaks[0] > 0, (
+                "expected the primary GPU pool to be used under capacity "
+                f"pressure; peaks={peaks}")
+            # No leak: the second identical burst does not grow the steady-state
+            # peak -- freed requests from burst 0 released their blocks.
+            assert peaks[1] <= peaks[0] * 1.15 + 4, (
+                "primary pool peak grew across identical bursts -- possible "
+                f"_KVCache / block leak; peaks={peaks}")
+            # NOTE: num_pool_groups is printed for observability only. Empirically
+            # GPT-OSS-120B in this (default-window) config runs SINGLE-pool at
+            # runtime (num_pool_groups=1); the 2-group VSWA case is the explicit
+            # max_attention_window path (I-7's Eagle3 cell), not plain
+            # test_w4_1gpu -- so we do NOT assert a group count here.
+
+    def test_w4_1gpu_suspend_resume(self):
+        # I-10 (§2d): suspend / resume correctness for an ACTIVE request -- the
+        # V2-only preemption round-trip, distinct from I-6 (idle committed-block
+        # reuse). Under capacity pressure the scheduler preempts an in-flight
+        # request: live pages go ACTIVE -> SUSPENDED (LOCKED->HELD,
+        # kv_cache_manager_v2.py:1884), are lazily offloaded to host when a
+        # competing request needs the slots, and on resume are onboarded with
+        # their host page-index buffers RECONNECTED (_restore_page_index_bufs,
+        # :1886 -- whose docstring warns that skipping it yields "stale/zero page
+        # indices -> illegal memory access during the forward pass"). That
+        # reconnection is the V2-only landmine this cell guards. V2-only (V1 has
+        # no suspend/resume state machine).
+        #
+        # Correctness model (important -- learned from a first run): suspend/
+        # resume INHERENTLY changes per-step batch composition (preempted
+        # requests are processed staggered rather than all together), so the
+        # generated tokens are NOT expected to be byte-identical to an
+        # unpreempted run -- greedy decoding is FP-nondeterministic across
+        # different batch compositions (a near-tie flips a late token). A byte-
+        # equality gate is therefore flaky BY DESIGN and cannot distinguish real
+        # KV corruption from benign FP drift. What DOES distinguish them: a
+        # corrupted KV (bad page-index reconnect / lost pages) manifests as an
+        # illegal-memory-access CRASH, or as output that diverges IMMEDIATELY
+        # (wrong first tokens) / degenerates; benign FP drift diverges only
+        # LATER, after a shared deterministic prefix. So the gate is: (1) no
+        # crash / no deadlock -- every request completes non-empty; (2) the
+        # ACTIVE<->SUSPENDED state machine genuinely fired -- the per-iteration
+        # manager counters iterSuspendedRequests>0 AND iterResumedRequests>0
+        # (added for exactly this cell). Offload/onboard bytes are the WRONG
+        # proxy: suspend() keeps HELD pages on GPU and only lazily offloads to
+        # host under further pressure, so iterOffloadBytes/iterOnboardBytes can
+        # be 0 while suspend/resume still fired (hence they are printed as
+        # diagnostics, not asserted); (3) each contended output shares a multi-
+        # token deterministic PREFIX with its uncontended single-request
+        # reference (corruption would diverge at token 0). Cf. docs/source/
+        # kv_cache_manager_v2_bringup/model_bringup.html §2d I-10.
+        kv_cache_config = KvCacheConfig(
+            # Hard cap sized for ~one request's full context+decode. It sits above
+            # a single request's peak (~context + 128 decode) but below even two
+            # requests' *context*, so the four concurrent requests cannot co-reside:
+            # three are admitted then suspended (ACTIVE->SUSPENDED, pages
+            # LOCKED->HELD) and resumed one at a time. Keeping them from co-residing
+            # is deliberate: co-residency changes per-step batch composition from
+            # the very first decode token, and with these near-identical prompts a
+            # greedy near-tie then flips token 0/1 -- which the KV-integrity gate (3)
+            # cannot distinguish from corruption. Serializing preserves a clean
+            # multi-token prefix vs the uncontended single-request reference while
+            # still forcing the suspend/resume round trip.
+            max_tokens=512,
+            free_gpu_memory_fraction=0.5,
+            # Bounce resume() when the tier is near-full so a suspended request
+            # genuinely defers then is recalled (V2-only knob).
+            max_util_for_resume=0.7,
+            enable_block_reuse=False,
+            host_cache_size=4 * (1 << 30),
+            use_kv_cache_manager_v2=True)
+
+        llm = LLM(self.MODEL_PATH,
+                  tensor_parallel_size=1,
+                  kv_cache_config=kv_cache_config,
+                  max_batch_size=8,
+                  max_seq_len=1024,
+                  disable_overlap_scheduler=True,
+                  enable_iter_perf_stats=True,
+                  moe_config=MoeConfig(backend="CUTLASS"))
+
+        # Several distinct long prompts; each alone fits the ~1-request pool,
+        # but together they cannot be co-resident, forcing suspend/resume.
+        base = (
+            "In large language model inference, the key-value cache stores the "
+            "attention keys and values computed for each token so they are not "
+            "recomputed on later decoding steps. ")
+        prompts = [
+            f"{name}: {base * 8}Answer in one word."
+            for name in ("Alpha", "Beta", "Gamma", "Delta")
+        ]
+        # Long generation so each suspend/resume round trip spans many decode
+        # steps and the suspended requests are held across a long active run of
+        # the request that owns the pool (a short 32-token generation barely
+        # exercises the resume -> page-index-reconnect path). The reconnect
+        # landmine (_restore_page_index_bufs) is hit on every resume.
+        sampling = SamplingParams(max_tokens=128, temperature=0.0)
+
+        def _drain_stats():
+            # Single drain: llm.get_stats() consumes the per-iteration records,
+            # so suspend/resume counts AND offload/onboard bytes must be summed
+            # in one pass. iterSuspendedRequests/iterResumedRequests are manager-
+            # level (top-level of each record); offload/onboard are per pool
+            # group. Both are V2-only.
+            suspended = resumed = offload = onboard = 0
+            for s in llm.get_stats(timeout=10):
+                suspended += s.get("iterSuspendedRequests", 0)
+                resumed += s.get("iterResumedRequests", 0)
+                pgs = s.get("kvCacheIterationStatsByPoolGroup")
+                if not pgs:
+                    continue
+                for pg in pgs.values():
+                    offload += pg.get("iterOffloadBytes", 0)
+                    onboard += pg.get("iterOnboardBytes", 0)
+            return suspended, resumed, offload, onboard
+
+        def _common_prefix_len(a, b):
+            n = 0
+            for x, y in zip(a, b):
+                if x != y:
+                    break
+                n += 1
+            return n
+
+        with llm:
+            # Uncontended references: each prompt alone fits the tight pool, so
+            # no suspend occurs (the deterministic single-request path).
+            ref_ids = []
+            ref_txt = []
+            for p in prompts:
+                r = llm.generate([p], sampling)
+                ref_ids.append(list(r[0].outputs[0].token_ids))
+                ref_txt.append(r[0].outputs[0].text)
+            _drain_stats()  # discard the reference runs' stats
+            # Contended: all prompts in flight against a ~1-request pool, so the
+            # scheduler must suspend/resume (and may offload/onboard) to serve them.
+            contended = llm.generate(prompts, sampling)
+            suspended, resumed, offload, onboard = _drain_stats()
+
+        con_ids = [list(r.outputs[0].token_ids) for r in contended]
+        con_txt = [r.outputs[0].text for r in contended]
+        prefixes = [
+            _common_prefix_len(ref_ids[i], con_ids[i])
+            for i in range(len(prompts))
+        ]
+        # Diagnostics FIRST, so the round-trip evidence and the ref/contended
+        # comparison are always visible even when an assertion fails.
+        print(f"[I-10 suspend/resume] suspended={suspended} resumed={resumed} "
+              f"offload_bytes={offload} onboard_bytes={onboard} "
+              f"common_prefix_tokens={prefixes}")
+        for i in range(len(prompts)):
+            print(f"[I-10 out {i}] ref={ref_txt[i]!r} con={con_txt[i]!r}")
+
+        # (1) No crash / no deadlock: every request produced a non-empty
+        # completion (a KV-corrupting bad page-index reconnect would instead
+        # illegal-memory-access crash here).
+        assert len(contended) == len(prompts)
+        assert all(len(ids) > 0 for ids in con_ids), (
+            "a request produced no tokens under suspend/resume contention "
+            "(possible V2 scheduler deadlock or illegal-memory-access crash)")
+        # (2) The ACTIVE<->SUSPENDED state machine genuinely fired (not mere
+        # queuing): an in-flight request was suspended under pressure and later
+        # successfully resumed. These per-iteration manager counters are the
+        # direct signal; offload/onboard bytes may legitimately be 0 (suspend
+        # keeps HELD pages on GPU and offloads only lazily), so they are not
+        # gated -- only printed above.
+        assert suspended > 0 and resumed > 0, (
+            "expected an active-request suspend->resume round trip "
+            "(iterSuspendedRequests>0 and iterResumedRequests>0); "
+            f"suspended={suspended} resumed={resumed} -- if 0, the pool was not "
+            "tight enough to force preemption of an in-flight request; "
+            "retune max_tokens")
+        # (3) KV integrity: each preempted request shares a deterministic multi-
+        # token prefix with its uncontended reference. Corruption diverges at
+        # token 0; benign batch-composition FP drift diverges only later.
+        assert all(p >= 3 for p in prefixes), (
+            "a preempted request diverged from its uncontended reference at the "
+            "very start -- possible KV corruption; "
+            f"common_prefix_tokens={prefixes}")
 
     @pytest.mark.skip(
         reason="GPT-OSS requires attn_backend='TRTLLM' (attention sinks, see "

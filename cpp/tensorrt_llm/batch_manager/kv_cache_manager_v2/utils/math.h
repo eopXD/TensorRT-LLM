@@ -67,8 +67,9 @@ template <typename T>
     return lower <= x && x < upper;
 }
 
-// Returns the intersection of [a.first, a.second) and [b.first, b.second),
-// or {0,0} if disjoint (caller must check first < second).
+// Returns the intersection of [a.first, a.second) and [b.first, b.second).
+// If the ranges are disjoint, the result has first > second; the caller must
+// check first < second before using it as a non-empty range.
 template <typename T>
 [[nodiscard]] inline std::pair<T, T> overlap(std::pair<T, T> a, std::pair<T, T> b) noexcept
 {
@@ -263,21 +264,31 @@ public:
 
     void resize(size_t newCapacity)
     {
-        size_t oldWords = mWords.size();
-        size_t newWords = divUp(newCapacity, size_t{64});
-        if (newWords > oldWords)
+        size_t const oldWords = mWords.size();
+        size_t const newWords = divUp(newCapacity, size_t{64});
+
+        // When the capacity shrinks, every set bit at or above newCapacity is
+        // dropped. Account for those bits so numSetBits() stays accurate, and
+        // mask the retained partial word so anySet() cannot observe stale bits.
+        // This covers both fewer-words and same-word-count (newWords == oldWords
+        // with a smaller newCapacity) shrinks.
+        if (newWords <= oldWords)
         {
-            mWords.resize(newWords, uint64_t{0});
-        }
-        else if (newWords < oldWords)
-        {
-            mWords.resize(newWords);
-            // mask the last partial word if needed
-            if (newCapacity % 64 != 0)
+            for (size_t w = newWords; w < oldWords; ++w)
             {
-                mWords.back() &= (uint64_t{1} << (newCapacity % 64)) - 1;
+                mNumSetBits -= static_cast<size_t>(__builtin_popcountll(mWords[w]));
+            }
+            if (newWords >= 1 && newCapacity % 64 != 0)
+            {
+                uint64_t const keepMask = (uint64_t{1} << (newCapacity % 64)) - 1;
+                uint64_t& word = mWords[newWords - 1];
+                mNumSetBits -= static_cast<size_t>(__builtin_popcountll(word & ~keepMask));
+                word &= keepMask;
             }
         }
+
+        // Grow (zero-filled) or shrink storage to the new word count.
+        mWords.resize(newWords, uint64_t{0});
     }
 
     // Returns true if any bit in [start, end) is set.

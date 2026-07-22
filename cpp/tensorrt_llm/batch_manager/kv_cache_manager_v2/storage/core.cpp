@@ -550,10 +550,11 @@ GpuPoolGroup::GpuPoolGroup(
     size_t totalGpuMem = 0;
     {
         CUdevice dev{};
-        cuCtxGetDevice(&dev);
-        cuDeviceTotalMem(&totalGpuMem, dev);
+        cuCheck(cuCtxGetDevice(&dev));
+        cuCheck(cuDeviceTotalMem(&totalGpuMem, dev));
     }
     // @TODO: We should replace maxSlotSize with sum. This should also be updated in Python. Will do it later.
+    TLLM_CHECK_WITH_INFO(!slotSizeList.empty(), "GpuPoolGroup: slotSizeList must not be empty");
     size_t maxSlotSize = *std::max_element(slotSizeList.begin(), slotSizeList.end());
     for (size_t sz : slotSizeList)
     {
@@ -683,8 +684,11 @@ std::unique_ptr<CacheLevelStorage> createCacheLevelStorage(CacheTierConfig const
             {
                 // Compute phys mem size (granularity) from quota.
                 constexpr size_t kPageSize = 2ULL << 20;
-                size_t physMemSize = kPageSize
-                    << std::min(4, std::max(0, static_cast<int>(std::log2(cfg.quota / (kPageSize * 512)))));
+                // Guard std::log2(0) (UB when cast to int) for quotas below 1 GiB,
+                // where the integer ratio is 0 and the exponent floor is used.
+                size_t const ratio = cfg.quota / (kPageSize * 512);
+                int const exponent = ratio == 0 ? 0 : std::min(4, std::max(0, static_cast<int>(std::log2(ratio))));
+                size_t physMemSize = kPageSize << exponent;
                 return std::make_unique<GpuCacheLevelStorage>(storageCfg, slotCountList, physMemSize);
             }
             else if constexpr (std::is_same_v<T, HostCacheTierConfig>)

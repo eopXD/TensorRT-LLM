@@ -918,7 +918,8 @@ class StorageManager:
         All returned elements are positive. Constraint-derived floors include
         headroom for the utilization gate checked by ``_KVCache.resume``.
         """
-        assert 0 < max_util_for_resume <= 1
+        if not 0 < max_util_for_resume <= 1:
+            raise ValueError(f"max_util_for_resume must be in (0, 1], got {max_util_for_resume}")
         max_slots = filled_list(0, self.num_pool_groups)
 
         def swa_floor_blocks(lc: AttnLifeCycle) -> int:

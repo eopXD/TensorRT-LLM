@@ -205,6 +205,13 @@ static void twoHopTransfer(
 void CopyEngine::transfer(
     CacheTier dstTier, CacheTier srcTier, size_t numBytes, std::vector<CopyTask> const& tasks, CUstream stream)
 {
+    // Nothing to copy. Also guards the two-hop path against a div-by-zero on
+    // `buf.size() / numBytes` when numBytes == 0.
+    if (tasks.empty() || numBytes == 0)
+    {
+        return;
+    }
+
     constexpr auto G = CacheTier::GPU_MEM;
     constexpr auto H = CacheTier::HOST_MEM;
     constexpr auto D = CacheTier::DISK;

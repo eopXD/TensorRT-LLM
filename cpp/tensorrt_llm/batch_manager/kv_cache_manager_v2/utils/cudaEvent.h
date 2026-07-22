@@ -139,8 +139,10 @@ public:
     // Get a resource wrapped in a PoolItem that auto-returns to pool on destruction.
     [[nodiscard]] PoolItem get()
     {
-        ++mOutstandingCount;
+        // Increment only after the item is successfully obtained, so a throwing
+        // mCreateFn() leaves mOutstandingCount unchanged (no leak in stats).
         T* item = mItems.empty() ? mCreateFn() : popFront();
+        ++mOutstandingCount;
         if constexpr (std::is_void_v<Derived>)
         {
             return PoolItem(item, Deleter{this});

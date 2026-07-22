@@ -64,7 +64,8 @@ void KVCacheManagerConfig::validate() const
                 }
                 for (auto const& buf : cfg.buffers)
                 {
-                    if (buf.tokensPerBlockOverride.has_value() && tokensPerBlock % *buf.tokensPerBlockOverride != 0)
+                    if (buf.tokensPerBlockOverride.has_value()
+                        && (*buf.tokensPerBlockOverride <= 0 || tokensPerBlock % *buf.tokensPerBlockOverride != 0))
                     {
                         throw AssertionError(
                             "KVCacheManagerConfig: tokensPerBlockOverride must be a divisor of "

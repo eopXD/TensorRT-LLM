@@ -1414,14 +1414,14 @@ class KVCacheManagerV2(BaseResourceManager):
             lifecycle_id = self.impl.get_layer_group_id(layer_id)
             layer = self.kv_cache_manager_py_config.layers[int(layer_id)]
             return (
-                f"role={str(role)}, lifecycle_id={int(lifecycle_id)}, "
+                f"role={role!s}, lifecycle_id={int(lifecycle_id)}, "
                 f"sliding_window_size={layer.sliding_window_size}"
             )
         attr = self.impl._storage.get_buffer_attr(layer_id, role)
         pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
         lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
         return (
-            f"role={str(role)}, pool_group_id={int(pool_group_id)}, "
+            f"role={role!s}, pool_group_id={int(pool_group_id)}, "
             f"lifecycle_id={int(attr.life_cycle_id)}, "
             f"lifecycle={lifecycle}"
         )
@@ -1934,9 +1934,6 @@ class KVCacheManagerV2(BaseResourceManager):
         layer_offset = self.layer_offsets[layer_idx]
         try:
             addr = self.impl.get_mem_pool_base_address(layer_offset, Role.INDEX_KEY)
-            page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
-            page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
-            converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
         except (KeyError, IndexError):
             # INDEX_KEY not registered for this layer (default V2 manager
             # registers only K/V/scale; sparse subclasses register
@@ -1949,6 +1946,11 @@ class KVCacheManagerV2(BaseResourceManager):
             # maps to ``IndexError``. Catch both so the "role not registered
             # -> None" contract holds on either backend.
             return None
+        # INDEX_KEY is registered; the remaining lookups must succeed. Keep them
+        # outside the try so genuine failures surface instead of returning None.
+        page_stride = self.impl.get_page_stride(layer_offset, Role.INDEX_KEY)
+        page_upper = self.impl.get_page_index_upper_bound(layer_offset, Role.INDEX_KEY)
+        converter = self.impl.get_page_index_converter(layer_offset, Role.INDEX_KEY)
 
         if isinstance(dtype, DataType):
             torch_dtype = binding_to_torch_dtype(dtype)

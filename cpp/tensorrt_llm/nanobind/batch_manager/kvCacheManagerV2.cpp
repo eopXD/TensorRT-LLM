@@ -1166,7 +1166,22 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
     nb::class_<kv::KVCacheDesc>(m, "KVCacheDesc")
         .def(nb::init<int, int>(), nb::arg("capacity"), nb::arg("history_length"))
         .def_rw("capacity", &kv::KVCacheDesc::capacity)
-        .def_rw("history_length", &kv::KVCacheDesc::historyLength) DEF_COPY(kv::KVCacheDesc);
+        .def_rw("history_length", &kv::KVCacheDesc::historyLength)
+        .def("__eq__",
+            [](kv::KVCacheDesc const& self, nb::handle other)
+            {
+                if (!nb::isinstance<kv::KVCacheDesc>(other))
+                {
+                    return false;
+                }
+                return self == nb::cast<kv::KVCacheDesc>(other);
+            })
+        .def("__repr__",
+            [](kv::KVCacheDesc const& self)
+            {
+                return "KVCacheDesc(capacity=" + std::to_string(self.capacity)
+                    + ", history_length=" + std::to_string(self.historyLength) + ")";
+            }) DEF_COPY(kv::KVCacheDesc);
 
     nb::class_<kv::BatchDesc>(m, "BatchDesc")
         .def(
@@ -1179,7 +1194,32 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("kv_caches"), nb::arg("system_prompt_length") = 0)
         .def_rw("kv_caches", &kv::BatchDesc::kvCaches)
-        .def_rw("system_prompt_length", &kv::BatchDesc::systemPromptLength) DEF_COPY(kv::BatchDesc);
+        .def_rw("system_prompt_length", &kv::BatchDesc::systemPromptLength)
+        .def("__eq__",
+            [](kv::BatchDesc const& self, nb::handle other)
+            {
+                if (!nb::isinstance<kv::BatchDesc>(other))
+                {
+                    return false;
+                }
+                return self == nb::cast<kv::BatchDesc>(other);
+            })
+        .def("__repr__",
+            [](kv::BatchDesc const& self)
+            {
+                std::string repr = "BatchDesc(kv_caches=[";
+                for (size_t i = 0; i < self.kvCaches.size(); ++i)
+                {
+                    if (i != 0)
+                    {
+                        repr += ", ";
+                    }
+                    repr += "KVCacheDesc(capacity=" + std::to_string(self.kvCaches[i].capacity)
+                        + ", history_length=" + std::to_string(self.kvCaches[i].historyLength) + ")";
+                }
+                repr += "], system_prompt_length=" + std::to_string(self.systemPromptLength) + ")";
+                return repr;
+            }) DEF_COPY(kv::BatchDesc);
 
     nb::class_<kv::SwaScratchReuseConfig>(m, "SwaScratchReuseConfig")
         .def(

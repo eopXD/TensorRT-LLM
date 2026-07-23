@@ -197,6 +197,18 @@ struct KVCacheDesc
     {
         TLLM_CHECK_DEBUG(0 <= historyLength && historyLength <= capacity);
     }
+
+    // Value equality, mirroring the Python @dataclass(frozen=True) semantics the
+    // bindings replace. Required so tests can compare descs by value.
+    bool operator==(KVCacheDesc const& other) const noexcept
+    {
+        return capacity == other.capacity && historyLength == other.historyLength;
+    }
+
+    bool operator!=(KVCacheDesc const& other) const noexcept
+    {
+        return !(*this == other);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -211,6 +223,18 @@ struct BatchDesc
     void validate() const
     {
         TLLM_CHECK_DEBUG(systemPromptLength >= 0);
+    }
+
+    // Value equality, mirroring the Python @dataclass(frozen=True) semantics the
+    // bindings replace. Uses KVCacheDesc::operator== elementwise.
+    bool operator==(BatchDesc const& other) const noexcept
+    {
+        return systemPromptLength == other.systemPromptLength && kvCaches == other.kvCaches;
+    }
+
+    bool operator!=(BatchDesc const& other) const noexcept
+    {
+        return !(*this == other);
     }
 };
 

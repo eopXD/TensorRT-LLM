@@ -1748,7 +1748,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def_prop_ro("commit_min_snapshot", &kv::KvCacheManager::commitMinSnapshot)
         .def_prop_ro("num_layers", &kv::KvCacheManager::numLayers)
         .def_prop_ro("layer_ids", &kv::KvCacheManager::layerIds)
-        .def_prop_ro("layer_grouping", [](kv::KvCacheManager const& self) { return self.layerGrouping().raw(); })
+        .def_prop_ro(
+            "layer_grouping", [](kv::KvCacheManager const& self) { return self.layerGrouping().raw(); },
+            "Layers grouped by shared lifecycle/pool allocation. The iteration order of the "
+            "layer lists (and of the groups) is NOT an API contract and may differ across "
+            "backends/runs; do not rely on it for buffer/pool memory order -- use "
+            "pool_group_descs (PoolGroupDesc.pools[i].base_address + coalesced_buffers) instead.")
         .def(
             "get_layer_group_id",
             [](kv::KvCacheManager const& self, kv::LayerId layerId) { return self.getLayerGroupId(layerId).value(); },

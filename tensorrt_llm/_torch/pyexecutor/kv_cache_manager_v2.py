@@ -1184,23 +1184,35 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             for pool_id in range(self.num_pools):
                 layer_id = self.impl.layer_grouping[pool_id][0]
-                kv_cache_pool_pointers_list.append(
-                    [
-                        self.impl.get_mem_pool_base_address(
-                            layer_id, Role.KEY, PageIndexMode.SHARED
-                        ),
-                        0,
-                    ]
+                key_base_addr = self.impl.get_mem_pool_base_address(
+                    layer_id, Role.KEY, PageIndexMode.SHARED
                 )
+                kv_cache_pool_pointers_list.append([key_base_addr, 0])
                 if self.dtype == DataType.NVFP4:
-                    block_scale_pool_pointers_list.append(
-                        [
-                            self.impl.get_mem_pool_base_address(
-                                layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
-                            ),
-                            0,
-                        ]
+                    # The KEY/scale pointers are a (rep-layer, 0-offset) origin
+                    # against which each layer's kv_cache_pool_mapping offset is
+                    # resolved. The block-scale origin must reproduce the SAME
+                    # per-layer offset() as KEY, so mirror the KEY base for the
+                    # same representative layer and shift it back by that layer's
+                    # offset. For the base manager offset(rep) == 0, so this is
+                    # just the rep layer's scale base; for address-ranked
+                    # subclasses (MiniMax-M3) offset(rep) may be non-zero, and the
+                    # shift lands the origin on the pool's slot-0 scale address.
+                    # This keeps block_scale_offset == offset without depending on
+                    # the non-contractual layer_grouping order.
+                    rep_offset = self._kv_pool_mapping_offset(layer_id, pool_id, key_base_addr)
+                    scale_stride = (
+                        self.get_layer_bytes_per_token(layer_id, Role.KEY_BLOCK_SCALE)
+                        * self.kv_factor
+                        * self.tokens_per_block
                     )
+                    scale_base_addr = (
+                        self.impl.get_mem_pool_base_address(
+                            layer_id, Role.KEY_BLOCK_SCALE, PageIndexMode.SHARED
+                        )
+                        - rep_offset * scale_stride
+                    )
+                    block_scale_pool_pointers_list.append([scale_base_addr, 0])
 
             for layer_id in typed_range(LayerId(self.num_local_layers)):
                 layer_group_id = self.impl.get_layer_group_id(layer_id)

@@ -195,6 +195,10 @@ public:
     LayerGroupId getLayerGroupId(LayerId layerId) const;
 
     // Layer grouping: layers with the same lifecycle share pool allocation.
+    // NOTE: the iteration order of the layer lists (and of the groups) is NOT
+    // part of the API contract and may differ across backends/runs. Do not rely
+    // on it to infer buffer/pool memory order — query poolGroupDescs()
+    // (PoolGroupDesc::pools[i].baseAddress + coalescedBuffers) for that.
     TypedVec<LayerGroupId, std::vector<LayerId>> layerGrouping() const;
 
     // Iterator over all buffer identifiers. Mirrors Python's all_buffer_ids property.

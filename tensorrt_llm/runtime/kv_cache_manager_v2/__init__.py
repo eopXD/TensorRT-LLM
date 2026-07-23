@@ -152,6 +152,34 @@ else:
     KVCacheIterationStatsDelta = _cpp.KVCacheIterationStatsDelta
     KVCacheManager = _cpp.KVCacheManager
     KVCacheManagerConfig = _cpp.KVCacheManagerConfig
+    # The C++ KVCacheManagerConfig binding replaces the Python @dataclass, but
+    # callers (the DeepSeek-V4 cache manager's _build_cache_config and our own
+    # host-tier fallback) use dataclasses.replace() on it. dataclasses.replace()
+    # is a free function keyed on __dataclass_fields__: it reads each field via
+    # getattr and rebuilds via cls(**fields). The binding already has a full
+    # keyword __init__ and readable fields, so we only need to advertise the
+    # dataclass field set. Field defaults/types are irrelevant here — replace()
+    # only uses the field names + init flag. The read-only
+    # enable_swa_scratch_reuse property is intentionally excluded (not a ctor
+    # field), matching the Python dataclass.
+    import dataclasses as _dataclasses
+
+    @_dataclasses.dataclass
+    class _KVCacheManagerConfigFieldSpec:
+        tokens_per_block: int = 0
+        cache_tiers: object = None
+        layers: object = None
+        max_util_for_resume: float = 0.97
+        enable_partial_reuse: bool = True
+        constraints: object = None
+        typical_step: object = None
+        initial_pool_ratio: object = None
+        swa_scratch_reuse: object = None
+        commit_min_snapshot: bool = False
+        enable_stats: bool = True
+
+    KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__
+    del _KVCacheManagerConfigFieldSpec, _dataclasses
     KVCacheRemovedData = _cpp.KVCacheRemovedData
     KVCacheStatsDelta = _cpp.KVCacheStatsDelta
     KVCacheStoredBlockData = _cpp.KVCacheStoredBlockData

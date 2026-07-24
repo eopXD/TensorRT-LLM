@@ -14,31 +14,23 @@ token sequences into block keys, byte-identically to the Python backend's
 ## Provenance
 
 - **Upstream project:** Bitcoin Core — https://github.com/bitcoin/bitcoin
-- **Source path upstream:** `src/crypto/`
+- **Source path upstream:** `src/`, `src/crypto/`, and `src/compat`
 - **Upstream commit:** `70d9ec7f3d452789d04dce81dc02db0b3b778bb5` (branch `master`)
-- **Retrieved:** 2026-07-17
-- **License:** MIT (see `LICENSE`, copied from the upstream `COPYING`). Each
-  source file retains its original MIT header.
 
 ## Contents
 
-| File | Origin | Notes |
-|------|--------|-------|
-| `sha256.h` | Bitcoin, modified | `CSHA256` API; `SHA256D64` declaration removed |
-| `sha256.cpp` | Bitcoin, modified | Scalar core + `CSHA256` + slim runtime dispatch |
-| `sha256_x86_shani.cpp` | Bitcoin, modified | x86 SHA-NI transform (guard changed) |
-| `sha256_arm_shani.cpp` | Bitcoin, modified | ARMv8 crypto transform (guard changed) |
-| `attributes.h` | Bitcoin, unmodified | `ALWAYS_INLINE` macro used by the x86 transform |
-| `sha256_endian.h` | **NVIDIA-authored** | Big-endian helpers replacing upstream `common.h` |
-| `LICENSE` | Bitcoin | Upstream MIT `COPYING` |
+| File | Notes |
+|------|-------|
+| `sha256.h` | `CSHA256` API; `SHA256D64` declaration removed |
+| `sha256.cpp` | Scalar core + `CSHA256` + slim runtime dispatch |
+| `sha256_x86_shani.cpp` | x86 SHA-NI transform (guard changed) |
+| `sha256_arm_shani.cpp` | ARMv8 crypto transform (guard changed) |
+| `attributes.h` | `ALWAYS_INLINE` macro used by the x86 transform |
+| `sha256_endian.h` | Big-endian helpers replacing upstream `common.h` |
 
 ## NVIDIA modifications
 
-The files are **not** as-received; they were reduced to the single-block path
-TensorRT-LLM needs. Per NVIDIA's open-source guidance for permissively licensed
-software used with modifications, each edited Bitcoin file keeps its original
-MIT header and carries an added NVIDIA copyright/modification notice; the whole
-directory remains under the MIT license.
+The files are reduced to the single-block path TensorRT-LLM needs.
 
 Changes vs. upstream:
 
@@ -59,10 +51,3 @@ Changes vs. upstream:
   architecture macros. Build wiring (per-file `-msha` / `-march=armv8-a+crypto`)
   lives in `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/CMakeLists.txt`.
 
-## Updating
-
-Re-fetch `src/crypto/sha256*.{h,cpp}` from the desired upstream tag and re-apply
-the modifications above (they are localized to file headers, includes, build
-guards, and the removed `SHA256D64`/SIMD sections). Update the commit hash and
-date. Verify with the standard `sha256("abc")` vector and against the Python
-`hashlib.sha256` block-key chain.

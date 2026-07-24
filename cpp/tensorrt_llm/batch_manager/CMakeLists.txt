@@ -87,7 +87,7 @@ target_include_directories(
          ${xgrammar_source_dir}/3rdparty/dlpack/include
          ${xgrammar_source_dir}/include
          ${KV_CACHE_MANAGER_V2_INCLUDE_DIR}
-         ${PROJECT_SOURCE_DIR}/../3rdparty/sha256)
+         ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
 set_target_properties(
   ${BATCH_MANAGER_STATIC_TARGET}

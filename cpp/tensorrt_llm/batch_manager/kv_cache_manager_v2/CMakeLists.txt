@@ -16,12 +16,12 @@
 # Sources for the C++ KVCacheManagerV2 implementation. These are added to the
 # tensorrt_llm_batch_manager_static target by the parent CMakeLists.txt.
 
-# Bitcoin Core SHA-256 (vendored, MIT; see 3rdparty/sha256/README.md) — needed
-# by blockRadixTree.cpp. Slimmed to the single-block CSHA256 path: portable
-# scalar core + runtime dispatch (sha256.cpp) plus a per-architecture hardware
-# transform. Plain C++17; the include root 3rdparty/sha256 is added on the
+# Bitcoin Core SHA-256 (vendored, MIT; see common/sha256/README.md) — needed by
+# blockRadixTree.cpp. Slimmed to the single-block CSHA256 path: portable scalar
+# core + runtime dispatch (sha256.cpp) plus a per-architecture hardware
+# transform. Plain C++17; the include root common/sha256 is added on the
 # batch_manager target so "sha256.h" resolves.
-set(SHA256_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/sha256)
+set(SHA256_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../common/sha256)
 set(SHA256_SRCS ${SHA256_DIR}/sha256.cpp)
 # x86/x86-64: Intel SHA-NI transform.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")

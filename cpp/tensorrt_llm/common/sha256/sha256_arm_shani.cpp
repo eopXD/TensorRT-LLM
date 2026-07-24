@@ -1,17 +1,30 @@
-// Copyright (c) 2022-present The Bitcoin Core developers
-// Distributed under the MIT software license, see the accompanying
-// file LICENSE or http://www.opensource.org/licenses/mit-license.php.
+// SPDX-FileCopyrightText: Copyright (c) 2022-present The Bitcoin Core developers
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: MIT
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+// THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
 //
 // Based on https://github.com/noloader/SHA-Intrinsics/blob/master/sha256-arm.c,
 // Written and placed in public domain by Jeffrey Walton.
 // Based on code from ARM, and by Johannes Schneiders, Skip Hovsmith and
 // Barry O'Rourke for the mbedTLS project.
 // Variant specialized for 64-byte inputs added by Pieter Wuille.
-//
-// Portions Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
-// Modified by NVIDIA and redistributed under the MIT license (see LICENSE):
-// gated on the target architecture instead of the ENABLE_* build macros.
-// SPDX-License-Identifier: MIT
 
 #if defined(__aarch64__)
 

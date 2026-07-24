@@ -33,11 +33,11 @@ include_directories(${PROJECT_SOURCE_DIR}/include)
 # KV Cache Manager V2 include directory (global, needed during compilation of
 # SRCS) NOTE: PROJECT_SOURCE_DIR = cpp/ (build_wheel.py passes cpp/ as -S), so
 # batch_manager is one level down and the vendored SHA-256 is at
-# ../3rdparty/sha256 (repo root).
+# tensorrt_llm/common/sha256.
 set(KV_CACHE_MANAGER_V2_INCLUDE
     ${PROJECT_SOURCE_DIR}/tensorrt_llm/batch_manager)
 include_directories(${KV_CACHE_MANAGER_V2_INCLUDE}
-                    ${PROJECT_SOURCE_DIR}/../3rdparty/sha256)
+                    ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
 # NOSTRIP: Disable stripping for BOLT compatibility (requires --emit-relocs)
 if(ENABLE_BOLT_COMPATIBLE)
@@ -49,8 +49,8 @@ endif()
 # SHA-256 symbols are provided by tensorrt_llm_batch_manager_static (via the
 # shared lib). Only add the include directory so headers resolve during
 # compilation of kvCacheManagerV2.cpp.
-target_include_directories(${TRTLLM_NB_MODULE}
-                           PRIVATE ${PROJECT_SOURCE_DIR}/../3rdparty/sha256)
+target_include_directories(
+  ${TRTLLM_NB_MODULE} PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
 
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 

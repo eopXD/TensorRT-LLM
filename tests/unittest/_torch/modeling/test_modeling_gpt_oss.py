@@ -51,6 +51,23 @@ def test_gpt_oss_prefers_python_transceiver() -> None:
     assert GptOssForCausalLM.get_preferred_transceiver_runtime() == "PYTHON"
 
 
+def test_gpt_oss_model_defaults():
+    """GPT-OSS is VSWA, so it selects KVCacheManagerV2 by default.
+
+    ``use_kv_cache_manager_v2`` defaults to the "auto" sentinel, which
+    ``_resolve_kv_cache_manager_v2_auto`` resolves from this dict. An explicit
+    user value still wins -- that precedence is covered generically in
+    tests/unittest/llmapi/test_llm_args.py.
+    """
+
+    class LlmArgs:
+        pass
+
+    defaults = GptOssForCausalLM.get_model_defaults(LlmArgs())
+
+    assert defaults == {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+
+
 def dump_config_json(dst_dir):
     if os.path.exists(dst_dir):
         shutil.rmtree(dst_dir)

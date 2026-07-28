@@ -5667,8 +5667,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                        dtype="auto")
+        # GPT-OSS resolves "auto" to KVCacheManagerV2, which does not split
+        # the KV cache budget between the target and draft managers, so the
+        # two_model variant pins V1.
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.4,
+            dtype="auto",
+            use_kv_cache_manager_v2="auto" if one_model else False)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
@@ -5722,8 +5727,11 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             max_batch_size=8,
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8))
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                        dtype="auto")
+        # See test_eagle3_guided_decoding_4gpus: two-model Eagle3 pins V1.
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.4,
+            dtype="auto",
+            use_kv_cache_manager_v2="auto" if one_model else False)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
@@ -5789,9 +5797,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             max_batch_size=8,
             disable_overlap_scheduler=not one_model,
             cuda_graph_config=CudaGraphConfig(max_batch_size=8))
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
-                                        dtype="auto",
-                                        enable_block_reuse=False)
+        # See test_eagle3_guided_decoding_4gpus: two-model Eagle3 pins V1.
+        kv_cache_config = KvCacheConfig(
+            free_gpu_memory_fraction=0.9,
+            dtype="auto",
+            enable_block_reuse=False,
+            use_kv_cache_manager_v2="auto" if one_model else False)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 5

@@ -14,10 +14,23 @@
 # limitations under the License.
 
 from ._eviction_controller import (  # noqa: E402
+    EVICTION_POLICY_NAME,
+    DepthAwareEvictionPolicy,
     EvictablePage,
     EvictionPolicy,
+    LRUEvictionPolicy,
     NodeRef,
     PerLevelEvictionController,
+    make_eviction_policy,
 )
 
-__all__ = ["EvictionPolicy", "PerLevelEvictionController", "EvictablePage", "NodeRef"]
+__all__ = [
+    "EVICTION_POLICY_NAME",
+    "DepthAwareEvictionPolicy",
+    "EvictablePage",
+    "EvictionPolicy",
+    "LRUEvictionPolicy",
+    "NodeRef",
+    "PerLevelEvictionController",
+    "make_eviction_policy",
+]

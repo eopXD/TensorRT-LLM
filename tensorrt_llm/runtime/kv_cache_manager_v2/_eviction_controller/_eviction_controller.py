@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from typing import Callable, Iterator, Protocol, cast
 
 from llist import dllist, dllistnode
@@ -45,6 +46,9 @@ class EvictablePage(Protocol):
 
     @property
     def status(self) -> PageStatus: ...
+
+    @property
+    def eviction_ordinal(self) -> int: ...
 
     def is_committed(self) -> bool: ...
 
@@ -146,11 +150,109 @@ class PrioritizedEvictionPolicy:
             yield from p
 
 
+class DepthAwareEvictionPolicy:
+    """Evict the deepest block first; LRU within a depth band.
+
+    A block's chain depth bounds how many sequences can ever reach it. In a
+    multi-agent deployment the shallow blocks are the agent anchor (system
+    prompt + tool definitions + few-shots) that every session of that agent
+    replays, while deep blocks hang off a single session's history and become
+    unreachable the moment that session ends. Recency cannot tell the two apart:
+    a session that just ran leaves its dead tail looking exactly as fresh as the
+    anchor it shares with every future session.
+
+    Depth is already carried by ``Block.ordinal``, so this needs no new state
+    and no metadata from the framework above.
+
+    This is NOT a strict improvement over LRU and is off by default. It wins
+    when many sessions interleave, because the interleaving is what evicts one
+    agent's anchor before its next turn. It *loses* when concurrency is low and
+    the cache is only moderately pressured, because then the deep blocks are
+    exactly what the same session's next turn extends. See
+    ``examples/kv_cache_agent_aware/README.md`` for the measured curves.
+    """
+
+    __slots__ = ("_bands", "_band_size")
+    _bands: dict[int, dllist]
+    _band_size: int
+
+    def __init__(self, band_size: int = 8) -> None:
+        if band_size <= 0:
+            raise ValueError(f"band_size must be positive, got {band_size}")
+        self._bands = {}
+        self._band_size = band_size
+
+    def _band(self, page: EvictablePage) -> int:
+        return page.eviction_ordinal // self._band_size
+
+    def push(self, page: EvictablePage, evict_first: bool = False) -> dllistnode:
+        assert page.node_ref is None
+        band = self._bands.get(self._band(page))
+        if band is None:
+            band = dllist()
+            self._bands[self._band(page)] = band
+        return band.appendleft(page) if evict_first else band.append(page)
+
+    def pop(self) -> EvictablePage:
+        # Deepest non-empty band first, oldest within it.
+        band_index = max(idx for idx, band in self._bands.items() if len(band) > 0)
+        band = self._bands[band_index]
+        victim = band.first
+        assert victim is not None
+        page = victim.value
+        self.remove(victim)
+        return page
+
+    def remove(self, node: dllistnode) -> EvictablePage:
+        page = node.value
+        band = self._bands[self._band(page)]
+        band.remove(node)
+        if len(band) == 0:
+            self._bands.pop(self._band(page), None)
+        return page
+
+    def __len__(self) -> int:
+        return sum(len(band) for band in self._bands.values())
+
+    def __iter__(self) -> Iterator[EvictablePage]:
+        for _, band in sorted(self._bands.items()):
+            yield from band
+
+
 class PrioritizedLRUEvictionPolicy(PrioritizedEvictionPolicy):
     __slots__ = ()
 
     def __init__(self) -> None:
         super().__init__(lambda priority: LRUEvictionPolicy())
+
+
+class PrioritizedDepthAwareEvictionPolicy(PrioritizedEvictionPolicy):
+    __slots__ = ()
+
+    def __init__(self) -> None:
+        super().__init__(lambda priority: DepthAwareEvictionPolicy())
+
+
+# Selects the within-priority ordering. Retention priority still dominates:
+# these only decide which block goes first among equal-priority candidates.
+_POLICIES: dict = {
+    "lru": PrioritizedLRUEvictionPolicy,
+    "depth": PrioritizedDepthAwareEvictionPolicy,
+}
+
+# Env-var switch rather than a config field, deliberately: a new
+# KvCacheConfig field is a public API change that has to clear
+# tests/unittest/api_stability and the LLM-args golden manifest, which is not
+# warranted while this is still being evaluated.
+EVICTION_POLICY_NAME: str = os.environ.get("TLLM_KV_EVICTION_POLICY", "lru").strip().lower()
+if EVICTION_POLICY_NAME not in _POLICIES:
+    raise ValueError(
+        f"TLLM_KV_EVICTION_POLICY={EVICTION_POLICY_NAME!r} is not one of {sorted(_POLICIES)}"
+    )
+
+
+def make_eviction_policy() -> EvictionPolicy:
+    return _POLICIES[EVICTION_POLICY_NAME]()
 
 
 class PerLevelEvictionController:  # for one cache level
@@ -169,7 +271,7 @@ class PerLevelEvictionController:  # for one cache level
         num_pool_groups = max(life_cycle_grouping) + 1
         assert num_pool_groups == len(set(life_cycle_grouping))
         self._policies = cast(
-            TypedIndexList, [PrioritizedLRUEvictionPolicy() for _ in range(num_pool_groups)]
+            TypedIndexList, [make_eviction_policy() for _ in range(num_pool_groups)]
         )
 
     def __del__(self) -> None:

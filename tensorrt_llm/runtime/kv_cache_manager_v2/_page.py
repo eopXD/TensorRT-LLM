@@ -121,6 +121,18 @@ class Page(Slot):
     def scheduled_for_eviction(self) -> bool:
         return self.node_ref is not None
 
+    @property
+    def eviction_ordinal(self) -> int:
+        """Depth of this page's block in the reuse chain, for eviction ranking.
+
+        A block's depth bounds how many sequences can reach it: shallow blocks
+        sit on the shared prefix every session of an agent walks through, deep
+        blocks hang off one session's divergent history. Pages with no chain
+        position report 0 (treated as maximally shared), which is the
+        conservative answer for a policy that protects shallow blocks.
+        """
+        return 0
+
     def is_committed(self) -> bool:
         raise LogicError("Unexpected call to this implementation.")
 
@@ -136,6 +148,10 @@ class UncommittedPage(Page):
 
     def is_committed(self) -> bool:
         return False
+
+    @property
+    def eviction_ordinal(self) -> int:
+        return int(self.ordinal)
 
     def __init__(
         self,
@@ -244,6 +260,13 @@ class CommittedPage(Page):
 
     def is_committed(self) -> bool:
         return True
+
+    @property
+    def eviction_ordinal(self) -> int:
+        # The block can already be gone during rebase (see __del__), in which
+        # case the page is about to be dropped anyway and its rank is moot.
+        block = self.block()
+        return 0 if block is None else int(block.ordinal)
 
     def __init__(
         self,

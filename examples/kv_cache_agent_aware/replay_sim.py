@@ -106,11 +106,22 @@ class SimResult:
     evictions: int = 0
     anchor_evictions: int = 0
     oversized_requests: int = 0
+    # Counted directly rather than derived from token counts: prompt_tokens
+    # includes the trailing partial block, which is never part of the chain, so
+    # dividing it by tokens_per_block would inflate the denominator and
+    # understate the hit rate relative to what the engine reports.
+    total_blocks: int = 0
+    matched_blocks: int = 0
     per_agent: dict = field(default_factory=dict)
 
     @property
     def hit_rate(self) -> float:
         return self.matched_tokens / max(1, self.prompt_tokens)
+
+    @property
+    def block_hit_rate(self) -> float:
+        """Matches the engine's reused / (reused + missed) over whole blocks."""
+        return self.matched_blocks / max(1, self.total_blocks)
 
     @property
     def anchor_hit_rate(self) -> float:
@@ -119,7 +130,8 @@ class SimResult:
     def __str__(self) -> str:
         return (
             f"{self.policy:<16} budget={self.budget_blocks:>5} "
-            f"hit={self.hit_rate:6.2%} anchor_hit={self.anchor_hit_rate:6.2%} "
+            f"hit={self.hit_rate:6.2%} block_hit={self.block_hit_rate:6.2%} "
+            f"anchor_hit={self.anchor_hit_rate:6.2%} "
             f"evict={self.evictions:>7} anchor_evict={self.anchor_evictions:>6}"
         )
 
@@ -174,6 +186,8 @@ def simulate(
             matched += 1
         result.matched_tokens += matched * tokens_per_block
         result.anchor_matched_tokens += min(matched, anchor_blocks) * tokens_per_block
+        result.total_blocks += len(chain)
+        result.matched_blocks += matched
 
         agent_stats = result.per_agent.setdefault(
             turn.agent, {"prompt_tokens": 0, "matched_tokens": 0, "turns": 0}

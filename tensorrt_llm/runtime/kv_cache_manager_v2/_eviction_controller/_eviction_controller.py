@@ -172,26 +172,38 @@ class DepthAwareEvictionPolicy:
     ``examples/kv_cache_agent_aware/README.md`` for the measured curves.
     """
 
-    __slots__ = ("_bands", "_band_size")
+    __slots__ = ("_bands", "_band_size", "_node_band")
     _bands: dict[int, dllist]
     _band_size: int
+    # Band each live node was pushed into. Required for correctness, not speed:
+    # a page's eviction_ordinal is NOT stable across its queue lifetime --
+    # UncommittedPage reports its own ordinal, CommittedPage reports
+    # block.ordinal, and a page converts between them (and reports 0 once the
+    # block is dropped during rebase). Recomputing the band on removal can
+    # therefore address a different dllist than the one holding the node, which
+    # raises "dllistnode belongs to another list".
+    _node_band: dict
 
     def __init__(self, band_size: int = 8) -> None:
         if band_size <= 0:
             raise ValueError(f"band_size must be positive, got {band_size}")
         self._bands = {}
         self._band_size = band_size
+        self._node_band = {}
 
     def _band(self, page: EvictablePage) -> int:
         return page.eviction_ordinal // self._band_size
 
     def push(self, page: EvictablePage, evict_first: bool = False) -> dllistnode:
         assert page.node_ref is None
-        band = self._bands.get(self._band(page))
+        index = self._band(page)
+        band = self._bands.get(index)
         if band is None:
             band = dllist()
-            self._bands[self._band(page)] = band
-        return band.appendleft(page) if evict_first else band.append(page)
+            self._bands[index] = band
+        node = band.appendleft(page) if evict_first else band.append(page)
+        self._node_band[id(node)] = index
+        return node
 
     def pop(self) -> EvictablePage:
         # Deepest non-empty band first, oldest within it.
@@ -205,10 +217,13 @@ class DepthAwareEvictionPolicy:
 
     def remove(self, node: dllistnode) -> EvictablePage:
         page = node.value
-        band = self._bands[self._band(page)]
+        index = self._node_band.pop(id(node), None)
+        if index is None:
+            index = self._band(page)
+        band = self._bands[index]
         band.remove(node)
         if len(band) == 0:
-            self._bands.pop(self._band(page), None)
+            self._bands.pop(index, None)
         return page
 
     def __len__(self) -> int:

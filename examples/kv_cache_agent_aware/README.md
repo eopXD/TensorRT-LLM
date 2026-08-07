@@ -9,7 +9,20 @@ realistically-scaled multi-agent traces. Chain depth — a signal already presen
 in `Block.ordinal` and free to read — carries the entire win, and only under
 high request interleaving.**
 
-Everything below is reproducible on a laptop; no GPU is required.
+**Confirmed on hardware, with two corrections.** A live run on an H100 NVL
+(§7) measures depth-aware eviction at **+7.5 / +6.4 / +1.0 pp** block hit rate
+over LRU across three cache budgets — real, and in the predicted direction, but
+roughly half the magnitude the simulator claimed. Treat every offline number
+below as **directional only**; the simulator is not calibrated for magnitude.
+
+**And a scoping caveat that matters more than either result:**
+`KVCacheManagerV2` defaults to its **C++** backend
+(`kv_cache_manager_v2/__init__.py:23`, `TLLM_KV_CACHE_MANAGER_V2_BACKEND`,
+default `"cpp"`). The eviction controller this PoC modifies is the *pure-Python*
+backend, so **none of this affects a default deployment**. The live numbers
+below were obtained with `TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`.
+
+Everything except §7 is reproducible on a laptop; no GPU is required.
 
 ---
 
@@ -210,3 +223,62 @@ first item in `NEXT_SESSION_PROMPT.md`.
   cross-session by content addressing, prefetch can only help a cold start.
 - **One roster shape.** 6 agents, one anchor-size distribution. `|A|` = 12+ was
   not swept.
+
+## 7. Live validation on H100 (the falsification test)
+
+`run_live.py` replays the identical trace, interleaving order and block size
+through a real engine and reads the engine's own `kvCacheStats`.
+`compare_live.py` mechanically prints AGREE/DISAGREE against a ±4 pp tolerance
+on the *policy delta* — chosen before any data was collected.
+
+Setup: Llama-3.1-8B-Instruct (the paper's model), 1× H100 NVL 95 GB,
+`use_kv_cache_manager_v2=True`, `enable_partial_reuse=False`, batch size 1,
+120 requests, `TLLM_KV_CACHE_MANAGER_V2_BACKEND=python`. Built from this branch
+(`tensorrt_llm-1.3.0rc24`, arches `89-real;90-real`).
+
+| KV cache | blocks | lru pred | lru meas | depth pred | depth meas | Δ pred | Δ meas | verdict |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | :--- |
+| 14,592 tok | 456 | 7.46% | 19.44% | 19.68% | **26.93%** | +12.2 | **+7.5** | DISAGREE |
+| 21,888 tok | 684 | 11.07% | 24.89% | 24.69% | **31.33%** | +13.6 | **+6.4** | DISAGREE |
+| 36,480 tok | 1,140 | 19.43% | 36.40% | 29.52% | **37.37%** | +10.1 | **+1.0** | DISAGREE |
+
+`reused + missed` is 23,342 in every cell — same trace, same total lookups —
+which is the sanity check that the cells differ only in eviction order.
+
+**What survives.** Depth-aware eviction really does help, in the predicted
+direction, and most under pressure. It is also *faster*: 30.7 s vs 34.9 s
+wall-clock at the tightest budget (~12%), consistent with fewer prefill
+recomputations.
+
+**What does not.** The simulator is wrong on magnitude — it overestimates the
+delta by ~60-90% at tight budgets and ~10× at the loosest — and badly wrong on
+absolute hit rate (7.46% predicted vs 19.44% measured for LRU). The engine's
+`reused + missed` denominator is smaller than the simulator's block count, so
+the two are not measuring quite the same population. **Any offline claim about
+how much a policy is worth has to be re-derived against the engine.**
+
+**What was not tested.** The `agent-aware` policy was *not* run live: it needs
+agent-identity plumbing onto `Page` that this PoC deliberately did not add once
+the offline sweep showed no benefit. So the null result for the agent-transition
+term remains an offline-only finding. It is the obvious thing to check next if
+anyone wants to overturn it.
+
+### A bug the offline harness could not have found
+
+The first live run on the Python backend crashed:
+
+```
+ValueError: dllistnode belongs to another list
+```
+
+`DepthAwareEvictionPolicy` keyed its band on `page.eviction_ordinal`, which is
+**not stable** across a queue entry's lifetime: `UncommittedPage` reports its own
+ordinal, `CommittedPage` reports `block.ordinal`, and a page converts between
+them (reporting 0 once the block is dropped during rebase). So a page pushed
+into one band was looked up in another on removal. Fixed by recording the band
+each node was pushed into (`_node_band`) rather than recomputing it.
+
+The offline simulator uses its own queues and never exercises the
+uncommitted→committed transition, so no amount of offline testing would have
+surfaced this. That is the strongest argument in this document for running the
+hardware test.

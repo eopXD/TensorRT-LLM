@@ -74,7 +74,11 @@ def main() -> None:
     p.add_argument("--tokens-per-block", type=int, default=32)
     p.add_argument("--max-tokens", type=int, required=True,
                    help="KV cache size in tokens; the budget knob")
-    p.add_argument("--max-num-seqs", type=int, default=8)
+    # Requests are issued one at a time, exactly as the simulator models them:
+    # "concurrency" is the session interleaving order, not simultaneous
+    # execution. Batching several requests together would add capacity-scheduler
+    # effects the simulator does not model, making any gap uninterpretable.
+    p.add_argument("--max-num-seqs", type=int, default=1)
     p.add_argument("--json", type=str, default=None)
     args = p.parse_args()
 
@@ -119,6 +123,9 @@ def main() -> None:
         max_batch_size=args.max_num_seqs,
         max_num_tokens=16384,
         enable_chunked_prefill=True,
+        # Without this the iteration-stats queue stays empty and get_stats()
+        # returns nothing, which reads as "hit rate 0" rather than as an error.
+        enable_iter_perf_stats=True,
     )
 
     sampling = SamplingParams(max_tokens=1, temperature=0.0)
@@ -126,7 +133,7 @@ def main() -> None:
     t0 = time.time()
     sent = 0
     for turn in turns:
-        llm.generate([{"prompt_token_ids": list(turn.tokens)}], sampling)
+        llm.generate([{"prompt_token_ids": list(turn.tokens)}], sampling, use_tqdm=False)
         sent += 1
         if sent % 25 == 0:
             print(f"  ... {sent}/{len(turns)} requests", flush=True)
@@ -142,12 +149,27 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001 - stats surface varies by backend
         print(f"WARNING: could not read stats: {exc!r}", flush=True)
 
+    # Whether these counters are cumulative or per-iteration decides how to
+    # aggregate, and getting it wrong silently produces a plausible but wrong
+    # hit rate. Compute both readings and print them; if the counters are
+    # cumulative the max is correct and the sum is inflated, and the raw sample
+    # below shows which it is. They agree only when there is a single record.
+    reused_sum = missed_sum = 0
     for record in records:
         entry = json.loads(record) if isinstance(record, str) else record
         found = _scan_counters(entry)
-        # Counters are cumulative, so the last non-zero record wins.
         reused = max(reused, found.get("reused", 0))
         missed = max(missed, found.get("missed", 0))
+        reused_sum += found.get("reused", 0)
+        missed_sum += found.get("missed", 0)
+    total_sum = reused_sum + missed_sum
+    print(
+        f"AGG_CHECK records={len(records)} "
+        f"max(reused)={reused} max(missed)={missed} "
+        f"sum(reused)={reused_sum} sum(missed)={missed_sum} "
+        f"sum_block_hit={(reused_sum / total_sum) if total_sum else float('nan'):.4f}",
+        flush=True,
+    )
 
     if records:
         first = records[-1]

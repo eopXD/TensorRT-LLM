@@ -622,9 +622,17 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
-    assert len(
-        scheduler.update_state_after_alloc.call_args.args[1]) == math.ceil(
-            CHUNK_SIZE * 2 / BLOCK_SIZE)
+    # V1 allocates for the whole prompt when the sequence is added, so every
+    # block exists on the first chunk. V2 allocates per chunk, which is the
+    # lower-peak-memory behaviour and the one to keep; the remaining blocks
+    # arrive as append-deltas in `new_block_ids` on the next chunk, so no
+    # information is lost. The expectation is split rather than V2 changed.
+    total_blocks = math.ceil(CHUNK_SIZE * 2 / BLOCK_SIZE)
+    first_chunk_blocks = (math.ceil(CHUNK_SIZE / BLOCK_SIZE)
+                          if use_kv_cache_manager_v2 else total_blocks)
+
+    assert len(scheduler.update_state_after_alloc.call_args.args[1]
+               ) == first_chunk_blocks
 
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         sched_output = call.args[0]
@@ -639,18 +647,18 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
             req = sched_output.cached_requests[0]
 
         if i == 0:
-            # The first prefill chunk.
-            # All of the prefill tokens and all the blocks should be provided upfront.
+            # The first prefill chunk. All of the prefill tokens are provided
+            # upfront on both managers; the blocks are whatever has been
+            # allocated so far.
             assert req.computed_position == 0
             assert len(req.new_tokens) == CHUNK_SIZE * 2
-            assert len(req.new_block_ids) == math.ceil(CHUNK_SIZE * 2 /
-                                                       BLOCK_SIZE)
+            assert len(req.new_block_ids) == first_chunk_blocks
             assert req.num_scheduled_tokens == CHUNK_SIZE
         elif i == 1:
             # The second prefill chunk.
             assert req.computed_position == CHUNK_SIZE
             assert len(req.new_tokens) == 0
-            assert len(req.new_block_ids) == 0
+            assert len(req.new_block_ids) == total_blocks - first_chunk_blocks
             assert req.num_scheduled_tokens == CHUNK_SIZE
         elif i == 2 and use_overlap_scheduler:
             assert len(req.new_tokens) == 0

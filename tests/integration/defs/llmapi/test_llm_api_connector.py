@@ -746,6 +746,145 @@ def test_connector_uniform_sliding_window(enforce_single_worker,
 SWA_OFFER_TOKENS = 128
 
 
+# The mock scheduler answers every query with the same offer; this records what
+# it was asked and when, so a test can assert the connector was consulted
+# exactly once per request rather than assuming it.
+def record_connector_queries(scheduler, num_matched, load_async=False):
+    """Answer every query with `num_matched`, recording when each one arrived.
+
+    The third element of each record is `build_connector_meta.call_count` at
+    query time -- the number of iterations whose connector hooks had already
+    run. The connector is asked from `prepare_resources`, in the same iteration
+    the request runs, so a request that runs in iteration `n` records `n`. A
+    speculative ask would record a smaller number.
+    """
+    queries = []
+
+    def side_effect(request, num_computed_tokens):
+        queries.append((request.request_id, num_computed_tokens,
+                        scheduler.build_connector_meta.call_count))
+        return num_matched, load_async
+
+    scheduler.get_num_new_matched_tokens.side_effect = side_effect
+    return queries
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
+                         indirect=True)
+def test_connector_prefix_is_asked_once_and_shrinks_the_forward_pass(
+        enforce_single_worker, model_with_connector, use_kv_cache_manager_v2):
+    """The offer is asked for once and removes work from the forward pass.
+
+    Both managers ask on the batch that runs, so both record the same query
+    count and the same iteration index, and both report a prefill shortened by
+    the offer. This is the parity assertion for A0: a connector cannot tell the
+    two managers apart from what it is asked and what it is told.
+    """
+    model_fn, scheduler, worker = model_with_connector
+
+    OFFER_TOKENS = 64
+    NUM_INPUT_TOKENS = 256
+
+    model = model_fn(disable_overlap_scheduler=True)
+
+    queries = record_connector_queries(scheduler, OFFER_TOKENS)
+    worker.get_finished.return_value = [], []
+
+    generate_and_wait(model, scheduler, worker, [0] * NUM_INPUT_TOKENS,
+                      SamplingParams(max_tokens=4, ignore_eos=True))
+
+    # Once per request, anchored at the local match, in the first iteration --
+    # which is also the iteration the request ran in.
+    assert len(queries) == 1
+    _, num_computed_tokens, iterations_before = queries[0]
+    assert num_computed_tokens == 0
+    assert iterations_before == 0
+
+    req = scheduler.build_connector_meta.call_args_list[0].args[0].new_requests[
+        0]
+    # The runtime rolls the reported position back to the local match, so the
+    # connector sees where its load begins; the offer shows up as work removed.
+    assert req.computed_position == 0
+    assert req.num_scheduled_tokens == NUM_INPUT_TOKENS - OFFER_TOKENS
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                         ids=["kv_cache_manager_v2"],
+                         indirect=True)
+def test_connector_sliding_window_prefix_is_backed_by_history(
+        enforce_single_worker, model_with_connector, use_kv_cache_manager_v2):
+    """Serving a prefix raises `history_length`, not just capacity -- observably.
+
+    Under full attention the two are indistinguishable from outside: capacity is
+    `prompt_len` whether or not a prefix was served, so the page count says
+    nothing. Under a sliding window it does. `history_length` is the sole input
+    to the stale-range computation, so raising it to the offer end tells V2 that
+    the blocks the window has already left need no pages -- and raising capacity
+    alone would allocate one for every block of the served prefix.
+
+    So this is the test that would fail if `_resize_for_connector_prefix` called
+    `resize(capacity)` without the position; `test_connector_uniform_sliding_window`
+    above cannot, because it offers nothing.
+    """
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True,
+                     max_seq_len=SWA_MAX_SEQ_LEN,
+                     kv_cache_config=KvCacheConfig(
+                         free_gpu_memory_fraction=0.1,
+                         max_attention_window=[SWA_WINDOW]))
+
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
+
+    record_connector_queries(scheduler, SWA_OFFER_TOKENS)
+    worker.get_finished.return_value = [], []
+
+    generate_and_wait(model, scheduler, worker, [0] * SWA_NUM_INPUT_TOKENS,
+                      SamplingParams(max_tokens=4, ignore_eos=True))
+
+    # Anti-vacuity, as in the test above: one layer group with a live window,
+    # otherwise the page count below is being read off full attention.
+    layout = worker.register_kv_cache_layout.call_args.args[0]
+    assert len(layout.groups) == 1
+    assert layout.groups[0].window_size == SWA_WINDOW
+
+    req = scheduler.build_connector_meta.call_args_list[0].args[0].new_requests[
+        0]
+
+    # The offer was materialized: the position advanced over it, and the
+    # runtime rolled the reported position back to the local match.
+    assert req.computed_position == 0
+    assert req.num_scheduled_tokens == SWA_NUM_INPUT_TOKENS - SWA_OFFER_TOKENS
+
+    all_blocks = math.ceil(SWA_NUM_INPUT_TOKENS / 32)
+    page_indices = scheduler.update_state_after_alloc.call_args.args[1]
+    assert page_indices == req.new_block_ids
+    # One entry per block ordinal either way -- a block with no page reads back
+    # as BAD_PAGE_INDEX in place rather than shortening the list, so that block
+    # ordinals stay aligned to token ranges. The page count is therefore not the
+    # signal; *which* entries are bad is.
+    assert len(page_indices) == all_blocks
+
+    # With history at the offer end, every block that lies entirely below the
+    # window got no page. Without the bump history would still be at the local
+    # match, nothing would be stale, and all 8 blocks would be backed.
+    stale_blocks = (SWA_OFFER_TOKENS - SWA_WINDOW) // 32
+    assert stale_blocks > 0, "test sizes no longer put any block out of window"
+    assert page_indices[:stale_blocks] == [BAD_PAGE_INDEX] * stale_blocks, (
+        f"expected the first {stale_blocks} blocks of a {SWA_OFFER_TOKENS}-token "
+        f"served prefix to fall outside a {SWA_WINDOW}-token window and hold no "
+        f"page, got {page_indices}. History was not raised to the offer end.")
+
+    live = page_indices[stale_blocks:]
+    assert all(index != BAD_PAGE_INDEX for index in live), (
+        f"a block inside the window has no page: {page_indices}")
+    assert len(set(live)) == len(live), (
+        f"page slots reported to the connector are not distinct: {live}")
+
+
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
                          ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],

@@ -177,6 +177,87 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
     run_across_mpi(mpi_pool_executor, test, 2)
 
 
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_query_is_side_effect_free(mpi_pool_executor):
+    """The query and the commit are separable, and the query records nothing.
+
+    KVCacheManagerV2 allocates per context chunk, so an offer can be larger
+    than the pages the scheduler reserved. It therefore commits the amount it
+    honours rather than the amount it was offered, which is only possible if
+    asking is inert: `external_loads` is what tells the connector where its
+    load begins, and a request registered as loading is dropped from the batch.
+    """
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+            scheduler.get_num_new_matched_tokens.return_value = (16, True)
+        else:
+            scheduler = None
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.request_id = 42
+        req.is_generation_only_request = False
+        req.py_num_connector_matched_tokens = 0
+
+        assert manager.query_num_new_matched_tokens(req, 32) == (16, True)
+
+        assert manager.new_async_requests.loading_ids == set()
+        assert manager.scheduler_output_manager.external_loads == {}
+        assert req.py_num_connector_matched_tokens == 0
+
+        manager.commit_new_matched_tokens(req, 16, True)
+
+        assert manager.new_async_requests.loading_ids == {42}
+        assert manager.scheduler_output_manager.external_loads == {42: 16}
+        assert req.py_num_connector_matched_tokens == 16
+
+        if mpi_rank() == 0:
+            assert scheduler.get_num_new_matched_tokens.call_count == 1
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_commits_only_what_is_honoured(mpi_pool_executor):
+    """Committing less than the offer is legal and is what gets reported.
+
+    The unconsumed tail is recomputed locally; the connector releases its
+    ownership of the whole request at `request_finished`. V1 relies on the same
+    release -- with block reuse disabled it applies none of an offer it asked
+    for, because `setPrepopulatedPromptLen` is gated on `mEnableBlockReuse`.
+    """
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+            scheduler.get_num_new_matched_tokens.return_value = (128, False)
+        else:
+            scheduler = None
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.request_id = 7
+        req.is_generation_only_request = False
+        req.py_num_connector_matched_tokens = 0
+
+        num_tokens, load_async = manager.query_num_new_matched_tokens(req, 0)
+        assert num_tokens == 128
+        manager.commit_new_matched_tokens(req, 32, load_async)
+
+        assert manager.scheduler_output_manager.external_loads == {7: 32}
+        assert req.py_num_connector_matched_tokens == 32
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
     """Test that num_scheduled_tokens is correctly set for MTP (multi-token prediction)."""
     NUM_DRAFT_TOKENS = 3

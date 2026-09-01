@@ -1050,6 +1050,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_num_connector_matched_tokens = 0
 
+        # Whether the KV connector has already been asked for this request's
+        # current KV allocation. Used by KVCacheManagerV2, which asks in
+        # `prepare_resources`; the V1 manager asks from C++ under the block
+        # manager's tree mutex and needs no flag. Cleared in `free_resources`,
+        # because that is where an allocation dies -- the connector ABC's
+        # promise is at most once per allocation, not once per request.
+        self.py_connector_prefix_served = False
+
         self.py_result = PyResult(
             prompt_len=self.py_prompt_len,
             max_new_tokens=self.py_max_new_tokens,

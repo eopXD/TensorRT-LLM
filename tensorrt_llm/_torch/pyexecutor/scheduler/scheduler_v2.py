@@ -549,6 +549,22 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         Returns ``(action, tokens, chunking_flag)``.  *tokens* and
         *chunking_flag* are meaningful only when *action* is ``SCHEDULED``.
+
+        Deliberately connector-blind, unlike the V1 micro-batch scheduler. The
+        connector is asked in ``KVCacheManagerV2.prepare_resources``, on the
+        final batch, so the budget here is computed as if it will serve nothing
+        -- which is safe, because honouring an offer only ever removes tokens
+        from the forward pass. The cost is that a served prefix does not free
+        budget for a second request in the same iteration.
+
+        No ``should_add_sequence`` gate here either. That predicate stays false
+        from the moment an asynchronous load completes until
+        ``request_finished``, which only runs at the end of generation, so
+        gating scheduling on it would SKIP the request forever and never run
+        the prefill the load was for. It is used where V1 uses it -- around the
+        per-request connector work in ``prepare_resources``. What keeps a
+        loading request out of the batch is its
+        ``DISAGG_GENERATION_TRANS_IN_PROGRESS`` state.
         """
         if self.chunking_enabled:
             return self._try_schedule_context_chunked(req, budget)

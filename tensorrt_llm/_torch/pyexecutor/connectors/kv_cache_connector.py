@@ -526,7 +526,19 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             res = None
         return mpi_broadcast(res, root=0)
 
-    def get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> int:
+    def query_num_new_matched_tokens(
+        self, request: LlmRequest, num_computed_tokens: int
+    ) -> Tuple[int, bool]:
+        """Ask the connector how much of the prompt it can serve. No side effects.
+
+        Split out of ``get_num_new_matched_tokens`` so a caller that cannot
+        consume the whole answer can record only the part it honours. The
+        connector ABC promises one query per allocation, so this must run at
+        most once per request per allocation whatever the caller does with the
+        result. ``KVCacheManagerV2`` allocates per context chunk, so an offer
+        can outrun the pages the scheduler reserved; it queries here and commits
+        the honoured amount via ``commit_new_matched_tokens``.
+        """
         if request.is_generation_only_request:
             raise RuntimeError("Connector API is not supported for generation-only requests!")
 
@@ -537,6 +549,29 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         if num_tokens == 0 and load_kv_async:
             raise RuntimeError("load_kv_async must be False when num_tokens is 0!")
 
+        return num_tokens, load_kv_async
+
+    def commit_new_matched_tokens(
+        self, request: LlmRequest, num_tokens: int, load_kv_async: bool
+    ) -> None:
+        """Register the runtime's side of an answered query.
+
+        ``num_tokens`` is what the runtime will actually consume, which may be
+        less than what the connector offered. It is reported as-is: the offer's
+        unconsumed tail is recomputed locally, and the connector releases its
+        ownership of the whole request at ``request_finished``, exactly as it
+        does on the V1 manager.
+
+        Must run in the iteration the request is scheduled: ``external_loads``
+        is consumed and cleared by every ``build_scheduler_output``, and
+        ``new_async_requests.loading`` is read by that same call to suppress the
+        request's ``RequestData``.
+
+        ``load_kv_async`` is passed through unmodified even when
+        ``num_tokens`` is smaller than the offer. If the connector said it would
+        transfer asynchronously it has already started, so the request must be
+        held out of the batch until it reports done.
+        """
         # TODO(jthomson04): This part is a bit ugly.
         # When the connector indicates that a request will be loaded
         # asynchronously, we need to suspend its execution. This is
@@ -551,6 +586,17 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         request.py_num_connector_matched_tokens = num_tokens
 
+    def get_num_new_matched_tokens(self, request: LlmRequest, num_computed_tokens: int) -> int:
+        """Query and commit in one step.
+
+        This is the V1 entry point, called from C++ while the block manager
+        holds the radix-tree mutex, so the local match and the query are atomic
+        with respect to the tree and the answer can be committed immediately.
+        V1 also allocates for the whole prompt in the same call, so it never
+        honours less than it was offered.
+        """
+        num_tokens, load_kv_async = self.query_num_new_matched_tokens(request, num_computed_tokens)
+        self.commit_new_matched_tokens(request, num_tokens, load_kv_async)
         return num_tokens
 
     def should_add_sequence(self, request: LlmRequest) -> bool:

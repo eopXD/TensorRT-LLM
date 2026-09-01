@@ -42,6 +42,23 @@ These methods run on the leader process and drive the connector's behavior.
 
 * **`update_state_after_alloc(self, request: LlmRequest, block_ids: list[int])`**
   * **Description**: a callback to update internal state after KV cache blocks have been allocated for the prefill.
+  * **Note**: on `KVCacheManagerV2` with chunked prefill, `block_ids` covers only the blocks allocated for the first chunk, because V2 allocates per chunk rather than for the whole prompt. The remaining blocks arrive as append-deltas in `RequestData.new_block_ids` on subsequent chunks. A connector that treats this callback as its only source of block ids will under-plan; drive off `build_connector_meta` instead.
+  * **Note**: on `KVCacheManagerV2` under sliding-window attention, a block that the window has already passed holds no page, and is reported as `-1` (`BAD_PAGE_INDEX`) **in place** rather than being dropped from the list. This keeps each entry aligned with its block ordinal, so entry `i` always describes prompt tokens `[i * tokens_per_block, (i+1) * tokens_per_block)` and an append-delta over successive calls stays valid. Connectors must skip `-1` entries rather than treating them as page slots. The same applies to `RequestData.new_block_ids` and to `cache_block_ids` in `request_finished`.
+
+##### Serving a prefix on `KVCacheManagerV2`
+
+The connector interface is the same on both KV cache managers, and a connector written against V1 needs no changes to run on V2.
+
+Both managers ask `get_num_new_matched_tokens` at the same point in the iteration: once the batch for the upcoming forward pass is final. On V1 that is inside `addSequence`, called from `KVCacheManager.prepare_resources`; on V2 it is `KVCacheManagerV2.prepare_resources` directly. A request that is asked is therefore a request that runs, and the connector can take ownership of remote blocks in the query and release it in `request_finished`.
+
+Two differences are worth knowing when tuning a deployment.
+
+* **The runtime may honour less than you offer.** V1 allocates KV for the whole prompt when the request's first chunk is scheduled, so an offer always fits. V2 allocates per context chunk, which is what lets chunked prefill bound its memory, so an offer reaching past the current chunk requires the runtime to grow the allocation and that can fail under pressure. The runtime then serves the part it can cover and computes the rest locally. The amount actually served is what `RequestData.computed_position` reflects; the unserved remainder needs no action from the connector beyond its usual `request_finished` cleanup.
+* **The query is not part of the scheduler's budget.** The V2 scheduler sizes a request's chunk as if the connector will serve nothing, so a served prefix reduces the work in the forward pass but does not free budget for another request in the same iteration.
+
+`get_num_new_matched_tokens` is called **at most once per KV allocation**. This is the precise form of the "once per request" rule, and it holds on both managers: if a request's KV cache is destroyed and the request is replayed -- which `MAX_UTILIZATION` does under memory pressure -- the replay asks again, because the pages the first answer described are gone.
+
+**Deployment note.** Under V2 with a connector, a workload that was token-bound becomes KV-bound: the connector removes forward-pass tokens but its prefix still occupies GPU pages. Lowering `max_num_tokens` to hand memory back to the KV pool is usually the right adjustment, the opposite of the guidance for a connector-free deployment.
 
 #### 2. Worker Interface (`KvCacheConnectorWorker`)
 

@@ -127,6 +127,15 @@ def model_dir() -> str:
     pytest.skip(f"checkpoint not staged: {path}")
 
 
+# Adapter weight scale. 0.02 -- the scale the Qwen3-MoE routed-expert test uses
+# -- was measured on this model to leave greedy output byte-identical to base,
+# which reads exactly like "LoRA was never applied" and is why an earlier run of
+# this test was misdiagnosed. 0.2 moves every token of a 16-token completion on
+# both the text and the image path. The assertions below only distinguish
+# adapters from each other and from base, so a large scale costs nothing.
+_ADAPTER_STD = 0.2
+
+
 def _build_adapters(tmpdir: str, model_dir: str) -> list:
     """One adapter per rank, each with its own seed so outputs must differ."""
     from nemotron35_vl_lora_utils import assert_adapter_keys_parse, create_nemotron35_lora_adapter
@@ -138,6 +147,7 @@ def _build_adapters(tmpdir: str, model_dir: str) -> list:
             model_dir,
             lora_rank=rank,
             seed=seed,
+            std=_ADAPTER_STD,
         )
         # Cheap, and it converts a silent no-op into a failure at the point the
         # adapter is written rather than at the point its effect is missing.
@@ -193,9 +203,9 @@ def test_nemotron35_vl_multi_lora_with_images(tp_size, lora_mode, model_dir):
     KV head, so the attn_k / attn_v adapter shapes change, while the MoE latent
     projections are replicated rather than sharded.
     """
-    if tp_size > 1 and lora_mode == "cudagraph":
-        pytest.skip("tp2 covers sharding; CUDA-graph capture is covered at tp1")
-
+    # Every combination runs. `cuda_graph_config` defaults to a live
+    # CudaGraphConfig (llm_args.py), so "cudagraph" is what a user gets without
+    # asking, and skipping it at any tp size hides the default path.
     cuda_graph_config = (
         CudaGraphConfig(max_batch_size=_MAX_BATCH_SIZE) if lora_mode == "cudagraph" else None
     )

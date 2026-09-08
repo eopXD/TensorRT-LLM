@@ -33,6 +33,7 @@ from nemotron35_vl_lora_utils import (
 )
 
 from tensorrt_llm._torch.peft.lora.layer import LoraModuleType
+from tensorrt_llm._torch.peft.lora.manager import LoraManager
 
 pytestmark = pytest.mark.cpu_only
 
@@ -101,6 +102,22 @@ def test_layer_plan_accepts_both_spellings():
     words = layer_plan({"layers_block_type": ["mamba", "moe", "attention"]})
     letters = layer_plan({"hybrid_override_pattern": "ME*"})
     assert words == letters == ["mamba", "moe", "attention"]
+
+
+def test_layer_plan_accepts_the_current_nemotron_h_names():
+    """The NVFP4 exports and the bf16 SourceOfTruth disagree on layer names.
+
+    SourceOfTruth says mamba / attention; the quantized exports say
+    linear_attention / full_attention, which are the current Nemotron-H names.
+    The checkpoint's own `_nemotron_h_compatible_config` maps current to legacy.
+    Both must yield the same plan, or an adapter built against one checkpoint
+    silently targets the wrong layers of the other.
+    """
+    current = layer_plan(
+        {"layers_block_type": ["linear_attention", "moe", "full_attention", "moe"]}
+    )
+    legacy = layer_plan({"layers_block_type": ["mamba", "moe", "attention", "moe"]})
+    assert current == legacy == ["mamba", "moe", "attention", "moe"]
 
 
 def test_layer_plan_rejects_an_unknown_block():
@@ -233,10 +250,17 @@ def test_vl_wrapper_exposes_lora_config():
         "moe_latent_fc1",
         "moe_latent_fc2",
     }
-    # Every declared target must be a real module type, or engine setup fails
-    # later with a much less obvious error.
+    # Every declared target must resolve to a real module id, or engine setup
+    # fails later with a much less obvious error. The lookup is
+    # LoraManager.LORA_MODULE_IDS, not LoraModuleType.from_string: from_string
+    # upper-cases its argument, so it resolves "mamba_in_proj" but not "attn_q"
+    # (the member is ATTENTION_Q). These target names only round-trip via the
+    # manager's table.
     for name in config.lora_target_modules:
-        assert LoraModuleType.from_string(name) is not None
+        assert name in LoraManager.LORA_MODULE_IDS, f"{name} is not a known LoRA module"
+        assert LoraManager.LORA_MODULE_IDS[name] == LoraModuleType(
+            LoraManager.LORA_MODULE_IDS[name]
+        ), f"{name} maps to an id with no matching LoraModuleType"
 
 
 def test_vl_wrapper_hf_mapping_matches_the_adapter_builder():

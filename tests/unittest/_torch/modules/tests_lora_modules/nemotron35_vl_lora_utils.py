@@ -50,10 +50,27 @@ _MOE_PROJECTIONS = (
     "fc2_latent_proj",
 )
 
+# Three vocabularies name the same 88-layer plan, and a Nemotron 3.5 checkpoint
+# may use any of them:
+#
+# * `full_attention` / `linear_attention` -- the current Nemotron-H names, used
+#   by the NVFP4 exports;
+# * `attention` / `mamba` -- the legacy names, used by the bf16 SourceOfTruth;
+# * `*` / `M` / `E` -- the `hybrid_override_pattern` letters on older
+#   checkpoints, which is also what the runtime dispatches on at
+#   `modeling_nemotron_h.py:702`.
+#
+# The current-to-legacy mapping is the checkpoint's own, from
+# `_nemotron_h_compatible_config` in its `configuration_nemotron_h_omni.py`:
+# `{"linear_attention": "mamba", "full_attention": "attention"}`. Both bf16 and
+# NVFP4 resolve to the same 40 mamba / 40 moe / 8 attention split, so an adapter
+# built from either checkpoint targets the same layers.
 _BLOCK_ALIASES = {
     "attention": "attention",
+    "full_attention": "attention",
     "*": "attention",
     "mamba": "mamba",
+    "linear_attention": "mamba",
     "M": "mamba",
     "moe": "moe",
     "E": "moe",
@@ -181,10 +198,12 @@ def create_nemotron35_lora_adapter(
             produce different output, which is the multi-LoRA assertion.
         key_prefix: ``"language_model."`` to mimic an adapter trained against
             the VL wrapper; ``""`` for one trained against the bare decoder.
-        std: both ``lora_A`` and ``lora_B`` are drawn at this scale. The
-            sanity-test scale (A 0.01, B 0.001) is deliberately not reused: its
-            product is small enough that greedy decoding can return
-            byte-identical tokens, which would read as "LoRA was not applied".
+        std: both ``lora_A`` and ``lora_B`` are drawn at this scale. Measured on
+            Nemotron 3.5 Super VL: 0.02 leaves greedy output byte-identical to
+            base even with the adapter demonstrably applied, so it reads as
+            "LoRA was not applied"; 0.2 moves every token on both the text and
+            the image path. Callers asserting divergence should pass 0.2. The
+            sanity-test scale (A 0.01, B 0.001) is weaker still.
         layer_indices: restrict to these layers. Defaults to every layer.
 
     Returns:

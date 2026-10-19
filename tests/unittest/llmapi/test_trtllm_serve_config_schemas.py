@@ -27,7 +27,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import yaml
 from jsonschema import Draft202012Validator
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, create_model
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, create_model
 
 pytestmark = pytest.mark.cpu_only
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -114,6 +114,38 @@ def test_config_validation(
 ) -> None:
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+def test_multimodal_lora_policy_defaults_to_decoder_only(
+    schemas: dict[str, dict], filename: str
+) -> None:
+    from tensorrt_llm._torch.peft.lora.config import LoraConfig
+
+    assert LoraConfig().enable_multimodal_lora is False
+    policy = schemas[filename]["$defs"]["LoraConfig"]["properties"]["enable_multimodal_lora"]
+    assert policy["default"] is False
+    assert policy["type"] == "boolean"
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [(False, True), (True, True), (None, False), ("vision", False), ([], False), ({}, False)],
+)
+def test_multimodal_lora_policy_values_match_runtime(
+    schemas: dict[str, dict], filename: str, value: object, valid: bool
+) -> None:
+    from tensorrt_llm._torch.peft.lora.config import LoraConfig
+
+    config = {"enable_multimodal_lora": value}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors({"lora_config": config}))
+    assert (not errors) == valid
+    if valid:
+        assert LoraConfig.model_validate(config).enable_multimodal_lora is value
+    else:
+        with pytest.raises(ValidationError):
+            LoraConfig.model_validate(config)
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:

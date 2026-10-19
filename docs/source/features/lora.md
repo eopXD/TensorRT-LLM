@@ -11,6 +11,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique that e
    - [LoRA with Quantization](#lora-with-quantization)
    - [NeMo LoRA Format](#nemo-lora-format)
    - [Routed-Expert MoE LoRA](#routed-expert-moe-lora)
+   - [Multimodal Component LoRA](#multimodal-component-lora)
    - [Cache Management](#cache-management)
 4. [TRTLLM serve with LoRA](#trtllm-serve-with-lora)
    - [YAML Configuration](#yaml-configuration)
@@ -229,6 +230,83 @@ The per-request schema is not itself CUDA-graph capturable (its host-side adapte
 #### What is rejected, and where
 
 If you supply MoE LoRA on a non-Cutlass backend or with quantization, `create_moe` raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, and per-request (eager-schema) inputs under CUDA-graph capture (use the slot-indexed schema for capture).
+
+### Multimodal Component LoRA
+
+Set `lora_config.enable_multimodal_lora: true` to apply one request-selected HF
+adapter to declared encoder and connector projections as well as the decoder.
+The default is `false`, which keeps decoder-only ownership and rejects encoder
+or connector weights. The existing `LoRARequest` API selects one checkpoint per
+request; that checkpoint can contain any supported subset of components.
+
+The runtime accepts these native, unquantized BF16 model configurations:
+
+| Model configuration | Vision encoder | Audio encoder | Connectors |
+| --- | --- | --- | --- |
+| Nemotron Nano-Omni-30B (`NemotronH_Nano_Omni_Reasoning_V3`) | RADIO-H Q/K/V, fused QKV, output projection | Parakeet Q/K/V and output projection | Both linear projections in the vision and audio connectors |
+| Mistral Small 3.1 (`Mistral3ForConditionalGeneration`, dense decoder) | Pixtral Q/K/V and output projection | Not available | `linear_1` and `linear_2` in the multimodal projector |
+
+Other variants of these architectures require their own component declarations.
+Encoder MLPs, patch embeddings, audio convolutions, and the Mistral patch merger
+are outside the enrolled targets. Packed and split versions of the same projection
+cannot coexist in one checkpoint.
+
+```yaml
+lora_config:
+  enable_multimodal_lora: true
+  lora_dir:
+    - /path/to/composite-adapter
+  max_lora_rank: 8
+  max_loras: 4
+  max_cpu_loras: 4
+```
+
+Component checkpoint module names are matched against the model's declared
+paths before normalization. The optional `base_model.model.` prefix and
+`.lora_A.weight` / `.lora_B.weight` suffix surround these paths:
+
+| Component | Accepted module path examples |
+| --- | --- |
+| Nano-Omni vision | `vision_model.radio_model.model.blocks.0.attn.q_proj`, `vision_model.encoder.layer.0.attention.query` |
+| Nano-Omni audio | `sound_encoder.encoder.layers.0.self_attn.q_proj` |
+| Nano-Omni vision connector | `mlp1.1`, `mlp1.3`, `vision_projector.mlp1.linear1`, `vision_projector.mlp1.linear2` |
+| Nano-Omni audio connector | `sound_projection.linear1`, `sound_projection.linear2` |
+| Mistral vision | `vision_tower.transformer.layers.0.attention.q_proj`, `model.vision_tower.transformer.layers.0.attention.q_proj` |
+| Mistral connector | `multi_modal_projector.linear_1`, `model.multi_modal_projector.linear_1` |
+
+Flat and language-model-prefixed decoder paths retain their existing meaning.
+An unsupported component, undeclared projection, duplicate destination, invalid
+dimension, or excessive rank fails before the adapter is registered. Checkpoints
+containing encoder or connector weights require one rank across their targeted
+components, use the shared BF16 cache dtype, and support standard LoRA or rsLoRA.
+DoRA, `alpha_pattern`, and `fan_in_fan_out` are not supported for these composite
+checkpoints. The component policy accepts HF checkpoints only. With the policy
+disabled, decoder-only checkpoints retain their existing format rules.
+
+Component LoRA currently requires TP1/PP1 on one rank, local encoder and decoder
+execution, and eager encoders. Decoder CUDA graphs remain available. Encoder
+CUDA graphs, prefill CUDA graphs, `torch.compile`, disaggregated serving,
+encoder-only workers, encoder side-stream prefetch, and EVS video pruning are
+rejected when this policy is enabled.
+Item scheduling supports `DEFAULT` and `DISABLED`; `EAGER` is rejected because
+it can request adapter residency before LLM admission releases cache capacity.
+For Nano-Omni, set `video_pruning_rate` to `null` or `0.0` to keep video pruning
+disabled. Leave this option unset for Mistral; its input processor does not accept
+an explicit pruning rate.
+
+Different requests in a batch can select different adapters or no adapter.
+Encoder mappings follow physical patch/frame rows, including audio padding;
+connector mappings follow the rows after projection preparation. Base-only rows
+receive no adapter contribution. Encoder-embedding reuse includes the relevant
+encoder and connector weight fingerprints, so identical media can be reused
+across decoder-only adapter changes. Changed encoder or connector weights produce
+separate cache entries, including after an adapter reload. Precomputed final
+embeddings require matching component provenance when component adaptation is
+active.
+
+The worker hashes checkpoint contents on each opt-in adapter selection and keeps
+an immutable copy of each distinct revision until shutdown. These checkpoint
+copies use disk space outside the `max_cpu_loras` weight-cache capacity.
 
 ### Cache Management
 

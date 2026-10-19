@@ -14,6 +14,7 @@
 # limitations under the License.
 """Runtime LoRA adapter management, and the entry points that build it."""
 
+import hashlib
 import itertools
 import json
 import logging
@@ -44,9 +45,10 @@ from .loaders import (
     get_all_hf_lora_weights,
     get_all_nemo_lora_weights,
     invert_module_mapping,
+    split_hf_lora_weights,
     unpack_nemo_weights,
 )
-from .ownership import DecoderLoraOwner
+from .ownership import ComponentLoraOwner, ComponentLoraTarget, DecoderLoraOwner
 
 if TYPE_CHECKING:
     from tensorrt_llm.runtime import ModelConfig
@@ -147,10 +149,169 @@ class LoraModelConfig:
     dtype: str
     swap_gate_up_proj_lora_b_weight: bool = True
     owner: DecoderLoraOwner = DecoderLoraOwner()
+    components: tuple[ComponentLoraOwner, ...] = ()
+
+
+def _validate_component_weights(
+    component_weights: dict[str, dict[ComponentLoraTarget, dict[str, torch.Tensor]]],
+    components: tuple[ComponentLoraOwner, ...],
+    adapter_config: dict,
+) -> set[int]:
+    if not component_weights:
+        return set()
+    if adapter_config.get("alpha_pattern") or adapter_config.get("fan_in_fan_out"):
+        raise ValueError("Component LoRA does not support alpha_pattern or fan_in_fan_out")
+    if adapter_config.get("use_dora"):
+        raise ValueError("Component LoRA does not support DoRA")
+    if not np.isfinite(float(adapter_config["lora_alpha"])):
+        raise ValueError("Component LoRA requires finite lora_alpha")
+    owners = {owner.name: owner for owner in components}
+    ranks = set()
+    for owner_name, targets in component_weights.items():
+        for target, weights in targets.items():
+            _check_lora_in_out(target.layer_idx, target.module_path, weights, owner_name)
+            if "magnitude" in weights:
+                raise ValueError(f"Component LoRA owner '{owner_name}' does not support DoRA")
+            t_in, t_out = weights["in"], weights["out"]
+            if t_in.ndim != 2 or t_out.ndim != 2:
+                raise ValueError(
+                    f"LoRA owner '{owner_name}' target '{target.module_path}' requires 2-D A/B weights"
+                )
+            rank = t_in.shape[0]
+            if (
+                rank <= 0
+                or rank > owners[owner_name].max_rank
+                or tuple(t_in.shape) != (rank, target.input_size)
+                or tuple(t_out.shape) != (target.output_size, rank)
+            ):
+                raise ValueError(
+                    f"Invalid LoRA shapes for owner '{owner_name}' target '{target.module_path}': "
+                    f"A={tuple(t_in.shape)}, B={tuple(t_out.shape)}; expected "
+                    f"A=(rank, {target.input_size}), B=({target.output_size}, rank), "
+                    f"0 < rank <= {owners[owner_name].max_rank}"
+                )
+            if (
+                target.layer_idx < 0
+                or target.tp_size <= 0
+                or target.in_tp_split_dim not in (-1, 1)
+                or target.out_tp_split_dim not in (-1, 0)
+                or any(size <= 0 for size in target.fused_output_sizes)
+                or (target.in_tp_split_dim == 1 and target.input_size % target.tp_size)
+                or (target.out_tp_split_dim == 0 and target.output_size % target.tp_size)
+                or (
+                    target.fused_output_sizes
+                    and sum(target.fused_output_sizes) != target.output_size
+                )
+            ):
+                raise ValueError(
+                    f"Invalid LoRA layout for owner '{owner_name}' target '{target.module_path}'"
+                )
+            if target.fused_output_sizes and any(
+                size % target.tp_size for size in target.fused_output_sizes
+            ):
+                raise ValueError(
+                    f"LoRA fused projection sizes must divide TP size for owner '{owner_name}'"
+                )
+            ranks.add(rank)
+    return ranks
+
+
+def _component_fingerprint(
+    owner: ComponentLoraOwner,
+    targets: dict[ComponentLoraTarget, dict[str, torch.Tensor]],
+    adapter_config: dict,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(
+            {
+                "owner": owner.name,
+                "dtype": str(str_dtype_to_torch(owner.dtype)),
+                "lora_alpha": float(adapter_config["lora_alpha"]),
+                "use_rslora": bool(adapter_config.get("use_rslora", False)),
+            },
+            sort_keys=True,
+        ).encode()
+    )
+    for target, weights in sorted(
+        targets.items(),
+        key=lambda item: (item[0].layer_idx, item[0].module_path, item[0].module_type),
+    ):
+        digest.update(
+            json.dumps((target.layer_idx, target.module_path, target.module_type)).encode()
+        )
+        for direction, tensor in sorted(weights.items()):
+            digest.update(json.dumps((direction, str(tensor.dtype), tuple(tensor.shape))).encode())
+            digest.update(tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _validate_composite_rank(
+    ranks: set[int],
+    decoder_weights: dict,
+    module_mapping: dict[str, str],
+    target_modules: list[str],
+) -> int:
+    ranks = set(ranks)
+    for layer_idx, modules in decoder_weights.items():
+        for hf_module, weights in modules.items():
+            module = module_mapping[hf_module]
+            if module not in target_modules:
+                continue
+            matrices = weights.values() if _is_moe_module_weights(weights) else (weights,)
+            for pair in matrices:
+                _check_lora_in_out(layer_idx, module, pair, "composite checkpoint")
+                ranks.add(pair["in"].shape[0])
+    if len(ranks) != 1:
+        raise ValueError(
+            f"A composite LoRA adapter requires one rank across components; got {sorted(ranks)}"
+        )
+    return next(iter(ranks))
+
+
+def _prepare_component_lora(
+    component_weights: dict[str, dict[ComponentLoraTarget, dict[str, torch.Tensor]]],
+    components: tuple[ComponentLoraOwner, ...],
+    adapter_config: dict,
+    retain_device_tensors: bool,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], dict, dict, list[torch.Tensor]]:
+    """Prepare component rows without publishing adapter cache state."""
+    owners = {owner.name: owner for owner in components}
+    packed_weights, packed_config, retained_weights = [], [], []
+    low_ranks, pointers = {}, {}
+    for owner_name, targets in component_weights.items():
+        dtype = str_dtype_to_torch(owners[owner_name].dtype)
+        for target, weights in targets.items():
+            t_in = weights["in"].cuda().to(dtype).contiguous()
+            t_out = weights["out"].cuda().to(dtype).contiguous()
+            if target.tp_size > 1 and target.fused_output_sizes:
+                parts = t_out.split(target.fused_output_sizes, dim=0)
+                shards = [part.chunk(target.tp_size, dim=0) for part in parts]
+                t_out = torch.cat(list(itertools.chain.from_iterable(zip(*shards))), dim=0)
+            rank = t_in.shape[0]
+            denominator = np.sqrt(rank) if adapter_config.get("use_rslora", False) else rank
+            t_out = t_out * (float(adapter_config["lora_alpha"]) / denominator)
+            packed_weights.append(torch.cat((t_in.flatten().cpu(), t_out.flatten().cpu())))
+            packed_config.append(
+                torch.tensor([target.execution_id, target.layer_idx, rank, 0], dtype=torch.int32)
+            )
+            name = f"{owner_name}:{target.execution_id}"
+            low_ranks.setdefault(target.layer_idx, {})[name] = rank
+            if retain_device_tensors:
+                pointers.setdefault(target.layer_idx, {})[name] = [
+                    t_in.data_ptr(),
+                    t_out.data_ptr(),
+                    0,
+                ]
+                retained_weights.extend((t_in, t_out))
+    return packed_weights, packed_config, low_ranks, pointers, retained_weights
 
 
 def load_torch_hf_lora(
-    lora_config: LoraConfig, *, owner: DecoderLoraOwner = DecoderLoraOwner()
+    lora_config: LoraConfig,
+    *,
+    owner: DecoderLoraOwner = DecoderLoraOwner(),
+    components: tuple[ComponentLoraOwner, ...] = (),
 ) -> Optional[torch.dtype]:
     """Load an HF LoRA checkpoint for the PyTorch workflow.
 
@@ -166,15 +327,20 @@ def load_torch_hf_lora(
         lora_config.trtllm_modules_to_hf_modules = get_default_trtllm_modules_to_hf_modules()
 
     assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
-    lora_loader = HfLoraLoader(lora_config.lora_dir, owner=owner)
+    lora_loader = HfLoraLoader(lora_config.lora_dir, owner=owner, components=components)
     inferred_target_modules = lora_loader.get_target_modules(
-        lora_config.trtllm_modules_to_hf_modules
+        lora_config.trtllm_modules_to_hf_modules,
+        allowed_target_modules=(
+            set(lora_config.lora_target_modules)
+            if components and lora_config.lora_target_modules
+            else None
+        ),
     )
 
     if len(lora_config.lora_target_modules) == 0:
         lora_config.lora_target_modules = inferred_target_modules
 
-    if len(lora_config.lora_target_modules) == 0:
+    if len(lora_config.lora_target_modules) == 0 and not lora_loader.component_weights:
         raise ValueError(
             "lora_target_modules is empty. "
             "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
@@ -182,11 +348,34 @@ def load_torch_hf_lora(
 
     missing_qkv_modules = LoraManager.get_missing_qkv_modules(lora_config.lora_target_modules)
     lora_config.lora_target_modules.extend(missing_qkv_modules)
+    if components:
+        ranks = _validate_component_weights(
+            lora_loader.component_weights, components, lora_loader.adapter_config
+        )
+        if lora_loader.component_weights:
+            module_mapping = invert_module_mapping(lora_config.trtllm_modules_to_hf_modules)
+            decoder_weights = get_all_hf_lora_weights(
+                lora_loader.decoder_weight,
+                set(module_mapping),
+                owner=owner,
+                hf_modules_to_trtllm_modules=module_mapping,
+                allowed_target_modules=set(lora_config.lora_target_modules),
+            )
+            _validate_composite_rank(
+                ranks, decoder_weights, module_mapping, lora_config.lora_target_modules
+            )
+        dtypes = {str_dtype_to_torch(component.dtype) for component in components}
+        if len(dtypes) != 1:
+            raise ValueError("Component LoRA requires one shared compute dtype")
+        return next(iter(dtypes))
     return lora_loader.get_dense_lora_dtype()
 
 
 def load_torch_nemo_lora(
-    lora_config: LoraConfig, *, owner: DecoderLoraOwner = DecoderLoraOwner()
+    lora_config: LoraConfig,
+    *,
+    owner: DecoderLoraOwner = DecoderLoraOwner(),
+    components: tuple[ComponentLoraOwner, ...] = (),
 ) -> Optional[torch.dtype]:
     """Load NeMo LoRA checkpoint for PyTorch workflow.
 
@@ -208,6 +397,10 @@ def load_torch_nemo_lora(
     Raises:
         ValueError: If NeMo LoRA directory is invalid or unsupported modules are specified
     """
+    if components:
+        raise ValueError(
+            "Multicomponent LoRA supports HF checkpoints only; NeMo remains decoder-only"
+        )
     lora_config.trtllm_modules_to_hf_modules = {"attn_qkv": "attn_qkv"}
 
     assert len(lora_config.lora_dir) == 1, "Expecting only a single lora dir"
@@ -237,7 +430,10 @@ def load_torch_nemo_lora(
 
 
 def load_torch_lora(
-    lora_config: LoraConfig, *, owner: DecoderLoraOwner = DecoderLoraOwner()
+    lora_config: LoraConfig,
+    *,
+    owner: DecoderLoraOwner = DecoderLoraOwner(),
+    components: tuple[ComponentLoraOwner, ...] = (),
 ) -> Optional[torch.dtype]:
     """Load LoRA checkpoint for PyTorch workflow.
 
@@ -253,9 +449,9 @@ def load_torch_lora(
         ValueError: If lora_ckpt_source is not supported
     """
     if lora_config.lora_ckpt_source == "nemo":
-        return load_torch_nemo_lora(lora_config, owner=owner)
+        return load_torch_nemo_lora(lora_config, owner=owner, components=components)
     elif lora_config.lora_ckpt_source == "hf":
-        return load_torch_hf_lora(lora_config, owner=owner)
+        return load_torch_hf_lora(lora_config, owner=owner, components=components)
     else:
         raise ValueError(
             f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}. "
@@ -346,6 +542,7 @@ class LoraManager(object):
         self._lora_weights_pointers_list: Dict[str, Dict[int, Dict[str, List[int]]]] = {}
         self._cpp_lora_weights: Dict[str, torch.Tensor] = {}  # on cpu
         self._cpp_lora_config: Dict[str, torch.Tensor] = {}  # on cpu
+        self.component_fingerprints: dict[str, dict[str, str]] = {}
         self.lora_target_modules: List[str] = []
         self._mapping = mapping
         self._model_config = model_config
@@ -390,6 +587,10 @@ class LoraManager(object):
                 uids=uids,
             )
         elif ckpt_source == "nemo":
+            if getattr(model_config, "components", ()):
+                raise ValueError(
+                    "Multicomponent LoRA supports HF checkpoints only; NeMo remains decoder-only"
+                )
             # Find all .nemo files from directories or files
             nemo_files = find_nemo_files(model_dirs_or_files)
 
@@ -413,6 +614,10 @@ class LoraManager(object):
         Note that when an adapter was already loaded before this call, it would not be
         included in the returned list of UIDs.
         """
+        if getattr(model_config, "components", ()):
+            raise ValueError(
+                "Multicomponent LoRA supports HF checkpoints only; NeMo remains decoder-only"
+            )
         if uids is None:
             uids = [self._generate_uid() for _ in range(len(model_files))]
         assert len(uids) == len(model_files)
@@ -678,6 +883,8 @@ class LoraManager(object):
             lora_model = load_state_dict(get_model_path(model_dir, "adapter_model"))
             if lora_model is None:
                 raise ValueError(f"Failed to load adapter_model from {model_dir}")
+            components = getattr(model_config, "components", ())
+            lora_model, component_weights = split_hf_lora_weights(lora_model, components)
             lora_model = preprocess_lora_weights(lora_model, model_config)
             all_weights = get_all_hf_lora_weights(
                 lora_model,
@@ -685,10 +892,30 @@ class LoraManager(object):
                 component,
                 owner=getattr(model_config, "owner", DecoderLoraOwner()),
                 hf_modules_to_trtllm_modules=hf_modules_to_trtllm_modules,
+                allowed_target_modules=set(self.lora_target_modules) if components else None,
             )
             rank = int(hf_config["r"])
             rs_lora = bool(hf_config.get("use_rslora", False))
             model_dtype = str_dtype_to_torch(model_config.dtype)
+            if components and any(
+                str_dtype_to_torch(owner.dtype) != model_dtype for owner in components
+            ):
+                raise ValueError(
+                    "Component LoRA requires one shared compute dtype across decoder and component owners"
+                )
+            component_ranks = _validate_component_weights(component_weights, components, hf_config)
+            if component_weights:
+                rank = _validate_composite_rank(
+                    component_ranks,
+                    all_weights,
+                    hf_modules_to_trtllm_modules,
+                    self.lora_target_modules,
+                )
+            fingerprints = {
+                owner.name: _component_fingerprint(owner, component_weights[owner.name], hf_config)
+                for owner in components
+                if owner.name in component_weights
+            }
             supports_native_fp8 = supports_native_fp8_lora(torch.cuda.get_device_capability())
 
             def get_output_dtype(module_weights):
@@ -703,7 +930,8 @@ class LoraManager(object):
 
             def uses_native_fp8(module_weights):
                 return (
-                    get_output_dtype(module_weights) == torch.float8_e4m3fn
+                    not components
+                    and get_output_dtype(module_weights) == torch.float8_e4m3fn
                     and not _is_moe_module_weights(module_weights)
                     and supports_native_fp8
                 )
@@ -877,6 +1105,22 @@ class LoraManager(object):
                         )
                     )
 
+            extra_weights, extra_configs, extra_ranks, extra_pointers, extra_retained = (
+                _prepare_component_lora(
+                    component_weights, components, hf_config, self._retain_device_tensors
+                )
+            )
+            cpp_lora_weights.extend(extra_weights)
+            cpp_lora_config.extend(extra_configs)
+            retained_lora_weights.extend(extra_retained)
+            for layer_idx, ranks in extra_ranks.items():
+                uid_to_low_ranks.setdefault(layer_idx, {}).update(ranks)
+            for layer_idx, pointers in extra_pointers.items():
+                lora_weights_pointers.setdefault(layer_idx, {}).update(pointers)
+            if not cpp_lora_weights:
+                raise ValueError(
+                    "LoRA checkpoint has no weights for the selected owners and target modules"
+                )
             max_weight_size = max(w.size(0) for w in cpp_lora_weights)
             packed_lora_weights = torch.stack(
                 [
@@ -891,6 +1135,7 @@ class LoraManager(object):
             self._lora_uid_to_low_ranks[uid] = uid_to_low_ranks
             self._lora_weights_pointers_list[uid] = lora_weights_pointers
             self._lora_weights.extend(retained_lora_weights)
+            self.component_fingerprints[uid] = fingerprints
 
         for uid, model_dir, hf_config in zip(new_uids, new_model_dirs, lora_hf_configs):
             load_from_model_dir(uid, model_dir, hf_config)

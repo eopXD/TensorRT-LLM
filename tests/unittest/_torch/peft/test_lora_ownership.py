@@ -308,6 +308,58 @@ def test_duplicate_decoder_aliases_are_rejected_before_cache(
     _assert_not_cached(runtime)
 
 
+@pytest.mark.parametrize(
+    "module",
+    [
+        "multi_modal_projector.linear_1",
+        "model.embed_tokens_extend.image_embed.img_projection",
+        "vision.embed_tokens_projector",
+        "audio.lm_head_projector",
+    ],
+)
+def test_non_layered_projector_rejected_at_startup_and_runtime(
+    runtime: _Runtime, entrypoint: str, module: str, tmp_path: Path
+) -> None:
+    source = runtime.config.lora_ckpt_source
+    weights = _weights(source, _decoder_prefix(source))
+    key = (
+        f"base_model.model.{module}.lora_A.weight"
+        if source == "hf"
+        else f"model.{module}.adapter_layer.lora_kqv_adapter.linear_in.weight"
+    )
+    weights[key] = torch.ones(2, 4, dtype=torch.float16)
+    path = _write_adapter(tmp_path / "mixed", source, weights)
+    config = runtime.config.model_copy(update={"lora_dir": [str(path)]})
+
+    for load in (
+        lambda: load_torch_lora(config, owner=runtime.model_config.owner),
+        lambda: _load(runtime, entrypoint, path),
+    ):
+        with pytest.raises(ValueError, match="outside selected owner 'decoder'") as exc:
+            load()
+        assert key in str(exc.value)
+        _assert_not_cached(runtime)
+
+
+def test_mixed_checkpoint_rejects_unmapped_encoder_weights(
+    hf_runtime: _Runtime, entrypoint: str, tmp_path: Path
+) -> None:
+    weights = _weights("hf", _decoder_prefix("hf"))
+    invalid = _weights("hf", "base_model.model.vision.encoder.layers")
+    invalid = {key.replace("o_proj", "unmapped_proj"): value for key, value in invalid.items()}
+    path = _write_adapter(tmp_path / "mixed", "hf", weights | invalid)
+    config = hf_runtime.config.model_copy(update={"lora_dir": [str(path)]})
+
+    for load in (
+        lambda: load_torch_lora(config, owner=hf_runtime.model_config.owner),
+        lambda: _load(hf_runtime, entrypoint, path),
+    ):
+        with pytest.raises(ValueError, match="outside selected owner 'decoder'") as exc:
+            load()
+        assert any(key in str(exc.value) for key in invalid)
+        _assert_not_cached(hf_runtime)
+
+
 @pytest.fixture(
     params=[
         ("gemma3vl", "Gemma3VLM"),

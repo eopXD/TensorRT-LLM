@@ -184,6 +184,8 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                 self.checkpoint_loader.cleanup()
                 self.checkpoint_loader = None
 
+        self._close_component_lora_registry()
+
         # MegaMoE's NVLink symmetric-memory activation workspaces are
         # rendezvoused over the EP group, so they must go before the
         # destroy_process_group() below. Never let a failure here escape:

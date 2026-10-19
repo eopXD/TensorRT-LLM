@@ -22,7 +22,10 @@
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include <set>
 #include <string>
+#include <unordered_map>
+#include <utility>
 
 namespace tensorrt_llm::runtime::lora
 {
@@ -91,7 +94,15 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
             "Expected LoRA weights dtype %s to match homogeneous cache dtype %s", weights->getDataTypeName(),
             IBuffer::getDataTypeName(expectedDataType));
 
-        auto loraModules = modelConfig.getLoraModules();
+        std::unordered_map<SizeType32, LoraModule const*> loraModules;
+        for (auto const& module : modelConfig.getLoraModules())
+        {
+            auto const executionId = module.executionId();
+            TLLM_CHECK_WITH_INFO(executionId >= 0, "LoRA execution ID must be nonnegative, got %d", executionId);
+            auto const inserted = loraModules.emplace(executionId, &module).second;
+            TLLM_CHECK_WITH_INFO(inserted, "Duplicate LoRA execution ID %d in model configuration", executionId);
+        }
+        std::set<std::pair<SizeType32, SizeType32>> destinations;
         auto maxAdapterSize = modelConfig.getMaxLoraRank();
         for (SizeType32 row = 0; row < config->getShape().d[0]; ++row)
         {
@@ -104,12 +115,14 @@ void loraValidateRequestTensors(std::optional<std::uint64_t> const& optTaskId,
             TLLM_CHECK_WITH_INFO(
                 layerId >= 0 && layerId < nbModelLayers, "Expected layerId to be in the range [0, numModelLayers)");
             TLLM_CHECK_WITH_INFO(adapterSize > 0, "Expected adapterSize to be > 0");
-            auto it = std::find_if(
-                loraModules.begin(), loraModules.end(), [modId](LoraModule const& m) { return m.value() == modId; });
-            std::string moduleName(LoraModule::toModuleName(modId));
-            TLLM_CHECK_WITH_INFO(it != loraModules.end(), "lora module " + moduleName + " not enabled for this model");
-            TLLM_CHECK_WITH_INFO(it->flattenedInOutSize(adapterSize, isDora) <= weights->getShape().d[2],
-                "lora_weights has too few values for " + moduleName);
+            TLLM_CHECK_WITH_INFO(modId >= 0, "LoRA execution ID must be nonnegative, got %d", modId);
+            auto const it = loraModules.find(modId);
+            TLLM_CHECK_WITH_INFO(it != loraModules.end(), "LoRA execution ID %d is not enabled for this model", modId);
+            TLLM_CHECK_WITH_INFO(destinations.emplace(modId, layerId).second,
+                "Duplicate LoRA destination for execution ID %d and layer %d", modId, layerId);
+            auto const& module = *it->second;
+            TLLM_CHECK_WITH_INFO(module.flattenedInOutSize(adapterSize, isDora) <= weights->getShape().d[2],
+                "lora_weights has too few values for %s (execution ID %d)", std::string(module.name()).c_str(), modId);
             TLLM_CHECK_WITH_INFO(adapterSize <= maxAdapterSize,
                 "Invalid low_rank (" + std::to_string(adapterSize) + "). low_rank must be smaller than mMaxLowRank ("
                     + std::to_string(maxAdapterSize) + ")");

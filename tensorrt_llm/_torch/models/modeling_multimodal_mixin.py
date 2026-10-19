@@ -39,7 +39,12 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
-from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.multimodal import (
+    MultimodalInput,
+    MultimodalParams,
+    MultimodalRuntimeData,
+    multimodal_lora_fingerprint,
+)
 from tensorrt_llm.inputs.registry import (
     MultimodalEncoderItemMetadata,
     get_multimodal_encoder_item_metadata,
@@ -294,6 +299,7 @@ def encode_multimodal_by_groups(
 
 
 if TYPE_CHECKING:
+    from ..peft.lora.ownership import ComponentLoraRequest
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
     from ..pyexecutor.llm_request import LlmRequest
 
@@ -989,6 +995,7 @@ class MultimodalModelMixin:
         return MultimodalParams(
             multimodal_data=residual_data,
             multimodal_input=residual_input,
+            component_lora_request=param.component_lora_request,
         )
 
     @staticmethod
@@ -1096,6 +1103,8 @@ class MultimodalModelMixin:
         encoder_cache = self._multimodal_encoder_cache
         cache_misses: list[MultimodalParams] = []
         partial_hits: list[tuple[MultimodalParams, EncoderCachePartition]] = []
+        for param in multimodal_params:
+            param.validate_embedding_lora_provenance()
         if encoder_cache is not None:
             for param in multimodal_params:
                 if param.multimodal_data.get("multimodal_embedding") is not None:
@@ -1113,6 +1122,7 @@ class MultimodalModelMixin:
                     param.multimodal_data["multimodal_embedding"] = (
                         _assemble_multimodal_encoder_embeddings(partition.hits, len(partition.keys))
                     )
+                    param.mark_embedding_lora_provenance()
                     continue
                 partial_hits.append((param, partition))
 
@@ -1257,6 +1267,8 @@ class MultimodalModelMixin:
                 item_metadata.item_refs,
                 item_metadata.output_embedding_lengths,
                 mm_data.get("mm_processor_kwargs_hash"),
+                component_lora_request=param.component_lora_request,
+                multimodal_data=mm_data,
             )
 
         modality = cls._encoder_cache_modality(param)
@@ -1277,16 +1289,22 @@ class MultimodalModelMixin:
             )
             return None
 
-        # The item hash, embedding row count, processor kwargs, and modality fully describe a
-        # reusable item embedding. Request order is excluded so the same item can be reused from a
-        # different request layout; the current request order is restored when cached item tensors
-        # are concatenated below.
+        # Decoder-only adapters share encoder outputs. Adapted towers and connectors add their
+        # content fingerprints; request order stays outside the key so items can be reordered.
         return [
-            cls._encoder_cache_item_key(modality, item_hash, embedding_length, kwargs_hash)
-            for item_hash, embedding_length in zip(
-                mm_input.multimodal_hashes,
-                embedding_lengths,
-                strict=True,
+            cls._encoder_cache_item_key(
+                modality,
+                item_hash,
+                embedding_length,
+                kwargs_hash,
+                param.encoder_lora_fingerprint(modality, item_index=item_index),
+            )
+            for item_index, (item_hash, embedding_length) in enumerate(
+                zip(
+                    mm_input.multimodal_hashes,
+                    embedding_lengths,
+                    strict=True,
+                )
             )
         ]
 
@@ -1296,10 +1314,12 @@ class MultimodalModelMixin:
         item_hash: Sequence[int],
         embedding_length: int,
         kwargs_hash: str,
+        component_fingerprint: tuple[tuple[str, str], ...] = (),
     ) -> Hashable:
         # Sole definition of the key format, so entries written by the
         # full-request path and the item-scheduling path hit from either.
-        return (modality, tuple(item_hash), int(embedding_length), kwargs_hash)
+        key = (modality, tuple(item_hash), int(embedding_length), kwargs_hash)
+        return (*key, component_fingerprint) if component_fingerprint else key
 
     @classmethod
     def build_encoder_cache_item_keys(
@@ -1308,6 +1328,9 @@ class MultimodalModelMixin:
         item_refs: Sequence[tuple[str, int]],
         embedding_lengths: Sequence[int],
         kwargs_hash: Optional[str],
+        *,
+        component_lora_request: Optional["ComponentLoraRequest"] = None,
+        multimodal_data: Optional[Dict[str, Any]] = None,
     ) -> Optional[list[Hashable]]:
         """Build per-item cache keys from request-level item metadata.
 
@@ -1329,8 +1352,16 @@ class MultimodalModelMixin:
             )
             return None
         return [
-            cls._encoder_cache_item_key(modality, item_hash, embedding_length, kwargs_hash)
-            for (modality, _), item_hash, embedding_length in zip(
+            cls._encoder_cache_item_key(
+                modality,
+                item_hash,
+                embedding_length,
+                kwargs_hash,
+                multimodal_lora_fingerprint(
+                    component_lora_request, modality, multimodal_data, item_index=item_index
+                ),
+            )
+            for (modality, item_index), item_hash, embedding_length in zip(
                 item_refs,
                 multimodal_hashes,
                 embedding_lengths,
@@ -1409,6 +1440,7 @@ class MultimodalModelMixin:
         Models slice raw modality tensors in `build_multimodal_encoder_input`; the mixin owns
         the parallel per-item metadata slice so every model gets it identically.
         """
+        residual.component_lora_request = source.component_lora_request
         source_lengths = source.multimodal_data["multimodal_embedding_lengths"]
         residual.multimodal_data["multimodal_embedding_lengths"] = [
             source_lengths[i] for i in item_indices
@@ -1472,6 +1504,7 @@ class MultimodalModelMixin:
             param.multimodal_data["multimodal_embedding"] = _assemble_multimodal_encoder_embeddings(
                 by_item, len(partition.keys)
             )
+            param.mark_embedding_lora_provenance()
 
             inserted = 0
             rejected = 0
@@ -1701,6 +1734,7 @@ def _dispatch_cross_iter_prefetch(
                 embed_mask_cumsum=cumsum,
             ),
             mm_item_order=req.py_mm_item_order,
+            component_lora_request=getattr(req, "py_component_lora_request", None),
         )
         for req, mm_data, cumsum in candidates
     ]
@@ -1733,6 +1767,7 @@ def _dispatch_cross_iter_prefetch(
                                 partition.hits, len(partition.keys)
                             )
                         )
+                        param.mark_embedding_lora_provenance()
                     else:
                         partial_hits.append((param, partition))
 

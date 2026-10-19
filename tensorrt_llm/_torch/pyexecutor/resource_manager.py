@@ -3284,6 +3284,18 @@ class PeftCacheManager(BaseResourceManager):
     def get_lora_manager(self) -> LoraManager:
         return self._lora_manager
 
+    def prepare_component_peft(
+            self, requests: list[LlmRequest]
+    ) -> Dict[int, list[TaskLayerModuleConfig]]:
+        """Ensure encoder adapters without consuming the decoder iteration table."""
+        if not requests or not any(request.lora_task_id is not None
+                                   for request in requests):
+            return {}
+        for request in requests:
+            self.add_request_peft(request)
+        table, _ = self.impl.ensure_batch_map_task_id(requests, [], False)
+        return table
+
     @property
     def data_type(self) -> torch.dtype:
         return binding_to_torch_dtype(self.impl.data_type)

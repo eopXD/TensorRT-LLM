@@ -40,7 +40,10 @@ from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
+from tensorrt_llm._torch.peft.lora.ownership import (ComponentLoraOwner,
+                                                     ComponentLoraTarget,
+                                                     DecoderLoraOwner)
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
@@ -788,6 +791,8 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
 
     supports_encoder_cache = True
     supports_mm_encoder_item_scheduling = True
+    component_lora_decoder_targets = ("attn_q", "attn_k", "attn_v",
+                                      "attn_dense")
 
     def __init__(
         self,
@@ -920,6 +925,90 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
                          "model.language_model.layers"),
         )
 
+    def configure_component_lora(
+            self, max_lora_rank: int) -> tuple[ComponentLoraOwner, ...]:
+        """Declare native Mistral Small 3.1 vision and connector projections."""
+        if hasattr(self, "_component_lora_owners"):
+            return self._component_lora_owners
+        vision = self._vision_tower
+        if (not isinstance(self.llm, MistralForCausalLM)
+                or not isinstance(vision, modeling_pixtral.PixtralVisionModel)
+                or self.llm.config.hidden_size != 5120
+                or self.llm.config.num_hidden_layers != 40
+                or vision.config.hidden_size != 1024
+                or vision.config.num_hidden_layers != 24
+                or vision.config.num_attention_heads != 16
+                or vision.config.torch_dtype != torch.bfloat16
+                or (self.model_config.quant_config is not None
+                    and self.model_config.quant_config.quant_algo is not None)):
+            raise ValueError(
+                "Component LoRA requires the BF16 Mistral Small 3.1 / Pixtral configuration"
+            )
+
+        vision_targets = []
+        for layer_idx, layer in enumerate(vision.transformer.layers):
+            attention = layer.attention
+            module_path = f"transformer.layers.{layer_idx}.attention"
+            for module_type, projection, lora_name, output_size in (
+                ("attn_q", "q_proj", "splitted_qkv_lora", attention.q_size),
+                ("attn_k", "k_proj", "splitted_qkv_lora", attention.kv_size),
+                ("attn_v", "v_proj", "splitted_qkv_lora", attention.kv_size),
+                ("attn_dense", "o_proj", "o_lora", attention.hidden_size),
+            ):
+                vision_targets.append(
+                    ComponentLoraTarget(
+                        module_path=f"{module_path}.{lora_name}",
+                        checkpoint_modules=tuple(
+                            f"{prefix}.{module_path}.{projection}"
+                            for prefix in ("vision_tower",
+                                           "model.vision_tower")),
+                        layer_idx=layer_idx,
+                        module_type=module_type,
+                        execution_id=-1,
+                        input_size=attention.hidden_size,
+                        output_size=output_size,
+                    ))
+
+        connector_targets = []
+        for name, module_type, semantic_type in (
+            ("linear_1", "mlp_h_to_4h", LoraModuleType.MLP_H_TO_4H),
+            ("linear_2", "mlp_4h_to_h", LoraModuleType.MLP_4H_TO_H),
+        ):
+            linear = getattr(self._multi_modal_projector, name)
+            linear.lora = LoraLayer([semantic_type], [linear.out_features])
+            connector_targets.append(
+                ComponentLoraTarget(
+                    module_path=f"{name}.lora",
+                    checkpoint_modules=tuple(
+                        f"{prefix}.{name}"
+                        for prefix in ("multi_modal_projector",
+                                       "model.multi_modal_projector")),
+                    layer_idx=0,
+                    module_type=module_type,
+                    execution_id=-1,
+                    input_size=linear.in_features,
+                    output_size=linear.out_features,
+                ))
+        self._component_lora_owners = (
+            ComponentLoraOwner(
+                "vision",
+                "_vision_tower",
+                tuple(vision_targets),
+                "bfloat16",
+                max_lora_rank,
+                ("vision_tower", "model.vision_tower"),
+            ),
+            ComponentLoraOwner(
+                "vision_connector",
+                "_multi_modal_projector",
+                tuple(connector_targets),
+                "bfloat16",
+                max_lora_rank,
+                ("multi_modal_projector", "model.multi_modal_projector"),
+            ),
+        )
+        return self._component_lora_owners
+
     @property
     def multimodal_token_ids(self) -> torch.Tensor:
         return self._image_token_ids
@@ -1036,12 +1125,39 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
                 f"Expected as many `pixel_values` ({len(pixel_values)}) and "
                 f"`image_sizes` ({len(image_sizes)}) as number of multimodal parameters "
                 f"({multimodal_params_len}).")
+        component_runtime = getattr(self, "_component_lora_runtime", None)
+        lora_kwargs = {}
+        if component_runtime is not None:
+            patch_size = self._vision_tower.config.patch_size
+            merge_size = self._multi_modal_projector.patch_merger._spatial_merge_size
+            vision_segments = []
+            connector_segments = []
+            for param, sizes in zip(multimodal_params, image_sizes):
+                request = param.component_lora_request
+                task_id = request.task_id if request is not None else None
+                for height, width in sizes:
+                    vision_segments.append(
+                        (task_id,
+                         (height // patch_size) * (width // patch_size)))
+                    connector_segments.append((
+                        task_id,
+                        (height // (patch_size * merge_size)) *
+                        (width // (patch_size * merge_size)),
+                    ))
+            lora_kwargs = {
+                "vision_lora_params":
+                component_runtime.parameters("vision", vision_segments),
+                "connector_lora_params":
+                component_runtime.parameters("vision_connector",
+                                             connector_segments),
+            }
         image_sizes = [torch.tensor(x) for x in image_sizes]
         batched_pixel_values, batched_image_sizes = self.batch_pixel_values(
             pixel_values=pixel_values, image_sizes=image_sizes)
         mm_embeds = [
             self._get_image_features(pixel_values=batched_pixel_values,
-                                     image_sizes=batched_image_sizes)
+                                     image_sizes=batched_image_sizes,
+                                     **lora_kwargs)
         ]
 
         return mm_embeds
@@ -1053,16 +1169,21 @@ class Mistral3VLM(MultimodalModelMixin, PreTrainedModel):
         self,
         pixel_values: torch.Tensor,
         image_sizes: torch.Tensor,
+        vision_lora_params: dict | None = None,
+        connector_lora_params: dict | None = None,
     ):
         with nvtx_range("[mistral] ViT"):
             image_outputs = self._vision_tower(
                 pixel_values=pixel_values,
                 image_sizes=image_sizes,
+                lora_params=vision_lora_params,
             )
 
         with nvtx_range("[mistral] MM projector"):
             image_features = self._multi_modal_projector(
-                image_outputs.squeeze(0), image_sizes)
+                image_outputs.squeeze(0),
+                image_sizes,
+                lora_params=connector_lora_params)
         return image_features
 
     # Original HF implementation:
@@ -1218,12 +1339,19 @@ class Mistral3MultiModalProjector(torch.nn.Module):
         )
 
     @torch.inference_mode()
-    def forward(self, image_features: torch.Tensor, image_sizes: torch.Tensor):
+    def forward(self,
+                image_features: torch.Tensor,
+                image_sizes: torch.Tensor,
+                lora_params: dict | None = None):
         image_features = self.norm(image_features)
         image_features = self.patch_merger(image_features, image_sizes)
-        hidden_states = self.linear_1(image_features)
+        hidden_states = self.linear_1(image_features,
+                                      lora_params=lora_params,
+                                      layer_idx=0)
         hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)
+        hidden_states = self.linear_2(hidden_states,
+                                      lora_params=lora_params,
+                                      layer_idx=0)
         return hidden_states
 
     def load_weights(self, weights):

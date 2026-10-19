@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::runtime
@@ -60,16 +62,18 @@ public:
     };
 
     explicit constexpr LoraModule(ModuleType const& t, SizeType32 inDim, SizeType32 outDim, bool inDimFirst,
-        bool outDimFirst, SizeType32 inTpSplitDim, SizeType32 outTpSplitDim) noexcept
+        bool outDimFirst, SizeType32 inTpSplitDim, SizeType32 outTpSplitDim,
+        std::optional<SizeType32> executionId = std::nullopt)
         : mType(t)
+        , mExecutionId(executionId.value_or(static_cast<SizeType32>(t)))
         , mInDim(inDim)
         , mOutDim(outDim)
         , mInDimFirst(inDimFirst)
         , mOutDimFirst(outDimFirst)
         , mInTpSplitDim(inTpSplitDim)
         , mOutTpSplitDim(outTpSplitDim)
-
     {
+        TLLM_CHECK_WITH_INFO(mExecutionId >= 0, "LoRA execution ID must be nonnegative, got %d", mExecutionId);
     }
 
     explicit constexpr LoraModule() noexcept
@@ -160,6 +164,12 @@ public:
     [[nodiscard]] SizeType32 constexpr value() const noexcept
     {
         return static_cast<SizeType32>(mType);
+    }
+
+    //! Identity used in cache entries and request rows, independent of the projection type.
+    [[nodiscard]] SizeType32 constexpr executionId() const noexcept
+    {
+        return mExecutionId;
     }
 
     [[nodiscard]] std::string_view constexpr name() const noexcept
@@ -304,6 +314,7 @@ public:
 
 private:
     ModuleType mType;
+    SizeType32 mExecutionId;
     SizeType32 mInDim;
     SizeType32 mOutDim;
     bool mInDimFirst;
@@ -315,6 +326,7 @@ private:
 inline std::ostream& operator<<(std::ostream& output, LoraModule const& module)
 {
     return output << "LoraModule(id=" << module.value() << ", "
+                  << "executionId=" << module.executionId() << ", "
                   << "name=" << module.name() << ", "
                   << "inDim=" << module.inDim() << ", "
                   << "outDim=" << module.outDim() << ", "

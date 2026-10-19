@@ -22,13 +22,16 @@ import uuid
 import weakref
 from pathlib import Path
 from queue import Empty, Queue
+from threading import Lock
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.peft.lora.adapter_revision import AdapterRevisionRegistry
 from .._torch.peft.lora.manager import LoraManager
+from .._torch.peft.lora.ownership import ComponentLoraRequest
 from .._torch.peft.prompt_adapter import PromptAdapterManager
 from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
@@ -120,6 +123,8 @@ class BaseWorker(GenerationExecutor):
         self._hf_model_dir = hf_model_dir
         self._tokenizer = tokenizer
         self.llm_args = llm_args
+        self._component_lora_registry: AdapterRevisionRegistry | None = None
+        self._component_lora_lock = Lock()
 
         self.engine = None
         self.result_queue: Optional[IpcQueue] = None
@@ -371,11 +376,41 @@ class BaseWorker(GenerationExecutor):
             model_config=self._runtime_model_config,
             uids=[str(prompt_adapter_request.adapter_id)])
 
+    def _load_component_lora_adapter(
+            self, request: LoRARequest) -> tuple[ComponentLoraRequest, str]:
+        """Pin checkpoint contents and a cache identity for this request."""
+        if request.ckpt_source != "hf":
+            raise ValueError("Multimodal LoRA requires HF adapter checkpoints")
+        with self._component_lora_lock:
+            if self._component_lora_registry is None:
+                self._component_lora_registry = AdapterRevisionRegistry()
+            snapshot = self._component_lora_registry.resolve(
+                request.adapter_id, request.path)
+            uid = str(snapshot.task_id)
+            self._lora_manager.load_from_ckpt(
+                [snapshot.path],
+                model_config=self._lora_model_config,
+                uids=[uid],
+                ckpt_source="hf")
+            fingerprints = self._lora_manager.component_fingerprints[uid]
+            return ComponentLoraRequest(
+                task_id=snapshot.task_id,
+                revision=snapshot.revision,
+                component_fingerprints=tuple(sorted(
+                    fingerprints.items()))), snapshot.path
+
+    def _close_component_lora_registry(self) -> None:
+        registry = getattr(self, "_component_lora_registry", None)
+        if registry is not None:
+            registry.close()
+            self._component_lora_registry = None
+
     def _enqueue_request(self,
                          request: GenerationRequest,
                          result_wait_queue=None) -> int:
         assert request.id is not None
         py_lora_path = None
+        component_lora_request = None
         if self._lora_manager is not None and request.lora_request is not None:
             try:
                 if self._is_pytorch_backend:
@@ -384,10 +419,15 @@ class BaseWorker(GenerationExecutor):
                     # in PeftCacheManager.add_request_peft().
                     # Pre-load on rank 0 to warm the LoRA manager cache so that
                     # add_request_peft finds the adapter already loaded.
-                    self._load_lora_adapter(request.lora_request)
-                    uid = str(request.lora_request.adapter_id)
+                    if self._lora_model_config.components:
+                        component_lora_request, py_lora_path = self._load_component_lora_adapter(
+                            request.lora_request)
+                        uid = str(component_lora_request.task_id)
+                    else:
+                        self._load_lora_adapter(request.lora_request)
+                        uid = str(request.lora_request.adapter_id)
                     lora_config = tllm.LoraConfig(
-                        task_id=request.lora_request.adapter_id,
+                        task_id=int(uid),
                         weights=None,
                         config=self._lora_manager.cpp_lora_config[uid])
                 else:
@@ -400,7 +440,8 @@ class BaseWorker(GenerationExecutor):
                         weights=self._lora_manager.cpp_lora_weights[uid]
                         if not adapter_in_cache else None,
                         config=self._lora_manager.cpp_lora_config[uid])
-                py_lora_path = request.lora_request.lora_path
+                if py_lora_path is None:
+                    py_lora_path = request.lora_request.lora_path
             except Exception as e:
                 raise RequestError(f"Failed to load LoRA adapter: {e}") from e
         else:
@@ -542,6 +583,7 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
+            executor_request.py_component_lora_request = component_lora_request
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
             executor_request.py_logprobs_simple_format = (
                 request.sampling_params.logprobs_simple_format)
@@ -1129,6 +1171,8 @@ class BaseWorker(GenerationExecutor):
             if can_shutdown():
                 self.engine.shutdown()
                 self.engine = None
+        if self.engine is None:
+            self._close_component_lora_registry()
 
     def get_disaggregated_params(self) -> dict:
         if self.engine is None or self.engine.kv_cache_transceiver is None:

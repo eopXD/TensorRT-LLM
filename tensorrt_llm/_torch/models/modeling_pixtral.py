@@ -84,6 +84,7 @@ class PixtralAttentionLayer(torch.nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: attention_interface.AttentionMetadata,
         position_ids: torch.Tensor,
+        lora_params: dict | None = None,
     ):
         residual = hidden_states
         hidden_states = self.attention_norm(hidden_states)
@@ -95,6 +96,7 @@ class PixtralAttentionLayer(torch.nn.Module):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=attention_interface.PredefinedAttentionMask.FULL,
+            lora_params=lora_params,
         )
 
         hidden_states = residual + hidden_states
@@ -130,6 +132,7 @@ class PixtralTransformer(torch.nn.Module):
         position_embeddings: torch.Tensor,
         position_ids: torch.Tensor,
         attn_metadata: attention_interface.AttentionMetadata,
+        lora_params: dict | None = None,
     ):
         if inputs_embeds.ndim == 3:
             batch_size, patches, _ = inputs_embeds.shape
@@ -162,6 +165,7 @@ class PixtralTransformer(torch.nn.Module):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 position_ids=position_ids,
+                lora_params=lora_params,
             )
 
             hidden_states = layer_outputs
@@ -221,6 +225,7 @@ class PixtralVisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self,
         pixel_values: torch.Tensor,
         image_sizes: torch.Tensor,
+        lora_params: dict | None = None,
     ):
         with torch.autocast(device_type="cuda", dtype=self.config.torch_dtype):
             patch_embeds = self.patch_conv(pixel_values)
@@ -252,6 +257,7 @@ class PixtralVisionModel(torch.nn.Module, MultimodalEncoderMixin):
             position_embeddings=position_embeddings,
             position_ids=position_ids,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
         )
 
         return out

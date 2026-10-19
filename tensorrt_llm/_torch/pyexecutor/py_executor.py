@@ -7282,6 +7282,18 @@ class PyExecutor:
         """Update the MM cache and encode selected items before LLM prefill."""
         scheduled_items = scheduled_requests.scheduled_mm_encoder_items or {}
         try:
+            producer_requests = [
+                request for request in self.active_requests
+                if request.request_id in scheduled_items
+            ]
+            peft_cache_manager = self.resource_manager.get_resource_manager(
+                ResourceManagerType.PEFT_CACHE_MANAGER)
+            try:
+                self.model_engine.prepare_multimodal_lora(
+                    producer_requests, peft_cache_manager)
+            except (ValueError, RuntimeError) as error:
+                raise MultimodalEncoderRequestError(
+                    str(error), request_ids=set(scheduled_items)) from error
             self.model_engine.forward_multimodal_encoder_items(
                 self.active_requests, scheduled_items)
         except MultimodalEncoderRequestError as e:

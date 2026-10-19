@@ -156,6 +156,28 @@ Note:
 - V: Video
 - A: Audio
 
+## Multimodal Runtime LoRA
+
+Runtime encoder and connector LoRA requires the explicit
+`lora_config.enable_multimodal_lora` policy. One `LoRARequest` selects a checkpoint
+containing decoder weights, component weights, or both.
+
+| Model configuration | Vision attention | Audio attention | Vision connector | Audio connector | Execution limits |
+| --- | --- | --- | --- | --- | --- |
+| Nemotron Nano-Omni-30B BF16 (`NemotronH_Nano_Omni_Reasoning_V3`) | Q/K/V, fused QKV, output | Q/K/V, output | Two linear projections | Two linear projections | TP1/PP1, eager encoders, optional decoder CUDA graphs |
+| Mistral Small 3.1 BF16 (`Mistral3ForConditionalGeneration`, dense decoder) | Q/K/V, output | N/A | Two linear projections | N/A | TP1/PP1, eager encoders, optional decoder CUDA graphs |
+
+These declarations apply to the listed native, unquantized model configurations.
+They do not extend encoder LoRA to other checkpoints of the same architecture.
+Encoder CUDA graphs, prefill CUDA graphs, `torch.compile`, disaggregated serving,
+encoder side-stream prefetch, and EVS video pruning are rejected with component
+LoRA enabled. Encoder item scheduling supports `DEFAULT` and `DISABLED`;
+`EAGER` is rejected. Nano-Omni accepts a video pruning rate of `null` or `0.0`;
+leave this option unset for Mistral.
+Decoder-only LoRA remains the default. See
+[Multimodal Component LoRA](../features/lora.md#multimodal-component-lora) for
+checkpoint paths, adapter restrictions, and embedding-cache behavior.
+
 ## Multimodal Encoder Optimizations
 
 The following optimizations are available to models that implement

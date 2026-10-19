@@ -6064,7 +6064,8 @@ class BaseLlmArgs(StrictBaseModel):
                 f"enable_lora is ignored when lora_config is provided for {self.backend} backend."
             )
 
-        if self.lora_config is not None:
+        if (self.lora_config is not None
+                and not self.lora_config.enable_multimodal_lora):
             if len(self.lora_config.lora_dir) == 0 and len(
                     self.lora_config.lora_target_modules) == 0:
                 logger.warning(

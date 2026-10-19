@@ -68,6 +68,13 @@ def get_default_trtllm_modules_to_hf_modules():
 
 
 class LoraConfig(StrictBaseModel):
+    enable_multimodal_lora: bool = Field(
+        default=False,
+        description=
+        "Enable runtime LoRA on explicitly supported multimodal encoders and connectors. "
+        "A request selects one adapter checkpoint for all of its targeted components. "
+        "Requires a supported BF16 model with TP1/PP1 and eager encoders; decoder CUDA graphs remain supported."
+    )
     lora_dir: List[str] = Field(
         default_factory=list,
         description="List of directories containing LoRA adapter checkpoints. "

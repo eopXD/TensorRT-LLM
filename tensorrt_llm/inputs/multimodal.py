@@ -3,7 +3,8 @@
 """Multimodal utilities for handling images and other media types in TensorRT-LLM."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import (TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple,
+                    Union)
 
 import numpy as np
 import torch
@@ -14,14 +15,49 @@ from tensorrt_llm.inputs.multimodal_data import (BaseModalityData, VideoData,
                                                  serialize_item)
 from tensorrt_llm.logger import logger
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.peft.lora.ownership import ComponentLoraRequest
+
 # Default hasher
 default_hasher = blake3
 _INT32_MAX = 2**31 - 1
 MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
+MULTIMODAL_LORA_PROVENANCE_KEY = "multimodal_lora_provenance"
 
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
 _HASH_SCHEME_TAG = b"trtllm.mm.hash.v1"
+
+
+def multimodal_lora_fingerprint(
+    request: Optional["ComponentLoraRequest"],
+    modality: Optional[str] = None,
+    multimodal_data: Optional[Dict[str, Any]] = None,
+    *,
+    item_index: Optional[int] = None,
+) -> tuple[tuple[str, str], ...]:
+    """Return the adapted component identities that affect an encoder output."""
+    if request is None:
+        return ()
+    components = {"vision", "vision_connector", "audio", "audio_connector"}
+    if modality == "image":
+        components = {"vision", "vision_connector"}
+    elif modality == "audio":
+        components = {"audio", "audio_connector"}
+    elif modality == "video":
+        components = {"vision", "vision_connector"}
+        video = (multimodal_data or {}).get("video")
+        if isinstance(video, dict) and video.get("audio") is not None:
+            audio = video["audio"]
+            has_audio = audio.get("has_audio") if isinstance(audio,
+                                                             dict) else None
+            if (item_index is None or not isinstance(has_audio, (list, tuple))
+                    or item_index >= len(has_audio) or has_audio[item_index]):
+                components.update(("audio", "audio_connector"))
+    return tuple(
+        sorted((name, fingerprint)
+               for name, fingerprint in request.component_fingerprints
+               if name in components))
 
 
 def _validate_int_list(values: Any, field_name: str) -> None:
@@ -462,6 +498,7 @@ _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MULTIMODAL_LORA_PROVENANCE_KEY,
 })
 
 
@@ -530,11 +567,45 @@ class MultimodalParams:
     encoder_event: Optional[torch.cuda.Event] = field(default=None,
                                                       repr=False,
                                                       compare=False)
+    component_lora_request: Optional["ComponentLoraRequest"] = None
 
     def __post_init__(self):
         """Ensure default values are properly set."""
         if self.multimodal_data is None:
             self.multimodal_data = {}
+
+    def encoder_lora_fingerprint(
+            self,
+            modality: Optional[str] = None,
+            *,
+            item_index: Optional[int] = None) -> tuple[tuple[str, str], ...]:
+        """Return component identities for this request's encoder embeddings."""
+        return multimodal_lora_fingerprint(self.component_lora_request,
+                                           modality,
+                                           self.multimodal_data,
+                                           item_index=item_index)
+
+    def validate_embedding_lora_provenance(self) -> None:
+        """Reject final embeddings produced with unknown or different component weights."""
+        if self.multimodal_data.get("multimodal_embedding") is None:
+            return
+        expected = self.encoder_lora_fingerprint()
+        actual = self.multimodal_data.get(MULTIMODAL_LORA_PROVENANCE_KEY)
+        if actual is None:
+            if expected:
+                raise ValueError(
+                    "Precomputed multimodal embeddings cannot be used with encoder or "
+                    "connector LoRA without matching component provenance.")
+        elif actual != expected:
+            raise ValueError(
+                "Multimodal embeddings were produced with different encoder or connector "
+                "LoRA weights than the request selected.")
+
+    def mark_embedding_lora_provenance(self) -> None:
+        """Record the component weights used to produce an attached embedding."""
+        if self.multimodal_data.get("multimodal_embedding") is not None:
+            fingerprint = self.encoder_lora_fingerprint()
+            self.multimodal_data[MULTIMODAL_LORA_PROVENANCE_KEY] = fingerprint
 
     def _is_shared_tensor_dict(self, obj: Any) -> bool:
         """Check if an object is a shared tensor dictionary.
@@ -1086,6 +1157,7 @@ _MM_METADATA_ONLY_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MULTIMODAL_LORA_PROVENANCE_KEY,
     "special_token_offsets",
     "layout_metadata",
 })

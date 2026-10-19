@@ -388,6 +388,66 @@ TEST_F(LoraCacheTest, basicPutGet)
     }
 }
 
+TEST_F(LoraCacheTest, executionIdsKeepSameProjectionWeightsSeparate)
+{
+    ModelConfig modelConfig(0, 1, 1, 0, 1, 4, tensorrt_llm::DataType::kFLOAT);
+    WorldConfig worldConfig(1, 1, 1, 0);
+    modelConfig.setLoraModules({
+        LoraModule(LoraModule::ModuleType::kATTN_Q, 4, 4, false, true, -1, -1),
+        LoraModule(LoraModule::ModuleType::kATTN_Q, 8, 12, false, true, -1, -1, 26),
+    });
+    LoraCachePageManagerConfig pageConfig(MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 4, 4, 8, 8, 1);
+    LoraCache cache(pageConfig, modelConfig, worldConfig, *mManager);
+
+    std::vector<int32_t> rows{1, 0, 2, 0, 26, 0, 2, 0};
+    TensorPtr config = ITensor::wrap(rows, ITensor::makeShape({2, 4}));
+    TensorPtr weights = mManager->cpu(ITensor::makeShape({2, 40}), tensorrt_llm::DataType::kFLOAT);
+    auto const data = weights->getBufferPtr<float>();
+    std::fill_n(data, 40, 1.0F);
+    std::fill_n(data + 40, 40, 2.0F);
+
+    EXPECT_EQ(cache.determineNumPages(config), 1);
+    cache.put(7, weights, config);
+    auto const& entries = cache.get(7);
+    ASSERT_EQ(entries.size(), 2);
+    EXPECT_EQ(entries[0].moduleId, 1);
+    EXPECT_EQ(entries[1].moduleId, 26);
+    EXPECT_EQ(entries[0].layerId, entries[1].layerId);
+    EXPECT_EQ(entries[0].inSize, 8);
+    EXPECT_EQ(entries[0].outSize, 8);
+    EXPECT_EQ(entries[1].inSize, 16);
+    EXPECT_EQ(entries[1].outSize, 24);
+    EXPECT_NE(entries[0].weightsInPointer, entries[1].weightsInPointer);
+    for (std::size_t i = 0; i < entries.size(); ++i)
+    {
+        auto const& entry = entries[i];
+        auto const expected = static_cast<float>(i + 1);
+        auto const in = reinterpret_cast<float const*>(entry.weightsInPointer);
+        auto const out = reinterpret_cast<float const*>(entry.weightsOutPointer);
+        for (SizeType32 j = 0; j < entry.inSize; ++j)
+        {
+            EXPECT_FLOAT_EQ(in[j], expected);
+        }
+        for (SizeType32 j = 0; j < entry.outSize; ++j)
+        {
+            EXPECT_FLOAT_EQ(out[j], expected);
+        }
+    }
+}
+
+TEST_F(LoraCacheTest, executionIdsRejectDuplicateModelDeclarations)
+{
+    ModelConfig modelConfig(0, 1, 1, 0, 1, 4, tensorrt_llm::DataType::kFLOAT);
+    WorldConfig worldConfig(1, 1, 1, 0);
+    modelConfig.setLoraModules({
+        LoraModule(LoraModule::ModuleType::kATTN_Q, 4, 4, false, true, -1, -1, 26),
+        LoraModule(LoraModule::ModuleType::kATTN_K, 8, 8, false, true, -1, -1, 26),
+    });
+    LoraCachePageManagerConfig pageConfig(MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 4, 4, 8, 8, 1);
+
+    EXPECT_THROW(LoraCache(pageConfig, modelConfig, worldConfig, *mManager), std::runtime_error);
+}
+
 TEST_F(LoraCacheTest, evictionPreservesCacheOnFailure)
 {
     LoraCachePageManagerConfig pageConfig(MemoryType::kCPU, tensorrt_llm::DataType::kFLOAT, 4, 4, 1, 64, 1);

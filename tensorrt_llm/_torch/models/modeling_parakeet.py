@@ -37,6 +37,7 @@ from ..model_config import ModelConfig
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
+from ..peft.lora.layer import LoraLayer
 
 EPSILON = 1e-5
 LOG_ZERO_GUARD_VALUE = 2**-24
@@ -363,12 +364,21 @@ class ParakeetProjection(nn.Module):
         self.linear1 = Linear(hidden_size, projection_hidden_size, bias=bias, dtype=dtype)
         self.linear2 = Linear(projection_hidden_size, llm_hidden_size, bias=bias, dtype=dtype)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, lora_params: Optional[dict] = None
+    ) -> torch.Tensor:
         hidden_states = self.norm(hidden_states)
-        hidden_states = self.linear1(hidden_states)
+        if not lora_params:
+            hidden_states = self.linear1(hidden_states)
+            hidden_states = torch.square(torch.nn.functional.relu(hidden_states))
+            return self.linear2(hidden_states)
+        input_shape = hidden_states.shape
+        hidden_states = self.linear1(
+            hidden_states.reshape(-1, input_shape[-1]), lora_params=lora_params, layer_idx=0
+        )
         hidden_states = torch.square(torch.nn.functional.relu(hidden_states))
-        hidden_states = self.linear2(hidden_states)
-        return hidden_states
+        hidden_states = self.linear2(hidden_states, lora_params=lora_params, layer_idx=0)
+        return hidden_states.reshape(*input_shape[:-1], hidden_states.shape[-1])
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +446,7 @@ class ParakeetConformerAttention(Attention):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_embeddings: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -448,7 +459,17 @@ class ParakeetConformerAttention(Attention):
         """
         B, T, C = hidden_states.shape
 
-        qkv = self.qkv_proj(hidden_states.reshape(-1, C))  # [B*T, (q+k+v)*d]
+        hidden_states_flat = hidden_states.reshape(-1, C)
+        if lora_params:
+            qkv = LoraLayer.forward_with_base(
+                lambda: self.qkv_proj(hidden_states_flat),
+                (self.splitted_qkv_lora, self.fused_qkv_lora),
+                hidden_states_flat,
+                lora_params,
+                self.layer_idx,
+            )
+        else:
+            qkv = self.qkv_proj(hidden_states_flat)
         q, k, v = self.split_qkv(qkv)  # each [B*T, H_rank*d]
 
         # Reshape to [B, H, T, d] for RPE computation
@@ -476,7 +497,9 @@ class ParakeetConformerAttention(Attention):
 
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=matrix_bd, scale=scale)
         attn_output = out.transpose(1, 2).reshape(B * T, self.q_size)
-        return self.o_proj(attn_output).reshape(B, T, C)
+        return self.o_proj(attn_output, lora_params=lora_params, layer_idx=self.layer_idx).reshape(
+            B, T, C
+        )
 
     def load_weights(self, weights: Dict[str, torch.Tensor], prefix: str = "") -> None:
         """Load checkpoint weights.
@@ -601,6 +624,7 @@ class ParakeetConformerBlock(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_embeddings: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         # 0.5 residual scaling on both FFN halves is part of the Conformer design.
@@ -611,6 +635,7 @@ class ParakeetConformerBlock(nn.Module):
             self.norm_self_att(hidden_states),
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
+            lora_params=lora_params,
         )
 
         hidden_states = hidden_states + self.conv(
@@ -665,6 +690,7 @@ class ParakeetEncoder(nn.Module):
         self,
         input_features: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         hidden_states = self.subsampling(input_features, attention_mask)
         hidden_states = hidden_states * self.input_scale
@@ -679,6 +705,7 @@ class ParakeetEncoder(nn.Module):
                 hidden_states,
                 attention_mask=attn_mask_4d,
                 position_embeddings=position_embeddings,
+                lora_params=lora_params,
             )
 
         return hidden_states
@@ -776,8 +803,13 @@ class ProjectedParakeet(nn.Module):
         self,
         input_features: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None,
+        connector_lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
-        return self.projection(self.encoder(input_features, attention_mask))
+        return self.projection(
+            self.encoder(input_features, attention_mask, lora_params=lora_params),
+            lora_params=connector_lora_params,
+        )
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         encoder_weights: Dict[str, torch.Tensor] = {}

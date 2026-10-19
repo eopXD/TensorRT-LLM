@@ -45,3 +45,45 @@ class DecoderLoraOwner:
         "language_model.encoder.layers",
         "decoder.layers",
     )
+
+
+@dataclass(frozen=True)
+class ComponentLoraTarget:
+    """One bound projection and its accepted HF checkpoint module names.
+
+    Checkpoint names exclude ``base_model.model`` and the LoRA tensor suffix.
+    Dimensions describe the unsharded weights; replicated targets use TP size one.
+    """
+
+    module_path: str
+    checkpoint_modules: tuple[str, ...]
+    layer_idx: int
+    module_type: str
+    execution_id: int
+    input_size: int
+    output_size: int
+    fused_output_sizes: tuple[int, ...] = ()
+    tp_size: int = 1
+    in_tp_split_dim: int = -1
+    out_tp_split_dim: int = -1
+
+
+@dataclass(frozen=True)
+class ComponentLoraOwner:
+    """An enrolled encoder or connector with concrete projection dimensions."""
+
+    name: str
+    module_path: str
+    targets: tuple[ComponentLoraTarget, ...]
+    dtype: str
+    max_rank: int
+    hf_prefixes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ComponentLoraRequest:
+    """Immutable adapter version and component contents selected by a request."""
+
+    task_id: int | None
+    revision: str
+    component_fingerprints: tuple[tuple[str, str], ...] = ()

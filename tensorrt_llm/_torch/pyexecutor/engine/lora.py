@@ -11,7 +11,7 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
-from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
+from tensorrt_llm._torch.peft.lora.ownership import ComponentLoraOwner, DecoderLoraOwner
 from tensorrt_llm._utils import torch_dtype_to_str
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
 from tensorrt_llm.inputs.registry import InputProcessor
@@ -82,6 +82,7 @@ def make_lora_model_config(
     swap_gate_up_proj_lora_b_weight: bool = True,
     *,
     owner: DecoderLoraOwner,
+    components: tuple[ComponentLoraOwner, ...] = (),
 ) -> LoraModelConfig:
     """Describe the model to the LoRA stack, for the engine to record."""
     return LoraModelConfig(
@@ -91,6 +92,7 @@ def make_lora_model_config(
         dtype=torch_dtype_to_str(model.config.torch_dtype),
         swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight,
         owner=owner,
+        components=components,
     )
 
 

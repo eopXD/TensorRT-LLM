@@ -11,6 +11,7 @@ from typing import (Any, Container, Dict, Hashable, Iterable, List, Optional,
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.peft.lora.ownership import ComponentLoraRequest
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
@@ -879,6 +880,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                                     None)
         self.py_end_id: Optional[int] = kwargs.pop("end_id", None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
+        self.py_component_lora_request: ComponentLoraRequest | None = kwargs.pop(
+            "py_component_lora_request", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
@@ -1608,6 +1611,8 @@ def executor_request_to_llm_request(
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
         py_lora_path=getattr(executor_request, "py_lora_path", None),
+        py_component_lora_request=getattr(executor_request,
+                                          "py_component_lora_request", None),
         return_log_probs=executor_request.output_config.return_log_probs,
         num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.

@@ -24,8 +24,10 @@ from tensorrt_llm._torch.models.modeling_multimodal_utils import _join_embedding
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_LORA_PROVENANCE_KEY,
     MultimodalParams,
     MultimodalRuntimeData,
+    multimodal_lora_fingerprint,
     strip_mm_encoder_inputs,
 )
 from tensorrt_llm.inputs.registry import (
@@ -441,6 +443,8 @@ class MultimodalItemScheduler:
                     item_metadata.item_refs,
                     item_metadata.output_embedding_lengths,
                     mm_data.get("mm_processor_kwargs_hash"),
+                    component_lora_request=getattr(request, "py_component_lora_request", None),
+                    multimodal_data=mm_data,
                 )
             )
         )
@@ -493,7 +497,11 @@ class MultimodalItemScheduler:
                     f"Scheduled MM request {request_id} has no encoder item state",
                     request_ids={request_id},
                 )
-            multimodal_param = MultimodalParams(multimodal_data=request.py_multimodal_data)
+            multimodal_param = MultimodalParams(
+                multimodal_data=request.py_multimodal_data,
+                component_lora_request=getattr(request, "py_component_lora_request", None),
+                mm_item_order=getattr(request, "py_mm_item_order", None),
+            )
             for item_idx in item_indices:
                 cache_key = state.item_cache_keys[item_idx]
                 if cache_key is None:
@@ -619,4 +627,7 @@ class MultimodalItemScheduler:
         # fusion boundary in the separate embedding-materialization follow-up.
         multimodal_data["multimodal_embedding"] = _join_embeddings(segments, start=start, end=end)
         multimodal_data["multimodal_embedding_is_chunk"] = True
+        multimodal_data[MULTIMODAL_LORA_PROVENANCE_KEY] = multimodal_lora_fingerprint(
+            getattr(request, "py_component_lora_request", None)
+        )
         return multimodal_data

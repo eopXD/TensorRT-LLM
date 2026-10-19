@@ -27,6 +27,7 @@ from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           TorchCompileConfig, TorchLlmArgs)
 
 # isort: split
+from tensorrt_llm.llmapi.llm_args import MultimodalEncoderSchedulingPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -42,6 +43,9 @@ from ..models.modeling_utils import DecoderModelForCausalLM, timing_metric
 from ..moe.expert_statistic import ExpertStatistic
 from ..moe.fused_moe.moe_comm_timeout_guard import set_moe_comm_warmup
 from ..moe.fused_moe.moe_load_balancer import MoeLoadBalancer
+from ..peft.lora.component_runtime import (ComponentLoraRuntime,
+                                           bind_component_lora)
+from ..peft.lora.ownership import ComponentLoraOwner
 from ..route_capture import ROUTE_CAPTURE_ATTR, RouteCapture
 from ..speculative import SpecMetadata, update_spec_config_from_loaded_model
 from ..speculative.utils import get_static_draft_len
@@ -73,7 +77,8 @@ from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest
 from .model_loader import ModelLoader, _construct_checkpoint_loader
-from .resource_manager import ResourceManager, ResourceManagerType
+from .resource_manager import (PeftCacheManager, ResourceManager,
+                               ResourceManagerType)
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
@@ -588,6 +593,8 @@ class PyTorchModelEngine(ModelEngine):
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._lora_owner: Optional[DecoderLoraOwner] = None
         self._lora_model: Optional[torch.nn.Module] = None
+        self._lora_components: tuple[ComponentLoraOwner, ...] | None = None
+        self._component_lora_runtime: ComponentLoraRuntime | None = None
         self._warmup_timer = _WarmupTimer(self.mapping.rank)
 
         self._model_caller = ModelCaller(
@@ -771,6 +778,7 @@ class PyTorchModelEngine(ModelEngine):
             metrics=self._metrics,
             kv_cache_manager_key=self.kv_cache_manager_key,
             mm_item_scheduler=self._mm_item_scheduler,
+            prepare_multimodal_lora=self.prepare_multimodal_lora,
             **runner_kwargs,
         )
 
@@ -853,6 +861,79 @@ class PyTorchModelEngine(ModelEngine):
         self.lora_model_config = lora_model_config
         if isinstance(self._runner, DecoderRunner):
             self._runner.lora_model_config = self.lora_model_config
+
+    def initialize_lora_components(
+            self, lora_config: LoraConfig) -> tuple[ComponentLoraOwner, ...]:
+        """Bind supported encoder projections before any adapter is loaded."""
+        if not lora_config.enable_multimodal_lora:
+            return ()
+        if self._lora_components is not None:
+            return self._lora_components
+        if self.mapping.world_size != 1:
+            raise ValueError(
+                "Multimodal LoRA currently requires TP1/PP1 on one rank")
+        mm_config = self.llm_args.multimodal_config
+        if mm_config.encoder_cuda_graph:
+            raise ValueError(
+                "Multimodal LoRA requires eager encoders; disable encoder_cuda_graph"
+            )
+        if mm_config.encoder_side_stream_max_ahead:
+            raise ValueError(
+                "Multimodal LoRA does not support encoder side-stream prefetch")
+        if mm_config.encoder_scheduling_policy == MultimodalEncoderSchedulingPolicy.EAGER:
+            raise ValueError(
+                "Multimodal LoRA does not support EAGER encoder scheduling")
+        if mm_config.video_pruning_rate is not None and mm_config.video_pruning_rate > 0:
+            raise ValueError(
+                "Multimodal LoRA does not support EVS video pruning")
+        if (self.llm_args.mm_encoder_only or self.llm_args.disable_mm_encoder
+                or self.llm_args.encode_only):
+            raise ValueError(
+                "Multimodal LoRA requires local encoder and decoder execution")
+        if self.prefill_cuda_graph_backend != PrefillCudaGraphBackend.DISABLED:
+            raise ValueError(
+                "Multimodal LoRA does not support prefill CUDA graphs")
+        if self.llm_args.torch_compile_config is not None:
+            raise ValueError("Multimodal LoRA does not support torch.compile")
+        configure = getattr(self.model, "configure_component_lora", None)
+        if configure is None:
+            raise ValueError(
+                f"{type(self.model).__name__} does not declare multimodal LoRA support"
+            )
+        components = bind_component_lora(self.model,
+                                         configure(lora_config.max_lora_rank))
+        if not components or any(owner.dtype != "bfloat16"
+                                 for owner in components):
+            raise ValueError(
+                "Multimodal LoRA requires declared BF16 encoder and connector targets"
+            )
+        self._lora_components = components
+        self._component_lora_runtime = ComponentLoraRuntime(components)
+        self.model._component_lora_runtime = self._component_lora_runtime
+        return components
+
+    def prepare_multimodal_lora(
+            self, requests: list[LlmRequest],
+            peft_cache_manager: PeftCacheManager | None) -> None:
+        """Make adapter weights resident before encoding request media."""
+        runtime = self._component_lora_runtime
+        if runtime is None:
+            return
+        requests = [
+            request for request in requests if request.py_multimodal_data
+        ]
+        if not requests:
+            runtime.bind_batch({}, torch.bfloat16)
+            return
+        if peft_cache_manager is None:
+            if any(request.lora_task_id is not None for request in requests):
+                raise RuntimeError(
+                    "Component adapters require an initialized PEFT cache")
+            runtime.bind_batch({}, torch.bfloat16)
+            return
+        table = peft_cache_manager.prepare_component_peft(requests)
+        runtime.bind_batch(
+            table, peft_cache_manager.data_type if table else torch.bfloat16)
 
     def _init_cuda_graph_lora_manager(self, lora_config: LoraConfig):
         """Build LoRA preparation state for the current executor resources."""
@@ -1140,11 +1221,15 @@ class PyTorchModelEngine(ModelEngine):
         # The runner, caller and scheduler retain the model, so
         # clearing the engine's attribute alone would leave the weights
         # reachable past `release_gc()` below.
+        if isinstance(self._runner, DecoderRunner):
+            self._runner._prepare_multimodal_lora = None
         self._runner = None
         self._model_caller = None
         self._mm_item_scheduler = None
         self._lora_model = None
         self._lora_owner = None
+        self._lora_components = None
+        self._component_lora_runtime = None
         self.model = None
 
         self.input_processor = None

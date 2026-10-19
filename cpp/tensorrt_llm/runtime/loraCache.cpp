@@ -494,13 +494,14 @@ LoraCache::LoraCache(LoraCachePageManagerConfig const& pageManagerConfig, ModelC
     , mModelConfig(modelConfig)
     , mWorldConfig(worldConfig)
 {
-    mCachePageManager = std::make_unique<LoraCachePageManager>(mPageManagerConfig, bufferManager);
-
-    auto modules = modelConfig.getLoraModules();
-    for (auto const& m : modules)
+    for (auto const& module : modelConfig.getLoraModules())
     {
-        mModuleIdToModule[m.value()] = m;
+        auto const executionId = module.executionId();
+        TLLM_CHECK_WITH_INFO(executionId >= 0, "LoRA execution ID must be nonnegative, got %d", executionId);
+        auto const inserted = mModuleIdToModule.emplace(executionId, module).second;
+        TLLM_CHECK_WITH_INFO(inserted, "Duplicate LoRA execution ID %d in model configuration", executionId);
     }
+    mCachePageManager = std::make_unique<LoraCachePageManager>(mPageManagerConfig, bufferManager);
 
     mBufferManager = std::make_unique<BufferManager>(std::make_shared<CudaStream>());
 

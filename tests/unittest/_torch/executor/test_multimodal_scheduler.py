@@ -346,6 +346,8 @@ def test_forward_multimodal_encoder_step_scopes_failure_to_item_owners():
     executor.enable_attention_dp = False
     executor.dist = SimpleNamespace(world_size=1)
     executor.model_engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
+    executor.model_engine.prepare_multimodal_lora = Mock()
+    executor.resource_manager = SimpleNamespace(get_resource_manager=lambda _: None)
     executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
 
     scheduled_requests = ScheduledRequests()
@@ -385,6 +387,8 @@ def test_forward_multimodal_encoder_step_contains_model_contract_error():
     executor.enable_attention_dp = False
     executor.dist = SimpleNamespace(world_size=1)
     executor.model_engine = engine
+    executor.model_engine.prepare_multimodal_lora = Mock()
+    executor.resource_manager = SimpleNamespace(get_resource_manager=lambda _: None)
     executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
 
     scheduled_requests = ScheduledRequests()
@@ -415,6 +419,8 @@ def test_forward_multimodal_encoder_step_contains_stale_schedule():
     executor.enable_attention_dp = False
     executor.dist = SimpleNamespace(world_size=1)
     executor.model_engine = engine
+    executor.model_engine.prepare_multimodal_lora = Mock()
+    executor.resource_manager = SimpleNamespace(get_resource_manager=lambda _: None)
     executor._handle_errors = lambda error_msg, **kwargs: handled.append((error_msg, kwargs))
 
     scheduled_requests = ScheduledRequests()
@@ -445,6 +451,8 @@ def test_forward_multimodal_encoder_step_propagates_system_errors():
     executor = object.__new__(PyExecutor)
     executor.active_requests = [failed]
     executor.model_engine = SimpleNamespace(forward_multimodal_encoder_items=fail_encoder)
+    executor.model_engine.prepare_multimodal_lora = Mock()
+    executor.resource_manager = SimpleNamespace(get_resource_manager=lambda _: None)
 
     scheduled_requests = ScheduledRequests()
     scheduled_requests.reset_context_requests([failed])
@@ -455,6 +463,34 @@ def test_forward_multimodal_encoder_step_propagates_system_errors():
 
     assert scheduled_requests.context_requests == [failed]
     assert scheduled_requests.scheduled_mm_encoder_items == {failed.request_id: [0]}
+
+
+@pytest.mark.cpu_only
+def test_encoder_step_prepares_adapters_for_selected_producers_before_forward():
+    selected = make_mm_request(1, [4])
+    deferred = make_mm_request(2, [4])
+    cache = object()
+    calls = []
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [deferred, selected]
+    executor.resource_manager = SimpleNamespace(get_resource_manager=lambda _: cache)
+    executor.model_engine = SimpleNamespace(
+        prepare_multimodal_lora=lambda requests, manager: calls.append(
+            ("prepare", requests, manager)
+        ),
+        forward_multimodal_encoder_items=lambda requests, items: calls.append(
+            ("forward", requests, items)
+        ),
+    )
+    scheduled = ScheduledRequests()
+    scheduled.scheduled_mm_encoder_items = {selected.request_id: [0]}
+
+    executor._forward_multimodal_encoder_step(scheduled)
+
+    assert calls == [
+        ("prepare", [selected], cache),
+        ("forward", executor.active_requests, scheduled.scheduled_mm_encoder_items),
+    ]
 
 
 def _executor_for_mm_admission(active_requests, *, max_batch_size=8, max_num_tokens=8):

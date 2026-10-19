@@ -917,6 +917,11 @@
       "path": "lora_config.cuda_graph_specialize_lora"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "lora_config.enable_multimodal_lora"
+    },
+    {
       "allowed_values": [
         "hf",
         "nemo"

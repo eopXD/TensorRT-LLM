@@ -52,6 +52,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_tok
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager,
     KVCacheManager,
+    PeftCacheManager,
     ResourceManager,
     ResourceManagerType,
 )
@@ -322,6 +323,9 @@ class DecoderRunner(ScheduledModelRunner):
     # Prompt tokens of the filler CUDA graph dummy requests, also the floor of
     # the longest one; None keeps the cache manager's default.
     _dummy_request_tokens: int | None = None
+    _prepare_multimodal_lora: Callable[[list[LlmRequest], PeftCacheManager | None], None] | None = (
+        None
+    )
 
     def __init__(
         self,
@@ -341,6 +345,8 @@ class DecoderRunner(ScheduledModelRunner):
         metrics: dict[str, float],
         kv_cache_manager_key: ResourceManagerType,
         mm_item_scheduler: MultimodalItemScheduler | None = None,
+        prepare_multimodal_lora: Callable[[list[LlmRequest], PeftCacheManager | None], None]
+        | None = None,
     ) -> None:
         self.model = model
         if config.compile_only_piecewise_graphs:
@@ -363,6 +369,7 @@ class DecoderRunner(ScheduledModelRunner):
         self._metrics = metrics
         self.kv_cache_manager_key = kv_cache_manager_key
         self._mm_item_scheduler = mm_item_scheduler
+        self._prepare_multimodal_lora = prepare_multimodal_lora
 
         self._config = config
 
@@ -3384,6 +3391,14 @@ class DecoderRunner(ScheduledModelRunner):
         Prepare inputs for Pytorch Model.
         """
 
+        if self._prepare_multimodal_lora is not None and scheduled_requests.num_context_requests:
+            peft_cache_manager = (
+                resource_manager.get_resource_manager(ResourceManagerType.PEFT_CACHE_MANAGER)
+                if resource_manager is not None
+                else None
+            )
+            self._prepare_multimodal_lora(scheduled_requests.context_requests, peft_cache_manager)
+
         new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
@@ -3534,6 +3549,7 @@ class DecoderRunner(ScheduledModelRunner):
                 multimodal_runtime=py_multimodal_runtime,
                 mm_item_order=getattr(request, "py_mm_item_order", None),
                 input_ids_start_offset=context_start_idx,
+                component_lora_request=getattr(request, "py_component_lora_request", None),
             )
             # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
             # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,

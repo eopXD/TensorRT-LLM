@@ -216,6 +216,7 @@ def _store_chunked_prefill_embeddings(
     )
     for param, embed_chunk in zip(valid_params, split_embeddings, strict=True):
         param.multimodal_data["multimodal_embedding"] = embed_chunk
+        param.mark_embedding_lora_provenance()
 
     logger.debug(
         f"Cached {len(split_embeddings)} multimodal embedding chunks in this iteration"
@@ -310,6 +311,7 @@ def get_multimodal_embeddings(
     # references after prefill, potentially before the asynchronous gather below has finished
     # reading them.
     for param in multimodal_params:
+        param.validate_embedding_lora_provenance()
         if param.encoder_event is not None:
             consumer_stream = torch.cuda.current_stream()
             consumer_stream.wait_event(param.encoder_event)
@@ -379,6 +381,7 @@ def get_attached_multimodal_embeddings(
         for param in multimodal_params)
     attached_embeddings = []
     for param in multimodal_params:
+        param.validate_embedding_lora_provenance()
         embeds = param.multimodal_data.get("multimodal_embedding")
         # No attached embedding for this request.
         if embeds is None:

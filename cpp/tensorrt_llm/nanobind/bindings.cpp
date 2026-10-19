@@ -251,10 +251,13 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("MOE_LATENT_FC2", tr::LoraModule::ModuleType::kMOE_LATENT_FC2);
 
     nb::class_<tr::LoraModule>(m, "LoraModule")
-        .def(nb::init<tr::LoraModule::ModuleType, SizeType32, SizeType32, bool, bool, SizeType32, SizeType32>(),
+        .def(nb::init<tr::LoraModule::ModuleType, SizeType32, SizeType32, bool, bool, SizeType32, SizeType32,
+                 std::optional<SizeType32>>(),
             nb::arg("module_type"), nb::arg("in_dim"), nb::arg("out_dim"), nb::arg("in_dim_first"),
-            nb::arg("out_dim_first"), nb::arg("in_tp_split_dim"), nb::arg("out_tp_split_dim"))
+            nb::arg("out_dim_first"), nb::arg("in_tp_split_dim"), nb::arg("out_tp_split_dim"),
+            nb::arg("execution_id") = std::nullopt)
         .def_prop_ro("module_type", &tr::LoraModule::name)
+        .def_prop_ro("execution_id", &tr::LoraModule::executionId)
         .def_prop_ro("in_dim", &tr::LoraModule::inDim)
         .def_prop_ro("out_dim", &tr::LoraModule::outDim)
         .def_prop_ro("in_dim_first", &tr::LoraModule::inDimFirst)

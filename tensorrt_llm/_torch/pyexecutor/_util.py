@@ -4171,6 +4171,21 @@ def create_py_executor_instance(
     peft_cache_manager = None
     if lora_config is not None:
         lora_owner = model_engine.initialize_lora_owner()
+        lora_components = model_engine.initialize_lora_components(lora_config)
+        if lora_components:
+            if is_disagg:
+                raise ValueError(
+                    "Multimodal LoRA does not support disaggregated serving")
+            supported_decoder_targets = model_engine.model.component_lora_decoder_targets
+            if not lora_config.lora_target_modules:
+                lora_config.lora_target_modules = list(
+                    supported_decoder_targets)
+            unsupported = set(lora_config.lora_target_modules) - set(
+                supported_decoder_targets)
+            if unsupported:
+                raise ValueError(
+                    f"Unsupported decoder targets for multimodal LoRA: {sorted(unsupported)}"
+                )
         # TODO: Refactor dimension resolution into a LoraModuleDimensions
         # dataclass to avoid ad-hoc getattr + TP-division blocks per model type.
         from tensorrt_llm.bindings import LoraModule
@@ -4179,7 +4194,9 @@ def create_py_executor_instance(
         if len(lora_config.lora_dir) == 1:
             # Route to appropriate loader based on checkpoint source
             initial_lora_data_type = _get_initial_lora_data_type(
-                load_torch_lora(lora_config, owner=lora_owner))
+                load_torch_lora(lora_config,
+                                owner=lora_owner,
+                                components=lora_components))
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -4189,6 +4206,11 @@ def create_py_executor_instance(
 
         model_binding_config = model_engine.model.model_config.get_bindings_model_config(
             is_disagg=is_disagg)
+        if any(target.layer_idx >= model_binding_config.num_lora_layers()
+               for owner in lora_components for target in owner.targets):
+            raise ValueError(
+                "Multimodal LoRA component layer indices exceed the cache layer capacity"
+            )
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
@@ -4277,6 +4299,25 @@ def create_py_executor_instance(
             mamba_inner_size=mamba_inner_size,
             moe_latent_size=moe_latent_size)
 
+        if lora_components:
+            from tensorrt_llm._torch.peft.lora.manager import LoraManager
+            from tensorrt_llm.bindings import LoraModuleType
+            component_modules = {}
+            for owner in lora_components:
+                for target in owner.targets:
+                    if target.execution_id not in component_modules:
+                        component_modules[target.execution_id] = LoraModule(
+                            LoraModuleType(LoraManager.LORA_MODULE_IDS[
+                                target.module_type]),
+                            target.input_size,
+                            target.output_size,
+                            False,
+                            True,
+                            target.in_tp_split_dim,
+                            target.out_tp_split_dim,
+                            execution_id=target.execution_id)
+            lora_modules.extend(component_modules.values())
+
         model_binding_config.use_lora_plugin = True
         model_binding_config.lora_modules = lora_modules
         model_binding_config.max_lora_rank = lora_config.max_lora_rank
@@ -4286,6 +4327,7 @@ def create_py_executor_instance(
             pretrained_config,
             target_modules + lora_config.missing_qkv_modules,
         )
+        num_lora_modules += sum(len(owner.targets) for owner in lora_components)
 
         peft_cache_config_model = PeftCacheConfig(
         ) if peft_cache_config is None else peft_cache_config
@@ -4310,6 +4352,7 @@ def create_py_executor_instance(
             lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight,
             owner=lora_owner,
+            components=lora_components,
         )
         model_engine.set_lora_model_config(lora_model_config)
         peft_cache_manager = PeftCacheManager(

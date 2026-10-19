@@ -237,6 +237,7 @@ class LoraLayer(torch.nn.Module):
         super().__init__()
 
         self.lora_module_types = lora_module_types
+        self.execution_module_ids: tuple[int, ...] | None = None
         self.output_hidden_sizes = output_hidden_sizes
         assert len(lora_module_types) == len(output_hidden_sizes)
 
@@ -334,6 +335,9 @@ class LoraLayer(torch.nn.Module):
                     f"LoRA input dtype {input_dtype} must match PEFT cache dtype "
                     f"{data_type}.")
 
+        input_shape = x.shape
+        if self.execution_module_ids is not None:
+            x = x.reshape(-1, x.shape[-1])
         use_cuda_graph_mode = lora_params.get("use_cuda_graph_mode", False)
         if use_cuda_graph_mode:
             result = self._forward_cuda_graph_mode(x, lora_params, layer_idx)
@@ -342,6 +346,9 @@ class LoraLayer(torch.nn.Module):
 
         if isinstance(result, torch.Tensor) and result.dtype != input_dtype:
             result = result.to(input_dtype)
+        if isinstance(result,
+                      torch.Tensor) and self.execution_module_ids is not None:
+            result = result.reshape(*input_shape[:-1], result.shape[-1])
         return result
 
     def prepare_grouped_gemm_buffers(self, input: GroupedGemmParamsInput):
@@ -733,14 +740,17 @@ class LoraLayer(torch.nn.Module):
         lora_ranks = []
         lora_weight_pointers = []
         active_lora_module_ids = []
+        active_output_sizes = []
 
         # Check if this layer has any LoRA weights
         layer_params = lora_params.get(layer_idx, {})
 
-        for module_idx in self.lora_module_types:
+        module_ids = self.execution_module_ids or self.lora_module_types
+        for output_idx, module_idx in enumerate(module_ids):
             module_idx = int(module_idx)
             if module_idx in layer_params:
                 active_lora_module_ids.append(module_idx)
+                active_output_sizes.append(self.output_hidden_sizes[output_idx])
                 lora_ranks.append(layer_params[module_idx]['adapter_size'])
                 lora_weight_pointers.append(
                     layer_params[module_idx]['weight_pointers'])
@@ -756,7 +766,7 @@ class LoraLayer(torch.nn.Module):
                 lora_ranks,
                 lora_weight_pointers,
                 lora_params['prompt_lens_cpu'][:num_seqs],
-                self.output_hidden_sizes,
+                active_output_sizes,
                 False,  # transA
                 True,  # transB
                 max([r.max() for r in lora_ranks]),
@@ -764,25 +774,21 @@ class LoraLayer(torch.nn.Module):
                 True,  # TODO smor- should be lora_params["remove_input_padding"], support in loraOp as well
             )
             if isinstance(lora_outputs, torch.Tensor):
-                return lora_outputs
-            else:
-                # For multiple LoRA modules, some might not be executed in grouped gemm.
-                # For those modules not executed, we create zero tensors with matching dimensions.
-                # Finally we concatenate all tensors (both LoRA outputs and zero tensors) in order.
-                lora_output = []
-                for module_idx in self.lora_module_types:
-                    if int(module_idx) in active_lora_module_ids:
-                        lora_output.append(lora_outputs.pop(0))
-                    else:
-                        lora_output.append(
-                            torch.zeros(list(x.shape[:-1]) + [
-                                self.output_hidden_sizes[
-                                    self.lora_module_types.index(module_idx)]
-                            ],
-                                        dtype=x.dtype,
-                                        device=x.device))
-                lora_output = torch.cat(lora_output, dim=-1)
-                return lora_output
+                if len(active_lora_module_ids) == len(module_ids):
+                    return lora_outputs
+                lora_outputs = list(
+                    lora_outputs.split(active_output_sizes, dim=-1))
+            lora_output = []
+            for output_idx, module_idx in enumerate(module_ids):
+                if int(module_idx) in active_lora_module_ids:
+                    lora_output.append(lora_outputs.pop(0))
+                else:
+                    lora_output.append(
+                        torch.zeros((*x.shape[:-1],
+                                     self.output_hidden_sizes[output_idx]),
+                                    dtype=x.dtype,
+                                    device=x.device))
+            return torch.cat(lora_output, dim=-1)
 
 
 class _LoraGroupedGemmRunner(TunableRunner):

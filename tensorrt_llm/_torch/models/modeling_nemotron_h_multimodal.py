@@ -57,7 +57,8 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from ..peft.lora.config import LoraConfig
-from ..peft.lora.ownership import DecoderLoraOwner
+from ..peft.lora.layer import LoraLayer, LoraModuleType
+from ..peft.lora.ownership import ComponentLoraOwner, ComponentLoraTarget, DecoderLoraOwner
 from ..speculative import SpecMetadata
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_mixin import (
@@ -80,6 +81,7 @@ from .modeling_radio import RADIOVisionModel, calc_seq_lens
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.peft.lora.component_runtime import ComponentLoraRuntime
     from tensorrt_llm.llmapi.llm_args import (
         MultimodalConfig,
         MultimodalEncoderCudaGraphConfig,
@@ -464,6 +466,49 @@ class SquaredReLU(nn.Module):
         return torch.pow(torch.nn.functional.relu(x), 2)
 
 
+class _NemotronVisionProjection(nn.Sequential):
+    """Preserve checkpoint indices while adapting the two connector linears."""
+
+    def __init__(self, projection: nn.Sequential):
+        super().__init__(*projection.children())
+        self.linear1_lora = LoraLayer([LoraModuleType.MLP_H_TO_4H], [self[1].out_features])
+        self.linear2_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H], [self[3].out_features])
+        self.train(projection.training)
+
+    def forward(self, hidden_states: torch.Tensor, lora_params: dict | None = None) -> torch.Tensor:
+        hidden_states = self[0](hidden_states)
+        if not lora_params:
+            return self[3](self[2](self[1](hidden_states)))
+        input_shape = hidden_states.shape
+        hidden_states = hidden_states.reshape(-1, input_shape[-1])
+        linear1_input = hidden_states
+        hidden_states = LoraLayer.forward_with_base(
+            lambda: self[1](linear1_input), (self.linear1_lora,), linear1_input, lora_params, 0
+        )
+        hidden_states = self[2](hidden_states)
+        linear2_input = hidden_states
+        hidden_states = LoraLayer.forward_with_base(
+            lambda: self[3](linear2_input), (self.linear2_lora,), linear2_input, lora_params, 0
+        )
+        return hidden_states.reshape(*input_shape[:-1], hidden_states.shape[-1])
+
+
+def _component_lora_parameters(
+    runtime: "ComponentLoraRuntime | None",
+    component: str,
+    task_ids: Sequence[int | None],
+    lengths: Sequence[int],
+) -> dict | None:
+    if runtime is None:
+        return None
+    return runtime.parameters(component, list(zip(task_ids, lengths, strict=True)))
+
+
+def _component_lora_task_id(param: MultimodalParams) -> int | None:
+    request = param.component_lora_request
+    return request.task_id if request is not None else None
+
+
 _RADIO_BLOCKS = "vision_model.radio_model.model.blocks."
 _RADIO_PATCH_GEN = "vision_model.radio_model.model.patch_generator."
 
@@ -719,7 +764,14 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
             x = x.permute(0, 2, 1, 3).contiguous()
         return x
 
-    def extract_feature(self, pixel_values, num_frames=None):
+    def extract_feature(
+        self,
+        pixel_values,
+        num_frames=None,
+        *,
+        component_lora_runtime: "ComponentLoraRuntime | None" = None,
+        task_ids: Sequence[int | None] = (),
+    ):
         """Extract vision features, optionally with temporal compression.
 
         Args:
@@ -739,17 +791,46 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         vit_embeds_lst = []
         for i in range(0, n, micro_batch_size):
             micro_batch_pixel_values = pixel_values[i : i + micro_batch_size]
+            lora_kwargs = {}
+            sequence_task_ids = []
+            if component_lora_runtime is not None:
+                micro_task_ids = task_ids[i : i + micro_batch_size]
+                if len(micro_task_ids) != micro_batch_pixel_values.shape[0]:
+                    raise ValueError("Vision LoRA routing must identify every image tile")
+                for start in range(0, len(micro_task_ids), T):
+                    tubelet_tasks = micro_task_ids[start : start + T]
+                    if any(task_id != tubelet_tasks[0] for task_id in tubelet_tasks):
+                        raise ValueError("A video tubelet cannot contain different LoRA requests")
+                    sequence_task_ids.append(tubelet_tasks[0])
+                num_skip = self.vision_model.radio_model.model.patch_generator.num_skip
+                lora_kwargs["lora_params"] = _component_lora_parameters(
+                    component_lora_runtime,
+                    "vision",
+                    sequence_task_ids,
+                    [H_patches * W_patches + num_skip] * len(sequence_task_ids),
+                )
             if num_frames is not None and T > 1:
                 vit_embeds = self.vision_model(
-                    micro_batch_pixel_values, num_frames=micro_batch_pixel_values.shape[0]
+                    micro_batch_pixel_values,
+                    num_frames=micro_batch_pixel_values.shape[0],
+                    **lora_kwargs,
                 )
             else:
-                vit_embeds = self.vision_model(micro_batch_pixel_values)
+                vit_embeds = self.vision_model(micro_batch_pixel_values, **lora_kwargs)
             # Down-sampling and projection.
             vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], H_patches, W_patches, -1)
             vit_embeds = self.pixel_shuffle(vit_embeds, scale_factor=self.downsample_ratio)
             vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1, vit_embeds.shape[-1])
-            vit_embeds = self.mlp1(vit_embeds)
+            if component_lora_runtime is None:
+                vit_embeds = self.mlp1(vit_embeds)
+            else:
+                connector_params = _component_lora_parameters(
+                    component_lora_runtime,
+                    "vision_connector",
+                    sequence_task_ids,
+                    [vit_embeds.shape[1]] * len(sequence_task_ids),
+                )
+                vit_embeds = self.mlp1(vit_embeds, lora_params=connector_params)
             vit_embeds_lst.append(vit_embeds)
         vit_embeds = torch.cat(vit_embeds_lst, dim=0)
         return vit_embeds
@@ -805,12 +886,36 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         return DynamicResolutionImageTiler.stack(processed, self.patch_size).to(target_dtype)
 
     def extract_feature_dynamic(
-        self, pixel_values_flat: torch.Tensor, image_sizes: List[Tuple[int, int]]
+        self,
+        pixel_values_flat: torch.Tensor,
+        image_sizes: List[Tuple[int, int]],
+        *,
+        component_lora_runtime: "ComponentLoraRuntime | None" = None,
+        task_ids: Sequence[int | None] = (),
     ) -> torch.Tensor:
         """Dynamic resolution feature extraction for variable-size images."""
-        vit_embeds = self.vision_model(pixel_values_flat, image_sizes=image_sizes)
+        lora_kwargs = {}
+        image_tokens = calc_seq_lens(image_sizes, self.patch_size)
+        if component_lora_runtime is not None:
+            num_skip = self.vision_model.radio_model.model.patch_generator.num_skip
+            lora_kwargs["lora_params"] = _component_lora_parameters(
+                component_lora_runtime,
+                "vision",
+                task_ids,
+                [length + num_skip for length in image_tokens],
+            )
+        vit_embeds = self.vision_model(pixel_values_flat, image_sizes=image_sizes, **lora_kwargs)
         vit_embeds = self.pixel_shuffle_dynamic_res(vit_embeds, image_sizes=image_sizes)
-        vit_embeds = self.mlp1(vit_embeds)
+        if component_lora_runtime is None:
+            vit_embeds = self.mlp1(vit_embeds)
+        else:
+            connector_params = _component_lora_parameters(
+                component_lora_runtime,
+                "vision_connector",
+                task_ids,
+                [round(length * self.downsample_ratio**2) for length in image_tokens],
+            )
+            vit_embeds = self.mlp1(vit_embeds, lora_params=connector_params)
         return vit_embeds
 
     def apply_evs_per_video(
@@ -894,7 +999,10 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         return mm_embedding_evs, num_tokens_in_videos
 
     def forward(
-        self, multimodal_params: List[MultimodalParams]
+        self,
+        multimodal_params: List[MultimodalParams],
+        *,
+        component_lora_runtime: "ComponentLoraRuntime | None" = None,
     ) -> Tuple[List[torch.Tensor], List[List[int] | None]]:
         # Group each param into one of three encoder sub-paths and call
         # each encoder once over its bucket. RADIO's temporal path packs
@@ -908,8 +1016,9 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
             "fixed_tile": [],
             "video_temporal": [],
         }
+        task_buckets: dict[str, list[int | None]] = {name: [] for name in buckets}
         plan: List[str] = []
-        for multimodal_data in multimodal_data_list:
+        for param, multimodal_data in zip(multimodal_params, multimodal_data_list):
             # This encoder emits one row per param, so a mixed image+video
             # param has no place to route. `_encode_vision` (mixin path)
             # splits mixed params into virtual per-modality params before
@@ -934,12 +1043,24 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
                 )
             plan.append(modality)
             buckets[modality].append(data)
+            if component_lora_runtime is not None:
+                task_buckets[modality].append(_component_lora_task_id(param))
 
-        outputs_by_modality: Dict[str, List[torch.Tensor]] = {
-            "dynamic_image": self._encode_dynamic_image(buckets["dynamic_image"]),
-            "fixed_tile": self._encode_fixed_tile(buckets["fixed_tile"]),
-            "video_temporal": self._encode_temporal_video(buckets["video_temporal"]),
-        }
+        outputs_by_modality: Dict[str, List[torch.Tensor]] = {}
+        for modality, encode_fn in (
+            ("dynamic_image", self._encode_dynamic_image),
+            ("fixed_tile", self._encode_fixed_tile),
+            ("video_temporal", self._encode_temporal_video),
+        ):
+            kwargs = (
+                {}
+                if component_lora_runtime is None
+                else {
+                    "component_lora_runtime": component_lora_runtime,
+                    "task_ids": task_buckets[modality],
+                }
+            )
+            outputs_by_modality[modality] = encode_fn(buckets[modality], **kwargs)
         # Reassemble in input order. Each modality's output list is in
         # input-param order (helpers preserve it), so an independent
         # cursor per modality suffices.
@@ -953,7 +1074,13 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         mm_embedding = [embed.reshape(-1, self.llm_hidden_size) for embed in mm_embedding]
         return mm_embedding, num_tokens_in_videos
 
-    def _encode_dynamic_image(self, image_data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
+    def _encode_dynamic_image(
+        self,
+        image_data_list: List[Dict[str, Any]],
+        *,
+        component_lora_runtime: "ComponentLoraRuntime | None" = None,
+        task_ids: Sequence[int | None] = (),
+    ) -> List[torch.Tensor]:
         """Encode all dynamic-resolution image requests in a single ViT forward.
 
         Returns one 3-D embedding tensor per request, in input order.
@@ -978,7 +1105,15 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
 
         # `extract_feature_dynamic` concatenates per-image embeddings along
         # dim=1, so we split by cumulative per-request post-shuffle token count.
-        batched_embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes)
+        kwargs = {}
+        if component_lora_runtime is not None:
+            image_task_ids = [
+                task_id
+                for task_id, count in zip(task_ids, images_per_request, strict=True)
+                for _ in range(count)
+            ]
+            kwargs = {"component_lora_runtime": component_lora_runtime, "task_ids": image_task_ids}
+        batched_embeds = self.extract_feature_dynamic(pixel_values_flat, image_sizes, **kwargs)
         scale_squared = self.downsample_ratio**2
         per_image_token_counts = [
             round(seq_len * scale_squared)
@@ -991,7 +1126,13 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
             cursor += n_images
         return list(torch.split(batched_embeds, per_request_token_counts, dim=1))
 
-    def _encode_fixed_tile(self, data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
+    def _encode_fixed_tile(
+        self,
+        data_list: List[Dict[str, Any]],
+        *,
+        component_lora_runtime: "ComponentLoraRuntime | None" = None,
+        task_ids: Sequence[int | None] = (),
+    ) -> List[torch.Tensor]:
         """Encode all fixed-tile requests (images + T==1 videos) in a single ViT forward.
 
         Returns one 3-D embedding tensor per request, in input order.
@@ -1000,10 +1141,24 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
             return []
         pixel_values = torch.cat([data["pixel_values"] for data in data_list], dim=0)
         patches_per_request = [data["pixel_values"].shape[0] for data in data_list]
-        batched_embeds = self.extract_feature(pixel_values)
+        kwargs = {}
+        if component_lora_runtime is not None:
+            tile_task_ids = [
+                task_id
+                for task_id, count in zip(task_ids, patches_per_request, strict=True)
+                for _ in range(count)
+            ]
+            kwargs = {"component_lora_runtime": component_lora_runtime, "task_ids": tile_task_ids}
+        batched_embeds = self.extract_feature(pixel_values, **kwargs)
         return list(torch.split(batched_embeds, patches_per_request, dim=0))
 
-    def _encode_temporal_video(self, video_data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
+    def _encode_temporal_video(
+        self,
+        video_data_list: List[Dict[str, Any]],
+        *,
+        component_lora_runtime: "ComponentLoraRuntime | None" = None,
+        task_ids: Sequence[int | None] = (),
+    ) -> List[torch.Tensor]:
         """Encode all temporal video requests, batching same-shape videos in one ViT pass.
 
         Each video contributes ``t * num_tiles_per_frame`` input tiles. Videos that
@@ -1048,9 +1203,17 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
         # per-video call so `forward_video`'s end-padding stays inside the
         # video. The remaining videos are grouped by frame shape and dtype.
         aligned_groups: Dict[Tuple, List[int]] = {}
-        for i, (_, _, frames_tensor, t, p) in enumerate(entries):
+        for i, (request_idx, _, frames_tensor, t, p) in enumerate(entries):
             if T > 1 and (t * p) % T != 0:
-                vit_embeds = self.extract_feature(frames_tensor, num_frames=t)
+                kwargs = (
+                    {}
+                    if component_lora_runtime is None
+                    else {
+                        "component_lora_runtime": component_lora_runtime,
+                        "task_ids": [task_ids[request_idx]] * frames_tensor.shape[0],
+                    }
+                )
+                vit_embeds = self.extract_feature(frames_tensor, num_frames=t, **kwargs)
                 per_video_outputs[i] = vit_embeds.reshape(-1, vit_embeds.shape[-1])
                 continue
             key = (frames_tensor.shape[-2], frames_tensor.shape[-1], p, frames_tensor.dtype)
@@ -1061,7 +1224,17 @@ class NemotronHVisionEncoder(transformers.PreTrainedModel):
             per_video_tile_counts = [entries[i][2].shape[0] for i in idxs]
             # `num_frames` is a non-None flag enabling the temporal path; the
             # actual per-tubelet grouping uses `T` and the cat tensor's shape.
-            vit_embeds = self.extract_feature(cat_frames, num_frames=cat_frames.shape[0])
+            kwargs = (
+                {}
+                if component_lora_runtime is None
+                else {
+                    "component_lora_runtime": component_lora_runtime,
+                    "task_ids": [
+                        task_ids[entries[i][0]] for i in idxs for _ in range(entries[i][2].shape[0])
+                    ],
+                }
+            )
+            vit_embeds = self.extract_feature(cat_frames, num_frames=cat_frames.shape[0], **kwargs)
             per_video_tubelet_counts = [n // T if T > 1 else n for n in per_video_tile_counts]
             chunks = torch.split(vit_embeds, per_video_tubelet_counts, dim=0)
             for i, chunk in zip(idxs, chunks):
@@ -2867,6 +3040,189 @@ _NEMOTRON_H_MM_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
 class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedModel):
     _supports_flash_attn = True
     lora_owner = DecoderLoraOwner(module_path="language_model")
+    component_lora_decoder_targets = (
+        "attn_q",
+        "attn_k",
+        "attn_v",
+        "attn_dense",
+        "mamba_in_proj",
+        "mamba_out_proj",
+    )
+
+    def configure_component_lora(self, max_lora_rank: int) -> tuple[ComponentLoraOwner, ...]:
+        """Declare the BF16 Nano-Omni-30B native towers and connectors."""
+        if hasattr(self, "_component_lora_owners"):
+            return self._component_lora_owners
+        config = self._mm_model_config.pretrained_config
+        sound_config = getattr(config, "sound_config", None)
+        if (
+            "NemotronH_Nano_Omni_Reasoning_V3" not in (config.architectures or [])
+            or config.torch_dtype != torch.bfloat16
+            or (
+                self._mm_model_config.quant_config is not None
+                and self._mm_model_config.quant_config.quant_algo is not None
+            )
+            or config.llm_config.hidden_size != 2688
+            or config.llm_config.num_hidden_layers != 52
+            or config.vit_hidden_size != 1280
+            or config.projector_hidden_size != 20480
+            or sound_config is None
+            or sound_config.hidden_size != 1024
+            or sound_config.num_hidden_layers != 24
+            or sound_config.num_attention_heads != 8
+            or sound_config.projection_hidden_size != 4096
+            or self.vision_encoder is None
+            or self.sound_encoder is None
+        ):
+            raise ValueError(
+                "Component LoRA requires the BF16 Nemotron Nano-Omni-30B configuration"
+            )
+        vision = self.vision_encoder.vision_model.radio_model.model
+        if len(vision.blocks) != 32 or vision.embed_dim != 1280:
+            raise ValueError("Component LoRA requires the native 32-block RADIO-H vision tower")
+
+        vision_targets = []
+        for layer_idx, block in enumerate(vision.blocks):
+            attention = block.attn
+            prefix = f"vision_model.radio_model.model.blocks.{layer_idx}.attn"
+            modelopt_prefix = f"vision_model.encoder.layer.{layer_idx}.attention"
+            for module_type, projection, modelopt_projection, output_size in (
+                ("attn_q", "q_proj", "query", attention.q_size),
+                ("attn_k", "k_proj", "key", attention.kv_size),
+                ("attn_v", "v_proj", "value", attention.kv_size),
+            ):
+                vision_targets.append(
+                    ComponentLoraTarget(
+                        module_path=f"blocks.{layer_idx}.attn.splitted_qkv_lora",
+                        checkpoint_modules=(
+                            f"{prefix}.{projection}",
+                            f"{modelopt_prefix}.{modelopt_projection}",
+                        ),
+                        layer_idx=layer_idx,
+                        module_type=module_type,
+                        execution_id=-1,
+                        input_size=attention.hidden_size,
+                        output_size=output_size,
+                    )
+                )
+            vision_targets.extend(
+                (
+                    ComponentLoraTarget(
+                        module_path=f"blocks.{layer_idx}.attn.fused_qkv_lora",
+                        checkpoint_modules=(f"{prefix}.qkv", f"{prefix}.qkv_proj"),
+                        layer_idx=layer_idx,
+                        module_type="attn_qkv",
+                        execution_id=-1,
+                        input_size=attention.hidden_size,
+                        output_size=attention.q_size + 2 * attention.kv_size,
+                        fused_output_sizes=(attention.q_size, attention.kv_size, attention.kv_size),
+                    ),
+                    ComponentLoraTarget(
+                        module_path=f"blocks.{layer_idx}.attn.o_lora",
+                        checkpoint_modules=(
+                            f"{prefix}.proj",
+                            f"{prefix}.o_proj",
+                            f"{modelopt_prefix}.output.dense",
+                        ),
+                        layer_idx=layer_idx,
+                        module_type="attn_dense",
+                        execution_id=-1,
+                        input_size=attention.q_size,
+                        output_size=attention.hidden_size,
+                    ),
+                )
+            )
+
+        audio_targets = []
+        for layer_idx, block in enumerate(self.sound_encoder.encoder.layers):
+            attention = block.self_attn
+            for module_type, projection, lora_name, output_size in (
+                ("attn_q", "q_proj", "splitted_qkv_lora", attention.q_size),
+                ("attn_k", "k_proj", "splitted_qkv_lora", attention.kv_size),
+                ("attn_v", "v_proj", "splitted_qkv_lora", attention.kv_size),
+                ("attn_dense", "o_proj", "o_lora", attention.hidden_size),
+            ):
+                audio_targets.append(
+                    ComponentLoraTarget(
+                        module_path=f"layers.{layer_idx}.self_attn.{lora_name}",
+                        checkpoint_modules=(
+                            f"sound_encoder.encoder.layers.{layer_idx}.self_attn.{projection}",
+                        ),
+                        layer_idx=layer_idx,
+                        module_type=module_type,
+                        execution_id=-1,
+                        input_size=attention.hidden_size,
+                        output_size=output_size,
+                    )
+                )
+
+        self.vision_encoder.mlp1 = _NemotronVisionProjection(self.vision_encoder.mlp1)
+        vision_connector_targets = []
+        audio_connector_targets = []
+        for index, name, module_type, semantic_type in (
+            (1, "linear1", "mlp_h_to_4h", LoraModuleType.MLP_H_TO_4H),
+            (3, "linear2", "mlp_4h_to_h", LoraModuleType.MLP_4H_TO_H),
+        ):
+            vision_linear = self.vision_encoder.mlp1[index]
+            vision_connector_targets.append(
+                ComponentLoraTarget(
+                    module_path=f"{name}_lora",
+                    checkpoint_modules=(f"mlp1.{index}", f"vision_projector.mlp1.{name}"),
+                    layer_idx=0,
+                    module_type=module_type,
+                    execution_id=-1,
+                    input_size=vision_linear.in_features,
+                    output_size=vision_linear.out_features,
+                )
+            )
+            audio_linear = getattr(self.sound_encoder.projection, name)
+            audio_linear.lora = LoraLayer([semantic_type], [audio_linear.out_features])
+            audio_connector_targets.append(
+                ComponentLoraTarget(
+                    module_path=f"{name}.lora",
+                    checkpoint_modules=(f"sound_projection.{name}",),
+                    layer_idx=0,
+                    module_type=module_type,
+                    execution_id=-1,
+                    input_size=audio_linear.in_features,
+                    output_size=audio_linear.out_features,
+                )
+            )
+        self._component_lora_owners = (
+            ComponentLoraOwner(
+                "vision",
+                "vision_encoder.vision_model.radio_model.model",
+                tuple(vision_targets),
+                "bfloat16",
+                max_lora_rank,
+                ("vision_model",),
+            ),
+            ComponentLoraOwner(
+                "audio",
+                "sound_encoder.encoder",
+                tuple(audio_targets),
+                "bfloat16",
+                max_lora_rank,
+                ("sound_encoder",),
+            ),
+            ComponentLoraOwner(
+                "vision_connector",
+                "vision_encoder.mlp1",
+                tuple(vision_connector_targets),
+                "bfloat16",
+                max_lora_rank,
+                ("mlp1", "vision_projector"),
+            ),
+            ComponentLoraOwner(
+                "audio_connector",
+                "sound_encoder.projection",
+                tuple(audio_connector_targets),
+                "bfloat16",
+                max_lora_rank,
+                ("sound_projection",),
+            ),
+        )
+        return self._component_lora_owners
 
     def __init__(self, model_config: ModelConfig):
         config = model_config.pretrained_config
@@ -3239,7 +3595,12 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
         return input_ids
 
-    def _encode_audio(self, audio_data_list: List[dict]) -> List[Tuple[torch.Tensor, List[int]]]:
+    def _encode_audio(
+        self,
+        audio_data_list: List[dict],
+        *,
+        task_ids: Sequence[int | None] = (),
+    ) -> List[Tuple[torch.Tensor, List[int]]]:
         """Encode a batch of audio feature dicts in a single ``sound_encoder`` call.
 
         Inputs may have different time dimensions (variable mel-feature
@@ -3272,12 +3633,37 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         all_features = torch.cat(padded_features, dim=0)
         all_masks = torch.cat(padded_masks, dim=0)
 
-        sound_embeds = self.sound_encoder(all_features, all_masks)
+        component_runtime = getattr(self, "_component_lora_runtime", None)
+        lora_kwargs = {}
+        valid_output_lens = None
+        if component_runtime is not None:
+            physical_output_length = int(
+                self.sound_encoder.encoder._get_subsampling_output_length(
+                    torch.tensor([all_features.shape[1]], dtype=torch.int32)
+                ).item()
+            )
+            valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
+                all_masks.sum(dim=1)
+            ).tolist()
+            clip_task_ids = [
+                task_id
+                for task_id, count in zip(task_ids, clips_per_input, strict=True)
+                for _ in range(count)
+            ]
+            segments = []
+            for task_id, length in zip(clip_task_ids, valid_output_lens, strict=True):
+                segments.extend(((task_id, length), (None, physical_output_length - length)))
+            lora_kwargs = {
+                "lora_params": component_runtime.parameters("audio", segments),
+                "connector_lora_params": component_runtime.parameters("audio_connector", segments),
+            }
+        sound_embeds = self.sound_encoder(all_features, all_masks, **lora_kwargs)
 
-        valid_input_lens = all_masks.sum(dim=1)
-        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
-            valid_input_lens
-        ).tolist()
+        if valid_output_lens is None:
+            valid_input_lens = all_masks.sum(dim=1)
+            valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
+                valid_input_lens
+            ).tolist()
 
         per_clip_embeds: List[torch.Tensor] = []
         per_clip_counts: List[int] = []
@@ -3371,12 +3757,17 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         encoder_fn feeds views of its own modality.
         """
         return MultimodalParams(
-            multimodal_data={"modality_type": modality, modality: param.multimodal_data[modality]}
+            multimodal_data={"modality_type": modality, modality: param.multimodal_data[modality]},
+            component_lora_request=param.component_lora_request,
         )
 
     def _encode_image_group(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         """Image group encoder_fn: one `vision_encoder` call over image items."""
-        embeds, _ = self.vision_encoder([self._vision_view(p, "image") for p in multimodal_params])
+        component_runtime = getattr(self, "_component_lora_runtime", None)
+        kwargs = {} if component_runtime is None else {"component_lora_runtime": component_runtime}
+        embeds, _ = self.vision_encoder(
+            [self._vision_view(p, "image") for p in multimodal_params], **kwargs
+        )
         return torch.cat(embeds, dim=0)
 
     def _encode_video_group(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
@@ -3388,12 +3779,25 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         the audio group. Stashes `num_tokens_in_video` on each video
         param for the EVS post-step.
         """
+        component_runtime = getattr(self, "_component_lora_runtime", None)
+        kwargs = {} if component_runtime is None else {"component_lora_runtime": component_runtime}
         video_embeds, video_num_tokens = self.vision_encoder(
-            [self._vision_view(p, "video") for p in multimodal_params]
+            [self._vision_view(p, "video") for p in multimodal_params], **kwargs
         )
         embedded_audio = [p.multimodal_data["video"].get("audio") for p in multimodal_params]
+        audio_kwargs = (
+            {}
+            if component_runtime is None
+            else {
+                "task_ids": [
+                    _component_lora_task_id(p)
+                    for p, audio in zip(multimodal_params, embedded_audio)
+                    if audio is not None
+                ],
+            }
+        )
         audio_outputs = (
-            self._encode_audio([a for a in embedded_audio if a is not None])
+            self._encode_audio([a for a in embedded_audio if a is not None], **audio_kwargs)
             if any(embedded_audio) and self.sound_encoder is not None
             else []
         )
@@ -3421,7 +3825,15 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
 
     def _encode_audio_group(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
         """Audio group encoder_fn: one `sound_encoder` call over standalone audio items."""
-        outs = self._encode_audio([p.multimodal_data["audio"] for p in multimodal_params])
+        component_runtime = getattr(self, "_component_lora_runtime", None)
+        kwargs = (
+            {}
+            if component_runtime is None
+            else {
+                "task_ids": [_component_lora_task_id(p) for p in multimodal_params],
+            }
+        )
+        outs = self._encode_audio([p.multimodal_data["audio"] for p in multimodal_params], **kwargs)
         return torch.cat([emb for emb, _ in outs], dim=0)
 
     @property

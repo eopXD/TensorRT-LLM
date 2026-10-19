@@ -28,6 +28,7 @@
 #include "tensorrt_llm/common/tllmDataType.h"
 
 #include <algorithm>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
@@ -120,6 +121,87 @@ TEST_F(LoraUtilsTest, loraValidateRequestTensors)
     EXPECT_THAT([&]()
         { loraValidateRequestTensors(std::nullopt, optReqLoraWeights, optReqLoraConfig, modelConfig, worldConfig); },
         testing::Throws<std::runtime_error>());
+}
+
+TEST(LoraModuleTest, executionIdDefaultsToSemanticType)
+{
+    constexpr LoraModule decoder(LoraModule::ModuleType::kATTN_Q, 4, 4, false, true, -1, -1);
+    static_assert(decoder.executionId() == static_cast<SizeType32>(LoraModule::ModuleType::kATTN_Q));
+    EXPECT_EQ(decoder.value(), decoder.executionId());
+
+    constexpr SizeType32 kComponentExecutionId = 26;
+    constexpr LoraModule component(LoraModule::ModuleType::kATTN_Q, 8, 12, false, true, -1, -1, kComponentExecutionId);
+    static_assert(component.executionId() == kComponentExecutionId);
+    EXPECT_EQ(component.value(), decoder.value());
+    EXPECT_EQ(component.name(), decoder.name());
+    EXPECT_EQ(component.flattenedInOutSize(2, false), 40);
+}
+
+TEST(LoraModuleTest, executionIdRejectsNegativeValues)
+{
+    for (auto const executionId : {-1, std::numeric_limits<SizeType32>::min()})
+    {
+        SCOPED_TRACE(executionId);
+        EXPECT_THROW(
+            LoraModule(LoraModule::ModuleType::kATTN_Q, 4, 4, false, true, -1, -1, executionId), std::runtime_error);
+    }
+}
+
+TEST_F(LoraUtilsTest, executionIdsSelectIndependentProjectionDimensions)
+{
+    ModelConfig modelConfig(0, 1, 1, 0, 1, 4, tensorrt_llm::DataType::kFLOAT);
+    WorldConfig worldConfig(1, 1, 1, 0);
+    modelConfig.setMaxLoraRank(2);
+    modelConfig.setLoraModules({
+        LoraModule(LoraModule::ModuleType::kATTN_Q, 4, 4, false, true, -1, -1),
+        LoraModule(LoraModule::ModuleType::kATTN_Q, 8, 12, false, true, -1, -1, 26),
+    });
+    std::vector<int32_t> rows{1, 0, 2, 0, 26, 0, 2, 0};
+    TensorPtr config = ITensor::wrap(rows, ITensor::makeShape({1, 2, 4}));
+    TensorPtr weights = mManager->cpu(ITensor::makeShape({1, 2, 40}), tensorrt_llm::DataType::kFLOAT);
+
+    EXPECT_NO_THROW(loraValidateRequestTensors(7, weights, config, modelConfig, worldConfig));
+
+    weights = mManager->cpu(ITensor::makeShape({1, 2, 16}), tensorrt_llm::DataType::kFLOAT);
+    EXPECT_THROW(loraValidateRequestTensors(7, weights, config, modelConfig, worldConfig), std::runtime_error);
+}
+
+TEST_F(LoraUtilsTest, executionIdsRejectInvalidRequestsAndDuplicateDestinations)
+{
+    ModelConfig modelConfig(0, 2, 2, 0, 1, 4, tensorrt_llm::DataType::kFLOAT);
+    WorldConfig worldConfig(1, 1, 1, 0);
+    modelConfig.setMaxLoraRank(2);
+    modelConfig.setLoraModules({LoraModule(LoraModule::ModuleType::kATTN_Q, 4, 4, false, true, -1, -1, 26)});
+    std::vector<int32_t> rows{26, 0, 2, 0, 26, 1, 2, 0};
+    TensorPtr config = ITensor::wrap(rows, ITensor::makeShape({1, 2, 4}));
+    TensorPtr weights = mManager->cpu(ITensor::makeShape({1, 2, 16}), tensorrt_llm::DataType::kFLOAT);
+
+    EXPECT_NO_THROW(loraValidateRequestTensors(7, weights, config, modelConfig, worldConfig));
+    rows[5] = 0;
+    EXPECT_THROW(loraValidateRequestTensors(7, weights, config, modelConfig, worldConfig), std::runtime_error);
+    rows[5] = 1;
+    for (auto const executionId : {-1, 1, 27})
+    {
+        SCOPED_TRACE(executionId);
+        rows[0] = executionId;
+        EXPECT_THROW(loraValidateRequestTensors(7, weights, config, modelConfig, worldConfig), std::runtime_error);
+    }
+}
+
+TEST_F(LoraUtilsTest, executionIdsRejectDuplicateModelDeclarations)
+{
+    ModelConfig modelConfig(0, 1, 1, 0, 1, 4, tensorrt_llm::DataType::kFLOAT);
+    WorldConfig worldConfig(1, 1, 1, 0);
+    modelConfig.setMaxLoraRank(2);
+    modelConfig.setLoraModules({
+        LoraModule(LoraModule::ModuleType::kATTN_Q, 4, 4, false, true, -1, -1, 26),
+        LoraModule(LoraModule::ModuleType::kATTN_K, 4, 4, false, true, -1, -1, 26),
+    });
+    std::vector<int32_t> rows{26, 0, 2, 0};
+    TensorPtr config = ITensor::wrap(rows, ITensor::makeShape({1, 1, 4}));
+    TensorPtr weights = mManager->cpu(ITensor::makeShape({1, 1, 16}), tensorrt_llm::DataType::kFLOAT);
+
+    EXPECT_THROW(loraValidateRequestTensors(7, weights, config, modelConfig, worldConfig), std::runtime_error);
 }
 
 } // namespace tensorrt_llm::runtime::lora

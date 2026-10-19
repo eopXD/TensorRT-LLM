@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from collections import namedtuple
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -58,6 +61,7 @@ class CudaGraphLoraParams:
         layer_info: Dict[LoraLayerKey, LoraLayerInfo],
         device: str = "cuda",
         max_tokens_per_seq: int = 1,
+        component_module_ids: frozenset[int] = frozenset(),
     ):
         """
         Initialize CUDA Graph compatible LoRA parameters.
@@ -69,6 +73,7 @@ class CudaGraphLoraParams:
             layer_info: Layer information for each layer
             device: Device to allocate tensors on
             max_tokens_per_seq: Maximum tokens per sequence (>1 for spec decode)
+            component_module_ids: Encoder and connector IDs excluded from decoder graphs
         """
         self.max_batch_size = max_batch_size
         self.max_lora_size = max_lora_size
@@ -77,6 +82,7 @@ class CudaGraphLoraParams:
         self.layer_module2key = self._calculate_layer_module2key()
         self.device = device
         self.max_tokens_per_seq = max_tokens_per_seq
+        self.component_module_ids = component_module_ids
 
         self.layer_params: Dict[self.LoraLayerKey, LoraLayerParams] = dict()
 
@@ -295,7 +301,15 @@ class CudaGraphLoraParams:
                 # the existing rank and weight pointers for the occupied slot.
                 continue
             else:  # task might have changed in the slot, update its rank
-                task_configs = peft_table[task_id]
+                task_configs = [
+                    config
+                    for config in peft_table[task_id]
+                    if config.module_id not in self.component_module_ids
+                ]
+                if not task_configs:
+                    self.slot_ranks_host[slot_id] = 0
+                    zero_out_weight_pointers(slot_id)
+                    continue
                 config = task_configs[0]  # assume all layerModuleConfigs have the same rank
                 self.slot_ranks_host[slot_id] = config.adapter_size
 

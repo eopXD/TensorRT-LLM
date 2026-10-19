@@ -536,7 +536,8 @@ class Block(nn.Module):
         self,
         x: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
-        attn_metadata: Optional[attention_interface.AttentionMetadata] = None
+        attn_metadata: Optional[attention_interface.AttentionMetadata] = None,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         residual = x
         x = self.norm1(x)
@@ -545,6 +546,7 @@ class Block(nn.Module):
             hidden_states=x,
             attn_metadata=attn_metadata,
             attention_mask=attention_interface.PredefinedAttentionMask.FULL,
+            lora_params=lora_params,
         )
         x = self.ls1(x)
         x = self.drop_path1(x)
@@ -836,7 +838,8 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     def forward_features(self,
                          x: torch.Tensor,
                          image_sizes: Optional[List[Tuple[int, int]]] = None,
-                         num_frames: Optional[int] = None) -> torch.Tensor:
+                         num_frames: Optional[int] = None,
+                         lora_params: Optional[dict] = None) -> torch.Tensor:
         """Forward through embeddings, transformer blocks, and post-transformer norm.
 
         Args:
@@ -876,7 +879,7 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         hidden_size = x.shape[-1]
         # Need flatten batch/seq_len for trtllm attention.
         x = x.reshape(-1, hidden_size)
-        x = self._run_blocks(x, attn_metadata)
+        x = self._run_blocks(x, attn_metadata, lora_params=lora_params)
 
         # Reshape back from flattened.
         if packed_batch_size is not None:
@@ -915,13 +918,19 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
     ) -> Dict[str, torch.Tensor]:
         return {"x": self._run_blocks_eager(inputs["x"], md)}
 
-    def _run_blocks(self, x: torch.Tensor,
-                    attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def _run_blocks(self,
+                    x: torch.Tensor,
+                    attn_metadata: AttentionMetadata,
+                    lora_params: Optional[dict] = None) -> torch.Tensor:
         # RADIO runs outside the compiled LM region and receives its vision
         # metadata explicitly. Keep both graph replay and eager fallback off
         # the custom-op path, which resolves the LM metadata from extra_attrs.
         with torch_compiling(False):
             if self._blocks_graph_runner is not None:
+                if lora_params:
+                    raise ValueError(
+                        "RADIO encoder CUDA graphs do not support runtime component LoRA"
+                    )
                 seq_lengths = attn_metadata.seq_lens.tolist()
                 output = self._blocks_graph_runner.maybe_run(
                     seq_lengths=seq_lengths,
@@ -929,12 +938,18 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
                 )
                 if output is not None:
                     return output["x"]
-            return self._run_blocks_eager(x, attn_metadata)
+            if lora_params is None:
+                return self._run_blocks_eager(x, attn_metadata)
+            return self._run_blocks_eager(x,
+                                          attn_metadata,
+                                          lora_params=lora_params)
 
-    def _run_blocks_eager(self, x: torch.Tensor,
-                          attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def _run_blocks_eager(self,
+                          x: torch.Tensor,
+                          attn_metadata: AttentionMetadata,
+                          lora_params: Optional[dict] = None) -> torch.Tensor:
         for block in self.blocks:
-            x = block(x, attn_metadata=attn_metadata)
+            x = block(x, attn_metadata=attn_metadata, lora_params=lora_params)
         return x
 
 
@@ -1089,7 +1104,8 @@ class RADIOVisionModelBase(nn.Module):
                 x: torch.Tensor,
                 feature_fmt: str = 'NLC',
                 image_sizes: Optional[List[Tuple[int, int]]] = None,
-                num_frames: Optional[int] = None) -> torch.Tensor:
+                num_frames: Optional[int] = None,
+                lora_params: Optional[dict] = None) -> torch.Tensor:
         if image_sizes is None:
             res_step = self.min_resolution_step
             if res_step is not None and (x.shape[-2] % res_step != 0
@@ -1102,7 +1118,8 @@ class RADIOVisionModelBase(nn.Module):
             x = self.input_conditioner(x)
         y = self.model.forward_features(x,
                                         image_sizes=image_sizes,
-                                        num_frames=num_frames)
+                                        num_frames=num_frames,
+                                        lora_params=lora_params)
         ret = self._extract_final(x,
                                   y,
                                   feature_fmt=feature_fmt,
@@ -1372,7 +1389,9 @@ class RADIOVisionModel(PreTrainedModel):
     def forward(self,
                 x: torch.Tensor,
                 image_sizes: Optional[List[Tuple[int, int]]] = None,
-                num_frames: Optional[int] = None):
+                num_frames: Optional[int] = None,
+                lora_params: Optional[dict] = None):
         return self.radio_model.forward(x,
                                         image_sizes=image_sizes,
-                                        num_frames=num_frames)
+                                        num_frames=num_frames,
+                                        lora_params=lora_params)

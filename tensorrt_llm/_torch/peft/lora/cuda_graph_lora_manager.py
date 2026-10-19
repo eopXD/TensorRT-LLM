@@ -99,6 +99,11 @@ class CudaGraphLoraManager:
             layer_info=self.layer_info,
             device=self.device,
             max_tokens_per_seq=self.max_tokens_per_seq,
+            component_module_ids=frozenset(
+                target.execution_id
+                for owner in lora_model_config.components
+                for target in owner.targets
+            ),
         )
 
         # Pre-size routed-expert MoE-LoRA scratch on every MoE layer so the
@@ -219,8 +224,8 @@ class CudaGraphLoraManager:
         # Get current slot to task mapping
         slot2task = self.adapter_slot_manager.get_slot_to_task_mapping()
 
-        # Update weight pointers if slot assignments changed
-        if self.adapter_slot_manager.has_slots_changed():
+        # Native cache pages can move while task IDs retain their graph slots.
+        if peft_table is not None or self.adapter_slot_manager.has_slots_changed():
             cuda_graph_lora_params.update_weight_pointers(peft_table, slot2task)
             self.adapter_slot_manager.reset_slots_changed()
 

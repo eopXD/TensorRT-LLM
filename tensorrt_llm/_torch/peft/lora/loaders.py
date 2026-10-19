@@ -33,7 +33,7 @@ import yaml
 
 from tensorrt_llm.models.convert_utils import get_model_path, load_state_dict
 
-from .ownership import DecoderLoraOwner
+from .ownership import ComponentLoraOwner, ComponentLoraTarget, DecoderLoraOwner
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,13 @@ def _validate_owner_prefix(
         )
 
 
+def _validate_unparsed_key_owner(key: str, owner: DecoderLoraOwner, source: str) -> None:
+    normalized = key.removeprefix("base_model.model.") if source == "HF" else key
+    prefixes = owner.hf_prefixes if source == "HF" else owner.nemo_prefixes
+    if not any(normalized.startswith(f"{prefix}.") for prefix in prefixes):
+        _validate_owner_prefix(key, normalized, owner, source)
+
+
 def _check_duplicate_destination(
     destinations: dict, destination: tuple, key: str, owner: DecoderLoraOwner
 ) -> None:
@@ -71,6 +78,17 @@ def _check_duplicate_destination(
             f"(module path '{owner.module_path or '<root>'}')."
         )
     destinations[destination] = key
+
+
+def _reject_decoder_target(
+    key: str, projection: str, allowed_targets: Set[str], owner: DecoderLoraOwner
+) -> None:
+    raise ValueError(
+        f"LoRA key '{key}' targets decoder projection '{projection}' which is not enabled "
+        f"for selected owner 'decoder' (module path '{owner.module_path or '<root>'}'). "
+        f"Enabled decoder targets: {sorted(allowed_targets)}. Remove these weights or enable "
+        "a decoder target supported by the model's multimodal LoRA policy."
+    )
 
 
 def get_all_nemo_lora_weights(
@@ -96,6 +114,7 @@ def get_all_nemo_lora_weights(
     layer_pattern = re.compile(r"(.*\.layers)\.(\d+)\..*")
     destinations = {}
     for key, weights in lora_weights.items():
+        _validate_unparsed_key_owner(key, owner, "NeMo")
         if adapter_key in key:
             m = layer_pattern.match(key)
             if m is None:
@@ -125,6 +144,109 @@ HF_LORA_PATTERN = re.compile(
     r"(.*)\.(\d+)\.(\w+)\.(\w+|\w+\.\w+|(\w+)\.(\d+)\.(\w+))\.(?:lora_(?:(A|B)\.weight|(magnitude)_vector)|weight_(m_wdecomp).weight)"
 )
 
+_COMPONENT_LORA_PATTERN = re.compile(
+    r"^(.*)\.(?:lora_(?:(A|B)\.weight|(magnitude)_vector)|weight_(m_wdecomp)\.weight)$"
+)
+
+
+def split_hf_lora_weights(
+    lora_weights: Dict[str, torch.Tensor],
+    components: tuple[ComponentLoraOwner, ...],
+) -> tuple[
+    Dict[str, torch.Tensor],
+    dict[str, dict[ComponentLoraTarget, dict[str, torch.Tensor]]],
+]:
+    """Resolve declared component aliases while preserving decoder checkpoint names."""
+    aliases = {}
+    execution_ids = {}
+    owner_names = set()
+    for owner in components:
+        if owner.name == "decoder" or owner.name in owner_names:
+            raise ValueError(f"Invalid or duplicate component LoRA owner '{owner.name}'")
+        owner_names.add(owner.name)
+        for target in owner.targets:
+            if not 26 <= target.execution_id <= torch.iinfo(torch.int32).max:
+                raise ValueError(
+                    f"LoRA owner '{owner.name}' target '{target.module_path}' "
+                    f"has invalid execution ID {target.execution_id}"
+                )
+            descriptor = (
+                owner.name,
+                target.module_type,
+                target.input_size,
+                target.output_size,
+                target.fused_output_sizes,
+                target.tp_size,
+                target.in_tp_split_dim,
+                target.out_tp_split_dim,
+            )
+            previous = execution_ids.setdefault(target.execution_id, descriptor)
+            if previous != descriptor:
+                raise ValueError(f"Conflicting component LoRA execution ID {target.execution_id}")
+            for alias in target.checkpoint_modules:
+                previous = aliases.setdefault(alias, (owner, target))
+                if previous != (owner, target):
+                    raise ValueError(f"Ambiguous component LoRA checkpoint alias '{alias}'")
+
+    decoder_weights = {}
+    component_weights = {}
+    destinations = {}
+    projection_representations = {}
+    for key, tensor in lora_weights.items():
+        normalized_key = key.removeprefix("base_model.model.")
+        match = _COMPONENT_LORA_PATTERN.fullmatch(normalized_key)
+        module_name = match.group(1) if match is not None else normalized_key
+        selected = aliases.get(module_name) if match is not None else None
+        if selected is None:
+            for owner in components:
+                if any(
+                    normalized_key == prefix or normalized_key.startswith(prefix + ".")
+                    for prefix in owner.hf_prefixes
+                ):
+                    if match is None:
+                        raise KeyError(f"unsupported key {key} from HF LoRA weights")
+                    raise ValueError(
+                        f"Unsupported LoRA key '{key}' for selected owner '{owner.name}' "
+                        f"(module path '{owner.module_path}')"
+                    )
+            decoder_weights[key] = tensor
+            continue
+        owner, target = selected
+        direction = (
+            "in" if match.group(2) == "A" else "out" if match.group(2) == "B" else "magnitude"
+        )
+        destination = (owner.name, target.execution_id, target.layer_idx, direction)
+        if destination in destinations:
+            raise ValueError(
+                f"LoRA keys '{destinations[destination]}' and '{key}' have a duplicate "
+                f"destination for selected owner '{owner.name}' (module path '{owner.module_path}')"
+            )
+        destinations[destination] = key
+        family = None
+        if target.module_type in ("attn_qkv", "attn_q", "attn_k", "attn_v"):
+            family = "attention"
+            packed = target.module_type == "attn_qkv"
+        elif target.module_type in ("mlp_gate_up", "mlp_gate", "mlp_h_to_4h"):
+            family = "gate/up"
+            packed = target.module_type == "mlp_gate_up"
+        if family is not None:
+            projection = (
+                owner.name,
+                target.layer_idx,
+                target.module_path.rpartition(".")[0],
+                family,
+            )
+            previous_packed, previous_key = projection_representations.setdefault(
+                projection, (packed, key)
+            )
+            if previous_packed != packed:
+                raise ValueError(
+                    f"LoRA keys '{previous_key}' and '{key}' mix packed and split {family} "
+                    f"projections for selected owner '{owner.name}'"
+                )
+        component_weights.setdefault(owner.name, {}).setdefault(target, {})[direction] = tensor
+    return decoder_weights, component_weights
+
 
 def iterate_hf_lora(
     iter_fn,
@@ -134,6 +256,7 @@ def iterate_hf_lora(
     *,
     owner: DecoderLoraOwner = DecoderLoraOwner(),
     hf_modules_to_trtllm_modules: Optional[Dict[str, str]] = None,
+    allowed_target_modules: Optional[Set[str]] = None,
 ):
     """Iterate over HuggingFace LoRA weights and call iterator function for each weight.
 
@@ -145,27 +268,32 @@ def iterate_hf_lora(
         component: Optional component name to filter by (e.g., 'decoder')
         owner: Decoder module and accepted checkpoint prefixes
         hf_modules_to_trtllm_modules: Canonical destinations for detecting HF alias collisions
+        allowed_target_modules: If provided, reject projections outside these canonical targets
 
     Returns:
         Nested dictionary structure organizing the weights
 
     Raises:
         KeyError: If unsupported keys are found
-        ValueError: If a key belongs to another owner or duplicates a destination
+        ValueError: If ownership, target selection, or destination uniqueness is invalid
     """
     all_weights = defaultdict(lambda: defaultdict(dict))
     destinations = {}
     module_representations = {}
     pattern = HF_LORA_PATTERN
     for key, weights in lora_weights.items():
-        m = pattern.match(key)
+        m = pattern.fullmatch(key)
         if not m:
-            if "lm_head" not in key and "embed_tokens" not in key:
-                raise KeyError(f"unsupported key {key} from HF LoRA weights")
             saved_module = re.search(r"(?:^|\.)(?:lm_head|embed_tokens)(?:\.|$)", key)
             if saved_module is not None:
                 _validate_owner_prefix(key, key[: saved_module.start()], owner, "HF", layered=False)
-            continue
+                if allowed_target_modules is not None and _COMPONENT_LORA_PATTERN.fullmatch(key):
+                    _reject_decoder_target(
+                        key, key.rsplit(".", 2)[0], allowed_target_modules, owner
+                    )
+                continue
+            _validate_unparsed_key_owner(key, owner, "HF")
+            raise KeyError(f"unsupported key {key} from HF LoRA weights")
         _validate_owner_prefix(key, m.group(1), owner, "HF")
         layer_idx = int(m.group(2))
         expert_idx = m.group(6)
@@ -193,6 +321,8 @@ def iterate_hf_lora(
                         hf_module = final_component
 
             if hf_module not in hf_modules:
+                if allowed_target_modules is not None:
+                    _reject_decoder_target(key, hf_module, allowed_target_modules, owner)
                 # Skip modules not in the supported mapping (only log once per module type)
                 if hf_module not in getattr(iterate_hf_lora, "_warned_modules", set()):
                     logger.warning(
@@ -215,6 +345,8 @@ def iterate_hf_lora(
             if hf_modules_to_trtllm_modules is not None
             else hf_module
         )
+        if allowed_target_modules is not None and trtllm_module not in allowed_target_modules:
+            _reject_decoder_target(key, trtllm_module, allowed_target_modules, owner)
         module_destination = (trtllm_module, layer_idx)
         previous_is_moe, previous_key = module_representations.setdefault(
             module_destination, (is_moe, key)
@@ -246,6 +378,7 @@ def get_all_hf_lora_weights(
     *,
     owner: DecoderLoraOwner = DecoderLoraOwner(),
     hf_modules_to_trtllm_modules: Optional[Dict[str, str]] = None,
+    allowed_target_modules: Optional[Set[str]] = None,
 ):
     """Extract and organize all HuggingFace LoRA weights by layer and module.
 
@@ -255,6 +388,7 @@ def get_all_hf_lora_weights(
         component: Optional component name to filter by (e.g., 'decoder')
         owner: Decoder module and accepted checkpoint prefixes
         hf_modules_to_trtllm_modules: Canonical destinations for detecting HF alias collisions
+        allowed_target_modules: If provided, reject projections outside these canonical targets
 
     Returns:
         Nested dictionary organizing weights by layer, module, and potentially expert
@@ -275,6 +409,7 @@ def get_all_hf_lora_weights(
         component,
         owner=owner,
         hf_modules_to_trtllm_modules=hf_modules_to_trtllm_modules,
+        allowed_target_modules=allowed_target_modules,
     )
     return all_weights
 
@@ -285,6 +420,7 @@ def get_hf_target_modules(
     *,
     owner: DecoderLoraOwner = DecoderLoraOwner(),
     hf_modules_to_trtllm_modules: Optional[Dict[str, str]] = None,
+    allowed_target_modules: Optional[Set[str]] = None,
 ):
     """Validate ownership and return supported HF targets present in the checkpoint."""
 
@@ -298,6 +434,7 @@ def get_hf_target_modules(
         hf_modules,
         owner=owner,
         hf_modules_to_trtllm_modules=hf_modules_to_trtllm_modules,
+        allowed_target_modules=allowed_target_modules,
     )
     return hf_target_modules
 
@@ -333,8 +470,16 @@ def norm_dora_magnitude(
 
 
 class HfLoraLoader:
-    def __init__(self, lora_dirs: List[str], *, owner: DecoderLoraOwner = DecoderLoraOwner()):
+    def __init__(
+        self,
+        lora_dirs: List[str],
+        *,
+        owner: DecoderLoraOwner = DecoderLoraOwner(),
+        components: tuple[ComponentLoraOwner, ...] = (),
+    ):
         self.owner = owner
+        self.components = components
+        self.component_weights = {}
         self.lora_target_modules = []
         self.is_valid = False
         self.lm_head = None
@@ -358,12 +503,14 @@ class HfLoraLoader:
         lora_dir = lora_dirs[0]
         with open(f"{lora_dir}/adapter_config.json") as f:
             adapter_config = json.load(f)
+        self.adapter_config = adapter_config
 
         model_path = get_model_path(lora_dir, "adapter_model")
         if model_path is None:
             raise ValueError(f"adapter_model file does not exist in {lora_dir}")
         lora_weight = load_state_dict(model_path)
         self.lora_weight = lora_weight
+        self.decoder_weight, self.component_weights = split_hf_lora_weights(lora_weight, components)
         if adapter_config.get("modules_to_save") is not None:
             if "lm_head" in adapter_config["modules_to_save"]:
                 self.lm_head = lora_weight["base_model.model.lm_head.weight"]
@@ -372,15 +519,20 @@ class HfLoraLoader:
             if "embed_tokens" in adapter_config["modules_to_save"]:
                 self.embed_tokens = lora_weight["base_model.model.model.embed_tokens.weight"]
 
-    def get_target_modules(self, trtllm_modules_to_hf_modules):
+    def get_target_modules(
+        self, trtllm_modules_to_hf_modules, *, allowed_target_modules: Optional[Set[str]] = None
+    ):
         hf_modules_to_trtllm_modules = invert_module_mapping(trtllm_modules_to_hf_modules)
+        if self.components and allowed_target_modules is None:
+            allowed_target_modules = set(trtllm_modules_to_hf_modules)
         lora_target_modules = set()
         if self.is_valid:
             hf_target_modules = get_hf_target_modules(
-                self.lora_weight,
+                self.decoder_weight,
                 hf_modules=set(hf_modules_to_trtllm_modules.keys()),
                 owner=self.owner,
                 hf_modules_to_trtllm_modules=hf_modules_to_trtllm_modules,
+                allowed_target_modules=allowed_target_modules,
             )
             for m in hf_target_modules:
                 trtllm_module = hf_modules_to_trtllm_modules[m]
@@ -390,7 +542,7 @@ class HfLoraLoader:
     def get_dense_lora_dtype(self) -> Optional[torch.dtype]:
         """Return the common input/output dtype for dense LoRA modules."""
         lora_dtypes = set()
-        for key, weight in self.lora_weight.items():
+        for key, weight in self.decoder_weight.items():
             match = HF_LORA_PATTERN.match(key)
             if match is not None and match.group(6) is None and match.group(8) in ("A", "B"):
                 lora_dtypes.add(weight.dtype)

@@ -431,7 +431,9 @@ class DecoderRunner(ScheduledModelRunner):
         self.cuda_graph_runner.register_sample_type_resolver(resolver)
         self._stage_in_graph_sampling = stage
 
-    def init_cuda_graph_lora_manager(self, lora_config: LoraConfig) -> None:
+    def init_cuda_graph_lora_manager(
+        self, lora_config: LoraConfig, lora_model: torch.nn.Module
+    ) -> None:
         """Build LoRA preparation state for the current executor resources."""
         cuda_graph_manager = None
         if self.cuda_graph_runner is not None and self.cuda_graph_runner.enabled:
@@ -441,7 +443,7 @@ class DecoderRunner(ScheduledModelRunner):
                 (self._config.original_max_draft_len + 1) if self._config.is_spec_decode else 1
             )
             cuda_graph_manager = make_cuda_graph_lora_manager(
-                self.model,
+                lora_model,
                 lora_config,
                 self.lora_model_config,
                 self._config.max_batch_size,

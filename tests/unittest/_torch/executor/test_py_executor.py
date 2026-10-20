@@ -97,6 +97,8 @@ def test_forward_step_carries_context_logits_request_to_runner(request_flags, ex
     cache_indirection = object()
     new_tensors = object()
     executor = types.SimpleNamespace(
+        dist=types.SimpleNamespace(world_size=1),
+        _tp_error_consensus_enabled=False,
         model_engine=engine,
         resource_manager=resources,
         iter_counter=0,
@@ -3558,6 +3560,7 @@ class TestPendingTransferResponseFlush:
     @staticmethod
     def _make_executor_loop_stub():
         executor = object.__new__(PyExecutor)
+        executor.dist = types.SimpleNamespace(world_size=1)
         executor.device_id = 0
         profiler = MagicMock()
         profiler.__enter__.return_value = Mock()

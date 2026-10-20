@@ -413,6 +413,24 @@ def start_rank_crash_kill_watchdog(
         return None
 
 
+def start_forward_recovery_watchdog(world_size: int) -> threading.Timer | None:
+    """Bound agreement and device draining after a rank-local forward failure."""
+    grace = _rank_crash_kill_grace()
+    if world_size <= 1 or grace is None:
+        return None
+    # mpi_comm is thread-local; capture the executor's world before the timer
+    # starts. A stuck GPU or logging lock must not delay the abort.
+    communicator = mpi_comm() if ENABLE_MULTI_DEVICE and not mpi_disabled() else None
+    timer = threading.Timer(
+        grace,
+        propagate_hard_kill,
+        kwargs={"diagnostics": False, "communicator": communicator},
+    )
+    timer.daemon = True
+    timer.start()
+    return timer
+
+
 class HangDetector:
     """Watchdog that fires when the executor loop stops checkpointing.
 

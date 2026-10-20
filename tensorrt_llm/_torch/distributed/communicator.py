@@ -199,6 +199,18 @@ class Distributed(ABC):
     def allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         pass
 
+    def init_forward_error_group(self) -> None:
+        """Initialize a CPU group isolated from model collectives, for PP=1."""
+        raise NotImplementedError
+
+    def forward_allgather(self, obj: object) -> list[object]:
+        """Exchange forward outcomes on the initialized CPU recovery group."""
+        raise NotImplementedError
+
+    def forward_max(self, value: int) -> int:
+        """Reduce a failure flag without serializing Python objects."""
+        raise NotImplementedError
+
     @abstractmethod
     def tp_allreduce(self, obj, op: ReduceOp = ReduceOp.SUM):
         pass
@@ -715,6 +727,28 @@ class MPIDist(Distributed):
         self._cp_comm = None
         self._tp_comm = None
         self._pp_comm = None
+        self._forward_error_comm = None
+        self._forward_error_send = np.empty(1, dtype=np.int32)
+        self._forward_error_recv = np.empty(1, dtype=np.int32)
+
+    def init_forward_error_group(self) -> None:
+        if self._forward_error_comm is None:
+            self._validate_world_size()
+            group = mpi_comm().group.Incl(range(self.world_size))
+            try:
+                self._forward_error_comm = mpi_comm().Create_group(group)
+            finally:
+                group.Free()
+
+    def forward_allgather(self, obj: object) -> list[object]:
+        return self._forward_error_comm.allgather(obj)
+
+    def forward_max(self, value: int) -> int:
+        self._forward_error_send[0] = value
+        self._forward_error_comm.Allreduce(self._forward_error_send,
+                                           self._forward_error_recv,
+                                           op=MPI.MAX)
+        return int(self._forward_error_recv[0])
 
     def _validate_world_size(self):
         """Validate world size before creating sub-communicators to prevent segfaults."""
@@ -923,6 +957,8 @@ class TorchDist(Distributed):
         ), "torch.distributed should be initialized before TorchDist"
 
         self.cluster_info = None
+        self._forward_error_group = None
+        self._forward_error_flag = None
 
         from tensorrt_llm._utils import set_torch_comm
         set_torch_comm(self)  # Set as global instance
@@ -934,6 +970,27 @@ class TorchDist(Distributed):
 
         init_pg(torch.distributed.group.WORLD, self.local_comm,
                 torch_pybind11_abi())
+
+    def init_forward_error_group(self) -> None:
+        if self._forward_error_group is None:
+            self._forward_error_group = dist.new_group(ranks=list(
+                range(self.world_size)),
+                                                       backend="gloo")
+            self._forward_error_flag = torch.empty(1,
+                                                   dtype=torch.int32,
+                                                   device="cpu")
+
+    def forward_allgather(self, obj: object) -> list[object]:
+        result: list[object] = [None] * self.world_size
+        dist.all_gather_object(result, obj, group=self._forward_error_group)
+        return result
+
+    def forward_max(self, value: int) -> int:
+        self._forward_error_flag.fill_(value)
+        dist.all_reduce(self._forward_error_flag,
+                        op=dist.ReduceOp.MAX,
+                        group=self._forward_error_group)
+        return int(self._forward_error_flag.item())
 
     def setup_local_comm(self):
         self._get_cluster_info()

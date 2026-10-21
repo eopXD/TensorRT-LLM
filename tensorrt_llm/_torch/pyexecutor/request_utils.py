@@ -435,6 +435,7 @@ class RequestBroadcaster:
             new_requests, "py_logits_post_processors"
         )
         py_multimodal_data = collect_py_objects_from_requests(new_requests, "py_multimodal_data")
+        py_mm_item_order = collect_py_objects_from_requests(new_requests, "py_mm_item_order")
         py_scheduling_params = collect_py_objects_from_requests(
             new_requests, "py_scheduling_params"
         )
@@ -456,6 +457,7 @@ class RequestBroadcaster:
                 [
                     py_logits_post_processors,
                     py_multimodal_data,
+                    py_mm_item_order,
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,

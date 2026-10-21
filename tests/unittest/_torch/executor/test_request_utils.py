@@ -9,12 +9,17 @@ This module tests:
 
 """
 
+import pickle
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
+    _lengths_by_modality,
+    _reorder_embeds_by_manifest,
+)
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import (
     RequestBroadcaster,
@@ -29,6 +34,7 @@ from tensorrt_llm._torch.pyexecutor.request_utils import (
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm.bindings import executor as trtllm
 from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.mapping import CpType
 
 pytestmark = pytest.mark.cpu_only
@@ -100,6 +106,77 @@ def test_request_broadcaster_requires_conversation_params_attr():
 
     with pytest.raises(AttributeError):
         RequestBroadcaster._collect_py_objects(None, source_items)
+
+
+@pytest.mark.parametrize("modalities", [("image", "video", "image"), ("video", "image", "video")])
+def test_request_broadcaster_preserves_mixed_media_order_on_peer(
+    modalities: tuple[str, ...],
+) -> None:
+    item_order = [
+        {"modality": modality, "index": modalities[:index].count(modality)}
+        for index, modality in enumerate(modalities)
+    ]
+    source_request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=1)
+    source_request.py_conversation_params = None
+    source_request.py_mm_item_order = item_order
+    source_request.py_multimodal_data = {
+        "image": {},
+        "video": {},
+        "multimodal_embedding_lengths": [2, 3, 4],
+    }
+    source_items = [RequestQueueItem(42, source_request)]
+    py_request_objects = RequestBroadcaster._collect_py_objects(None, source_items)
+
+    peer_items, peer_objects = pickle.loads(pickle.dumps((source_items, py_request_objects)))
+    attach_py_objects_to_requests(peer_items, peer_objects)
+    peer_request = executor_request_to_llm_request(
+        42, peer_items[0].request, child_req_ids=[], exclude_last_generation_logits=False
+    )
+    params = MultimodalParams(
+        multimodal_data=peer_request.py_multimodal_data,
+        mm_item_order=peer_request.py_mm_item_order,
+    )
+
+    assert params.mm_item_order == item_order
+    assert params.mm_item_order is not item_order
+    lengths = {
+        **_lengths_by_modality([params], (modalities[0],)),
+        **_lengths_by_modality([params], (modalities[1],)),
+    }
+    assert lengths == {modalities[0]: [2, 4], modalities[1]: [3]}
+    embeddings = {
+        modalities[0]: torch.tensor([[10], [11], [30], [31], [32], [33]]),
+        modalities[1]: torch.tensor([[20], [21], [22]]),
+    }
+    actual = _reorder_embeds_by_manifest([params], embeddings, lengths)
+    torch.testing.assert_close(
+        actual, torch.tensor([[10], [11], [20], [21], [22], [30], [31], [32], [33]])
+    )
+
+
+@pytest.mark.parametrize("item_order", [None, []])
+def test_request_broadcaster_preserves_optional_media_order_defaults(
+    item_order: list[dict[str, str | int]] | None,
+) -> None:
+    source_request = trtllm.Request(input_token_ids=[1, 2, 3], max_tokens=1)
+    source_request.py_conversation_params = None
+    source_request.py_mm_item_order = item_order
+    text_request = trtllm.Request(input_token_ids=[4, 5], max_tokens=1)
+    text_request.py_conversation_params = None
+    source_items = [RequestQueueItem(42, source_request), RequestQueueItem(43, text_request)]
+    py_request_objects = RequestBroadcaster._collect_py_objects(None, source_items)
+
+    peer_items, peer_objects = pickle.loads(pickle.dumps((source_items, py_request_objects)))
+    attach_py_objects_to_requests(peer_items, peer_objects)
+    peer_requests = [
+        executor_request_to_llm_request(
+            item.id, item.request, child_req_ids=[], exclude_last_generation_logits=False
+        )
+        for item in peer_items
+    ]
+
+    assert peer_requests[0].py_mm_item_order == item_order
+    assert peer_requests[1].py_mm_item_order is None
 
 
 def test_executor_request_to_llm_request_adopts_context_phase_draft_tokens() -> None:

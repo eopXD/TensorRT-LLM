@@ -869,9 +869,24 @@ class PyTorchModelEngine(ModelEngine):
             return ()
         if self._lora_components is not None:
             return self._lora_components
-        if self.mapping.world_size != 1:
+        mapping = self.mapping
+        if (mapping.world_size != mapping.tp_size or mapping.pp_size != 1
+                or mapping.cp_size != 1 or mapping.attn_cp_size != 1
+                or mapping.attn_tp_size != mapping.tp_size
+                or mapping.moe_ep_size != 1 or mapping.moe_cluster_size != 1
+                or mapping.moe_tp_size != mapping.tp_size
+                or mapping.enable_attention_dp or mapping.dwdp_enabled
+                or mapping.world_size > mapping.gpus_per_node):
             raise ValueError(
-                "Multimodal LoRA currently requires TP1/PP1 on one rank")
+                "Multimodal LoRA requires single-node tensor parallelism with "
+                "PP1/CP1/EP1, without attention DP or DWDP")
+        supported_tp_sizes = getattr(self.model, "component_lora_tp_sizes",
+                                     (1, ))
+        if mapping.tp_size not in supported_tp_sizes:
+            raise ValueError(
+                f"{type(self.model).__name__} does not support component LoRA "
+                f"at TP{mapping.tp_size}; supported TP sizes: {supported_tp_sizes}"
+            )
         mm_config = self.llm_args.multimodal_config
         if mm_config.encoder_cuda_graph:
             raise ValueError(
@@ -901,7 +916,8 @@ class PyTorchModelEngine(ModelEngine):
                 f"{type(self.model).__name__} does not declare multimodal LoRA support"
             )
         components = bind_component_lora(self.model,
-                                         configure(lora_config.max_lora_rank))
+                                         configure(lora_config.max_lora_rank),
+                                         tp_size=mapping.tp_size)
         if not components or any(owner.dtype != "bfloat16"
                                  for owner in components):
             raise ValueError(

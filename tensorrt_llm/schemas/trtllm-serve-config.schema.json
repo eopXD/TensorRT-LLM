@@ -3342,7 +3342,7 @@
         },
         "enable_multimodal_lora": {
           "default": false,
-          "description": "Enable runtime LoRA on explicitly supported multimodal encoders and connectors. A request selects one adapter checkpoint for all of its targeted components. Requires a supported BF16 model with TP1/PP1 and eager encoders; decoder CUDA graphs remain supported.",
+          "description": "Enable runtime LoRA on explicitly supported multimodal encoders and connectors. A request selects one adapter checkpoint for all of its targeted components. Requires a supported BF16 model with its declared single-node tensor-parallel topology, PP1 and eager encoders; decoder CUDA graphs remain supported.",
           "title": "Enable Multimodal Lora",
           "type": "boolean"
         },

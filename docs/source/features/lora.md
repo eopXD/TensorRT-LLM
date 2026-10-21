@@ -241,10 +241,11 @@ request; that checkpoint can contain any supported subset of components.
 
 The runtime accepts these native, unquantized BF16 model configurations:
 
-| Model configuration | Vision encoder | Audio encoder | Connectors |
-| --- | --- | --- | --- |
-| Nemotron Nano-Omni-30B (`NemotronH_Nano_Omni_Reasoning_V3`) | RADIO-H Q/K/V, fused QKV, output projection | Parakeet Q/K/V and output projection | Both linear projections in the vision and audio connectors |
-| Mistral Small 3.1 (`Mistral3ForConditionalGeneration`, dense decoder) | Pixtral Q/K/V and output projection | Not available | `linear_1` and `linear_2` in the multimodal projector |
+| Model configuration | Vision encoder | Audio encoder | Connectors | Tensor parallelism |
+| --- | --- | --- | --- | --- |
+| Nemotron Nano-Omni-30B (`NemotronH_Nano_Omni_Reasoning_V3`) | RADIO-H Q/K/V, fused QKV, output projection | Parakeet Q/K/V and output projection | Both linear projections in the vision and audio connectors | TP1 |
+| Nemotron Super 3.5 VL (`NemotronH_Omni_Reasoning_V3`, vision-only, 4096-wide 88-block decoder) | RADIO-H Q/K/V, fused QKV, output projection | Not available | Both linear projections in the vision connector | TP4 on one node |
+| Mistral Small 3.1 (`Mistral3ForConditionalGeneration`, dense decoder) | Pixtral Q/K/V and output projection | Not available | `linear_1` and `linear_2` in the multimodal projector | TP1 |
 
 Other variants of these architectures require their own component declarations.
 Encoder MLPs, patch embeddings, audio convolutions, and the Mistral patch merger
@@ -267,9 +268,9 @@ paths before normalization. The optional `base_model.model.` prefix and
 
 | Component | Accepted module path examples |
 | --- | --- |
-| Nano-Omni vision | `vision_model.radio_model.model.blocks.0.attn.q_proj`, `vision_model.encoder.layer.0.attention.query` |
+| Nemotron vision | `vision_model.radio_model.model.blocks.0.attn.q_proj`, `vision_model.encoder.layer.0.attention.query`, `vision_model.encoder.layer.0.attention.attention.query` |
 | Nano-Omni audio | `sound_encoder.encoder.layers.0.self_attn.q_proj` |
-| Nano-Omni vision connector | `mlp1.1`, `mlp1.3`, `vision_projector.mlp1.linear1`, `vision_projector.mlp1.linear2` |
+| Nemotron vision connector | `mlp1.1`, `mlp1.3`, `vision_projector.mlp1.linear1`, `vision_projector.mlp1.linear2` |
 | Nano-Omni audio connector | `sound_projection.linear1`, `sound_projection.linear2` |
 | Mistral vision | `vision_tower.transformer.layers.0.attention.q_proj`, `model.vision_tower.transformer.layers.0.attention.q_proj` |
 | Mistral connector | `multi_modal_projector.linear_1`, `model.multi_modal_projector.linear_1` |
@@ -283,16 +284,24 @@ DoRA, `alpha_pattern`, and `fan_in_fan_out` are not supported for these composit
 checkpoints. The component policy accepts HF checkpoints only. With the policy
 disabled, decoder-only checkpoints retain their existing format rules.
 
-Component LoRA currently requires TP1/PP1 on one rank, local encoder and decoder
-execution, and eager encoders. Decoder CUDA graphs remain available. Encoder
+Use full, unsharded HF adapter weights for Super VL. The runtime shards RADIO
+attention and decoder adapters across four ranks and replicates the vision
+connector adapters on every rank. Adapter checkpoints cannot contain audio
+targets for this vision-only configuration.
+
+Component LoRA requires the model's listed TP size on one node, PP1/CP1/EP1,
+local encoder and decoder execution, and eager encoders. Attention DP, DWDP,
+MoE clusters, and component TP subgroups are unsupported. Decoder CUDA graphs
+remain available. Encoder
 CUDA graphs, prefill CUDA graphs, `torch.compile`, disaggregated serving,
 encoder-only workers, encoder side-stream prefetch, and EVS video pruning are
 rejected when this policy is enabled.
 Item scheduling supports `DEFAULT` and `DISABLED`; `EAGER` is rejected because
 it can request adapter residency before LLM admission releases cache capacity.
-For Nano-Omni, set `video_pruning_rate` to `null` or `0.0` to keep video pruning
-disabled. Leave this option unset for Mistral; its input processor does not accept
-an explicit pruning rate.
+For Nano Omni, set `video_pruning_rate` to `null` or `0.0` to keep video pruning
+disabled. Set it explicitly to `0.0` for Super VL, whose checkpoint can enable
+pruning by default. Leave this option unset for Mistral; its input processor does
+not accept an explicit pruning rate.
 
 Different requests in a batch can select different adapters or no adapter.
 Encoder mappings follow physical patch/frame rows, including audio padding;

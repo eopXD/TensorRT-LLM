@@ -322,6 +322,14 @@ def test_binding_assigns_distinct_component_ids_to_same_local_projection(
 def test_binding_rejects_shared_layer_claimed_by_distinct_components(
     components: tuple[ComponentLoraOwner, ...],
 ) -> None:
+    components = (
+        components[0],
+        replace(
+            components[1],
+            targets=(replace(components[1].targets[0], output_size=8),),
+        ),
+        *components[2:],
+    )
     model = _component_model(components)
     model.audio.projection = model.vision.projection
 

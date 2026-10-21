@@ -17,9 +17,14 @@ from .ownership import ComponentLoraOwner
 
 
 def bind_component_lora(
-    model: nn.Module, components: tuple[ComponentLoraOwner, ...]
+    model: nn.Module,
+    components: tuple[ComponentLoraOwner, ...],
+    *,
+    tp_size: int = 1,
 ) -> tuple[ComponentLoraOwner, ...]:
     """Assign execution IDs and bind each declared projection to its LoRA layer."""
+    if tp_size <= 0:
+        raise ValueError("Component LoRA requires a positive executor TP size")
     next_id = max(LoraManager.LORA_MODULE_IDS.values()) + 1
     descriptors: dict[tuple, int] = {}
     bound_layers: dict[LoraLayer, tuple[str, int, dict[int, int]]] = {}
@@ -40,10 +45,29 @@ def bind_component_lora(
                 raise ValueError(
                     f"Invalid dimensions or layer index for {owner.name}.{target.module_path}"
                 )
-            if target.tp_size != 1 or (target.in_tp_split_dim, target.out_tp_split_dim) != (-1, -1):
+            split_dims = (target.in_tp_split_dim, target.out_tp_split_dim)
+            replicated = target.tp_size == 1 and split_dims == (-1, -1)
+            sharded = target.tp_size == tp_size and tp_size > 1 and split_dims in ((-1, 0), (1, -1))
+            if not replicated and not sharded:
                 raise ValueError(
-                    "Multimodal component LoRA currently requires replicated TP1 targets"
+                    "Component LoRA targets must be replicated TP1 or sharded across "
+                    "the executor TP group with one split dimension"
                 )
+            if sharded and target.fused_output_sizes and target.out_tp_split_dim != 0:
+                raise ValueError("Fused component LoRA targets require output TP sharding")
+            if (target.in_tp_split_dim == 1 and target.input_size % tp_size) or (
+                target.out_tp_split_dim == 0 and target.output_size % tp_size
+            ):
+                raise ValueError("Component LoRA split dimensions must be divisible by TP size")
+            if target.fused_output_sizes and (
+                sum(target.fused_output_sizes) != target.output_size
+                or any(size <= 0 for size in target.fused_output_sizes)
+                or (
+                    target.out_tp_split_dim == 0
+                    and any(size % tp_size for size in target.fused_output_sizes)
+                )
+            ):
+                raise ValueError("Invalid component LoRA fused projection sizes for TP layout")
             signature = (
                 owner.name,
                 target.module_type,
@@ -66,6 +90,16 @@ def bind_component_lora(
             if semantic_id not in layer.lora_module_types:
                 raise ValueError(
                     f"{owner.name}.{target.module_path} does not implement {target.module_type}"
+                )
+            local_output_size = target.output_size
+            if target.out_tp_split_dim == 0:
+                local_output_size //= tp_size
+            projection_index = layer.lora_module_types.index(semantic_id)
+            if layer.output_hidden_sizes[projection_index] != local_output_size:
+                raise ValueError(
+                    f"Component LoRA target {owner.name}.{target.module_path} declares local "
+                    f"output size {local_output_size}, but the bound LoRA layer requires "
+                    f"{layer.output_hidden_sizes[projection_index]}"
                 )
             layer_owner, layer_idx, module_ids = bound_layers.setdefault(
                 layer, (owner.name, target.layer_idx, {})

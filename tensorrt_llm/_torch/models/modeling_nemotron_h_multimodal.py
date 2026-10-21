@@ -3049,47 +3049,91 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
         "mamba_out_proj",
     )
 
+    @property
+    def component_lora_tp_sizes(self) -> tuple[int, ...]:
+        config = self._mm_model_config.pretrained_config
+        return (4,) if "NemotronH_Omni_Reasoning_V3" in (config.architectures or []) else (1,)
+
     def configure_component_lora(self, max_lora_rank: int) -> tuple[ComponentLoraOwner, ...]:
-        """Declare the BF16 Nano-Omni-30B native towers and connectors."""
+        """Declare the BF16 Nano Omni and Super VL native towers and connectors."""
         if hasattr(self, "_component_lora_owners"):
             return self._component_lora_owners
         config = self._mm_model_config.pretrained_config
+        architectures = config.architectures or []
+        is_super = "NemotronH_Omni_Reasoning_V3" in architectures
+        hidden_size, num_layers = (4096, 88) if is_super else (2688, 52)
+        vision_tp_size = 4 if is_super else 1
         sound_config = getattr(config, "sound_config", None)
         if (
-            "NemotronH_Nano_Omni_Reasoning_V3" not in (config.architectures or [])
+            (not is_super and "NemotronH_Nano_Omni_Reasoning_V3" not in architectures)
             or config.torch_dtype != torch.bfloat16
             or (
                 self._mm_model_config.quant_config is not None
                 and self._mm_model_config.quant_config.quant_algo is not None
             )
-            or config.llm_config.hidden_size != 2688
-            or config.llm_config.num_hidden_layers != 52
+            or config.llm_config.hidden_size != hidden_size
+            or config.llm_config.num_hidden_layers != num_layers
             or config.vit_hidden_size != 1280
             or config.projector_hidden_size != 20480
-            or sound_config is None
+            or config.patch_size != 16
+            or config.downsample_ratio != 0.5
+            or config.vision_config.args.get("model") != "vit_huge_patch16_224"
+            or self._mm_model_config.mapping.tp_size != vision_tp_size
+            or self.vision_encoder is None
+        ):
+            raise ValueError(
+                "Component LoRA requires BF16 Nemotron Nano-Omni-30B at TP1 or Super-3.5-VL at TP4"
+            )
+        if is_super:
+            if sound_config is not None or self.sound_encoder is not None:
+                raise ValueError("Super VL component LoRA requires a vision-only configuration")
+        elif (
+            sound_config is None
             or sound_config.hidden_size != 1024
             or sound_config.num_hidden_layers != 24
             or sound_config.num_attention_heads != 8
             or sound_config.projection_hidden_size != 4096
-            or self.vision_encoder is None
             or self.sound_encoder is None
         ):
-            raise ValueError(
-                "Component LoRA requires the BF16 Nemotron Nano-Omni-30B configuration"
-            )
+            raise ValueError("Nano Omni component LoRA requires the native Parakeet audio tower")
         vision = self.vision_encoder.vision_model.radio_model.model
         if len(vision.blocks) != 32 or vision.embed_dim != 1280:
             raise ValueError("Component LoRA requires the native 32-block RADIO-H vision tower")
+        projection = self.vision_encoder.mlp1
+        if (
+            len(projection) != 4
+            or (projection[1].in_features, projection[1].out_features) != (5120, 20480)
+            or (projection[3].in_features, projection[3].out_features) != (20480, hidden_size)
+        ):
+            raise ValueError("Component LoRA requires the native RADIO-H vision projector")
 
         vision_targets = []
         for layer_idx, block in enumerate(vision.blocks):
             attention = block.attn
+            tp_size = attention.mapping.tp_size
+            q_size, kv_size = attention.q_size * tp_size, attention.kv_size * tp_size
+            if (
+                tp_size != vision_tp_size
+                or attention.tp_size != tp_size
+                or attention.hidden_size != 1280
+                or attention.num_heads * tp_size != 16
+                or attention.num_key_value_heads * tp_size != 16
+                or attention.head_dim != 80
+                or (q_size, kv_size) != (1280, 1280)
+                or (attention.qkv_proj.in_features, attention.qkv_proj.out_features)
+                != (1280, attention.q_size + 2 * attention.kv_size)
+                or (attention.o_proj.in_features, attention.o_proj.out_features)
+                != (attention.q_size, 1280)
+            ):
+                raise ValueError("Component LoRA requires the native RADIO-H attention topology")
+            column_split = 0 if tp_size > 1 else -1
+            row_split = 1 if tp_size > 1 else -1
             prefix = f"vision_model.radio_model.model.blocks.{layer_idx}.attn"
             modelopt_prefix = f"vision_model.encoder.layer.{layer_idx}.attention"
             for module_type, projection, modelopt_projection, output_size in (
-                ("attn_q", "q_proj", "query", attention.q_size),
-                ("attn_k", "k_proj", "key", attention.kv_size),
-                ("attn_v", "v_proj", "value", attention.kv_size),
+                ("attn_q", "q_proj", "query", q_size),
+                ("attn_k", "k_proj", "key", kv_size),
+                ("attn_v", "v_proj", "value", kv_size),
             ):
                 vision_targets.append(
                     ComponentLoraTarget(
@@ -3097,12 +3141,15 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                         checkpoint_modules=(
                             f"{prefix}.{projection}",
                             f"{modelopt_prefix}.{modelopt_projection}",
+                            f"{modelopt_prefix}.attention.{modelopt_projection}",
                         ),
                         layer_idx=layer_idx,
                         module_type=module_type,
                         execution_id=-1,
                         input_size=attention.hidden_size,
                         output_size=output_size,
+                        tp_size=tp_size,
+                        out_tp_split_dim=column_split,
                     )
                 )
             vision_targets.extend(
@@ -3114,8 +3161,10 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                         module_type="attn_qkv",
                         execution_id=-1,
                         input_size=attention.hidden_size,
-                        output_size=attention.q_size + 2 * attention.kv_size,
-                        fused_output_sizes=(attention.q_size, attention.kv_size, attention.kv_size),
+                        output_size=q_size + 2 * kv_size,
+                        fused_output_sizes=(q_size, kv_size, kv_size),
+                        tp_size=tp_size,
+                        out_tp_split_dim=column_split,
                     ),
                     ComponentLoraTarget(
                         module_path=f"blocks.{layer_idx}.attn.o_lora",
@@ -3127,15 +3176,29 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                         layer_idx=layer_idx,
                         module_type="attn_dense",
                         execution_id=-1,
-                        input_size=attention.q_size,
+                        input_size=q_size,
                         output_size=attention.hidden_size,
+                        tp_size=tp_size,
+                        in_tp_split_dim=row_split,
                     ),
                 )
             )
 
         audio_targets = []
-        for layer_idx, block in enumerate(self.sound_encoder.encoder.layers):
+        audio_layers = self.sound_encoder.encoder.layers if self.sound_encoder is not None else ()
+        if self.sound_encoder is not None and len(audio_layers) != 24:
+            raise ValueError("Component LoRA requires the native 24-block Parakeet audio tower")
+        for layer_idx, block in enumerate(audio_layers):
             attention = block.self_attn
+            if (
+                attention.mapping.tp_size != 1
+                or attention.tp_size != 1
+                or attention.hidden_size != 1024
+                or attention.num_heads != 8
+                or attention.num_key_value_heads != 8
+                or (attention.q_size, attention.kv_size) != (1024, 1024)
+            ):
+                raise ValueError("Component LoRA requires the native Parakeet attention topology")
             for module_type, projection, lora_name, output_size in (
                 ("attn_q", "q_proj", "splitted_qkv_lora", attention.q_size),
                 ("attn_k", "k_proj", "splitted_qkv_lora", attention.kv_size),
@@ -3156,12 +3219,11 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                     )
                 )
 
-        self.vision_encoder.mlp1 = _NemotronVisionProjection(self.vision_encoder.mlp1)
         vision_connector_targets = []
         audio_connector_targets = []
-        for index, name, module_type, semantic_type in (
-            (1, "linear1", "mlp_h_to_4h", LoraModuleType.MLP_H_TO_4H),
-            (3, "linear2", "mlp_4h_to_h", LoraModuleType.MLP_4H_TO_H),
+        for index, name, module_type in (
+            (1, "linear1", "mlp_h_to_4h"),
+            (3, "linear2", "mlp_4h_to_h"),
         ):
             vision_linear = self.vision_encoder.mlp1[index]
             vision_connector_targets.append(
@@ -3175,20 +3237,28 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                     output_size=vision_linear.out_features,
                 )
             )
-            audio_linear = getattr(self.sound_encoder.projection, name)
-            audio_linear.lora = LoraLayer([semantic_type], [audio_linear.out_features])
-            audio_connector_targets.append(
-                ComponentLoraTarget(
-                    module_path=f"{name}.lora",
-                    checkpoint_modules=(f"sound_projection.{name}",),
-                    layer_idx=0,
-                    module_type=module_type,
-                    execution_id=-1,
-                    input_size=audio_linear.in_features,
-                    output_size=audio_linear.out_features,
+            if self.sound_encoder is not None:
+                audio_linear = getattr(self.sound_encoder.projection, name)
+                expected_dims = (1024, 4096) if index == 1 else (4096, hidden_size)
+                if (
+                    audio_linear.tp_size != 1
+                    or (audio_linear.in_features, audio_linear.out_features) != expected_dims
+                ):
+                    raise ValueError("Component LoRA requires the native Parakeet projector")
+                audio_connector_targets.append(
+                    ComponentLoraTarget(
+                        module_path=f"{name}.lora",
+                        checkpoint_modules=(f"sound_projection.{name}",),
+                        layer_idx=0,
+                        module_type=module_type,
+                        execution_id=-1,
+                        input_size=audio_linear.in_features,
+                        output_size=audio_linear.out_features,
+                    )
                 )
-            )
-        self._component_lora_owners = (
+
+        self.vision_encoder.mlp1 = _NemotronVisionProjection(self.vision_encoder.mlp1)
+        owners = [
             ComponentLoraOwner(
                 "vision",
                 "vision_encoder.vision_model.radio_model.model",
@@ -3196,15 +3266,26 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                 "bfloat16",
                 max_lora_rank,
                 ("vision_model",),
-            ),
-            ComponentLoraOwner(
-                "audio",
-                "sound_encoder.encoder",
-                tuple(audio_targets),
-                "bfloat16",
-                max_lora_rank,
-                ("sound_encoder",),
-            ),
+            )
+        ]
+        if self.sound_encoder is not None:
+            self.sound_encoder.projection.linear1.lora = LoraLayer(
+                [LoraModuleType.MLP_H_TO_4H], [self.sound_encoder.projection.linear1.out_features]
+            )
+            self.sound_encoder.projection.linear2.lora = LoraLayer(
+                [LoraModuleType.MLP_4H_TO_H], [self.sound_encoder.projection.linear2.out_features]
+            )
+            owners.append(
+                ComponentLoraOwner(
+                    "audio",
+                    "sound_encoder.encoder",
+                    tuple(audio_targets),
+                    "bfloat16",
+                    max_lora_rank,
+                    ("sound_encoder",),
+                )
+            )
+        owners.append(
             ComponentLoraOwner(
                 "vision_connector",
                 "vision_encoder.mlp1",
@@ -3212,16 +3293,20 @@ class NemotronHMultimodalModel(MultimodalModelMixin, transformers.PreTrainedMode
                 "bfloat16",
                 max_lora_rank,
                 ("mlp1", "vision_projector"),
-            ),
-            ComponentLoraOwner(
-                "audio_connector",
-                "sound_encoder.projection",
-                tuple(audio_connector_targets),
-                "bfloat16",
-                max_lora_rank,
-                ("sound_projection",),
-            ),
+            )
         )
+        if self.sound_encoder is not None:
+            owners.append(
+                ComponentLoraOwner(
+                    "audio_connector",
+                    "sound_encoder.projection",
+                    tuple(audio_connector_targets),
+                    "bfloat16",
+                    max_lora_rank,
+                    ("sound_projection",),
+                )
+            )
+        self._component_lora_owners = tuple(owners)
         return self._component_lora_owners
 
     def __init__(self, model_config: ModelConfig):

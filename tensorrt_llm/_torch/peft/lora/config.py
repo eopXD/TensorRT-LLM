@@ -73,8 +73,8 @@ class LoraConfig(StrictBaseModel):
         description=
         "Enable runtime LoRA on explicitly supported multimodal encoders and connectors. "
         "A request selects one adapter checkpoint for all of its targeted components. "
-        "Requires a supported BF16 model with TP1/PP1 and eager encoders; decoder CUDA graphs remain supported."
-    )
+        "Requires a supported BF16 model with its declared single-node tensor-parallel topology, "
+        "PP1 and eager encoders; decoder CUDA graphs remain supported.")
     lora_dir: List[str] = Field(
         default_factory=list,
         description="List of directories containing LoRA adapter checkpoints. "

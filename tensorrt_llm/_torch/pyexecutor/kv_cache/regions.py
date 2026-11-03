@@ -345,6 +345,16 @@ class RegionLayout:
         """Storage layers each model layer may own: one plus the highest storage index."""
         return 1 + max((region.storage_index for region in self.regions), default=0)
 
+    def declared_layer(self, model_layer: int) -> Optional[Tuple[Region, RegionLayer]]:
+        """The region and declaration that take ``model_layer``'s own storage id, if any."""
+        for region in self.regions:
+            if region.storage_index != 0:
+                continue
+            for layer in region.layers:
+                if layer.model_layer == model_layer:
+                    return region, layer
+        return None
+
     def covered_model_layers(self) -> FrozenSet[int]:
         """Model layers whose own storage id a region declares (storage index 0)."""
         return frozenset(

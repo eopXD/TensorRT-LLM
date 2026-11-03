@@ -44,6 +44,7 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import FLASHINFER_
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import (
     _KDA_BETA_CACHE_ALIGNMENT_BYTES,
     KDAIntermediateState,
+    KdaRegionProvider,
     KDAReplayLayerCache,
     KDAReplayState,
     KimiK3HybridCacheManager,
@@ -2762,10 +2763,20 @@ def test_v2_hybrid_fp4_disagg_ignores_derived_mla_and_kda_replay_roles(
 ) -> None:
     mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch, KimiK3HybridCacheManager)
     mgr._state_layout = None
+    mgr.mamba_pp_layers = [0, 2]
     mgr._kda_replay = (
-        SimpleNamespace(disagg_ignored_roles=lambda _: frozenset({DataRole("kda_conv_q")}))
+        SimpleNamespace(
+            disagg_ignored_roles=lambda _: frozenset({DataRole("kda_conv_q")}),
+            pool_buffer_configs=lambda _layout, _layer: [],
+        )
         if kda_replay
         else None
+    )
+    layout = mgr.region_layout
+    mgr._region_layout = RegionLayout(
+        num_model_layers=layout.num_model_layers,
+        owners=layout.owners,
+        regions=(*layout.regions, *KdaRegionProvider(mgr).declare_regions()),
     )
 
     ignored = mgr.get_disagg_ignored_roles()
@@ -5486,7 +5497,16 @@ def _v2_kda_draft_record_manager(kda_draft_records, enable_block_reuse):
         enable_block_reuse=enable_block_reuse,
         enable_partial_reuse=False,
     )
+    # The KDA layer is a region of the manager, declared as the constructor does.
+    mgr.layer_offsets = {0: 0, 1: 1}
+    mgr._region_provider_list = (KdaRegionProvider(mgr),)
+    mgr._declare_regions()
     return mgr
+
+
+def _build_kda_draft_record_config(mgr, config):
+    """Lay out the regions and build the cache config, in the constructor's order."""
+    return mgr._build_cache_config(mgr._lay_out_regions(config))
 
 
 def _ring_gate_manager(
@@ -7150,6 +7170,10 @@ def test_v2_kda_draft_records_replace_the_replay_caches(kda_replay_num_spec):
             assert not mgr.keeps_kda_draft_records
             return
         assert mgr.keeps_kda_draft_records
+        # The replay buffers are planes of the KDA region, in the recurrent state's slot.
+        assert mgr.region_layout.layer_ids(KdaRegionProvider.NAME) == (LayerId(0), LayerId(1))
+        kda_planes = {str(plane.role) for plane in mgr.region_layout.region_layer(0).planes}
+        assert {"ssm_state", "conv_state", "kda_state_tok"} <= kda_planes
         assert set(mgr._kda_replay_layout()) == {
             "kda_conv_q",
             "kda_conv_k",
@@ -7363,13 +7387,15 @@ def test_v2_kda_draft_records_size_with_the_ssm_pool(pool_sizing):
 
     quota = 128 << 20
     pool_ratio = [0.5, 0.5] if pool_sizing == "pool_ratio" else None
-    built = mgr._build_cache_config(_kda_draft_record_build_config(quota, pool_ratio))
+    built = _build_kda_draft_record_config(mgr, _kda_draft_record_build_config(quota, pool_ratio))
     assert built.cache_tiers[0].quota == quota
     ssm_buffers = {str(buffer.role): buffer.size for buffer in built.layers[0].buffers}
     assert ssm_buffers["kda_state_tok"] == records
     assert not set(ssm_buffers) & set(_KDA_REPLAY_BUFFERS[3:])
     with pytest.raises(ValueError, match="too small for live recurrent states"):
-        mgr._build_cache_config(_kda_draft_record_build_config(mgr._minimum_live_gpu_quota() - 1))
+        _build_kda_draft_record_config(
+            mgr, _kda_draft_record_build_config(mgr._minimum_live_gpu_quota() - 1)
+        )
 
 
 @skip_no_cuda
@@ -7381,7 +7407,7 @@ def test_v2_kda_draft_records_leave_the_quota_to_the_pools(enable_block_reuse):
         kda_draft_records=True, enable_block_reuse=enable_block_reuse
     )
     runtime_manager = RuntimeKVCacheManager(
-        mgr._build_cache_config(_kda_draft_record_build_config(128 << 20))
+        _build_kda_draft_record_config(mgr, _kda_draft_record_build_config(128 << 20))
     )
     try:
         pool_bytes = runtime_manager.get_quota(GPU_LEVEL)

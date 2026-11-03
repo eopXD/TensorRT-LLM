@@ -10,6 +10,7 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from typing import Sequence
 
 import torch
 
@@ -32,6 +33,17 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
+    AllocationUnit,
+    HandOff,
+    Plane,
+    Region,
+    RegionContext,
+    RegionLayer,
+    RegionLifeCycle,
+    RegionProvider,
+    RegionTransfer,
 )
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -929,6 +941,51 @@ def get_kda_replay_num_spec(
     return kda_mtp_replay_num_spec(spec_config.tokens_per_gen_step - 1)
 
 
+class KdaRegionProvider(RegionProvider):
+    """Kimi K3's KDA recurrent state, with the fused-verify replay buffers in its slot.
+
+    The replay buffers share the recurrent state's slot, so the KDA kernels
+    address both through one state index. They are never transferred: the
+    generation worker seeds them from the transferred convolution state.
+
+    Args:
+        manager: The manager whose KDA layers the region covers.
+    """
+
+    NAME = "kda_recurrent_state"
+
+    def __init__(self, manager: "KimiK3HybridCacheManager") -> None:
+        self._manager = manager
+
+    def declare_regions(self) -> Sequence[Region]:
+        manager = self._manager
+        replay = manager._kda_replay
+        layers = []
+        for layer_id in manager.mamba_pp_layers:
+            buffers = manager._get_recurrent_buffer_configs(layer_id)
+            if replay is not None:
+                buffers.extend(replay.pool_buffer_configs(manager._state_layout, layer_id))
+            layers.append(
+                RegionLayer(
+                    manager.layer_offsets[layer_id],
+                    tuple(Plane(buffer.role, buffer.size) for buffer in buffers),
+                )
+            )
+        rebuilt = (
+            replay.disagg_ignored_roles(manager._state_layout)
+            if replay is not None
+            else frozenset()
+        )
+        return [
+            Region(
+                self.NAME,
+                RegionLifeCycle(AllocationUnit.REQUEST, HandOff.DECLARED_POINTS),
+                tuple(layers),
+                transfer=RegionTransfer(rebuilt_roles=rebuilt),
+            )
+        ]
+
+
 class KimiK3HybridCacheManager(Fp4MlaHybridCacheManager):
     """KDA/MLA cache layout and K3-only replay lifecycle handling."""
 
@@ -994,20 +1051,8 @@ class KimiK3HybridCacheManager(Fp4MlaHybridCacheManager):
         return self._kda_replay.pool_layout(self._state_layout)
 
     @override
-    def _get_recurrent_buffer_configs(self, global_layer_id: int) -> list[BufferConfig]:
-        buffers = super()._get_recurrent_buffer_configs(global_layer_id)
-        if self._kda_replay is not None:
-            buffers.extend(
-                self._kda_replay.pool_buffer_configs(self._state_layout, global_layer_id)
-            )
-        return buffers
-
-    @override
-    def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        roles = super().get_disagg_ignored_roles()
-        if self._kda_replay is not None:
-            roles |= self._kda_replay.disagg_ignored_roles(self._state_layout)
-        return roles
+    def _create_region_providers(self, context: RegionContext) -> Sequence[RegionProvider]:
+        return [*super()._create_region_providers(context), KdaRegionProvider(self)]
 
     @override
     def _setup_model_state(self) -> None:
@@ -1277,6 +1322,7 @@ def get_kimi_cache_params(config, *, spec_config=None, quant_config=None):
 
 
 __all__ = [
+    "KdaRegionProvider",
     "KDAIntermediateLayerCache",
     "KDAIntermediateState",
     "KDAReplayState",

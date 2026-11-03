@@ -50,6 +50,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     AllocationUnit,
+    Region,
     RegionContext,
     RegionProvider,
 )
@@ -600,11 +601,17 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     def _mamba_state_bytes_per_slot(self) -> int:
         """Return persistent bytes per slot allocated by the native pools."""
-        return sum(
-            buffer.size
-            for layer_id in self.mamba_pp_layers
-            for buffer in self._get_recurrent_buffer_configs(layer_id)
-        )
+        layout = self.region_layout
+        total = 0
+        for layer_id in self.mamba_pp_layers:
+            declared = (
+                layout.declared_layer(self.layer_offsets[layer_id]) if layout.regions else None
+            )
+            if declared is not None:
+                total += sum(plane.page_bytes for plane in declared[1].planes)
+            else:
+                total += sum(buffer.size for buffer in self._get_recurrent_buffer_configs(layer_id))
+        return total
 
     def _num_ssm_snapshots_for_capacity(
         self,
@@ -785,6 +792,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # Register pool-owned roles here, then bind their typed views in
         # _get_state_buffer. Model scratch must not participate in warmup cleanup.
         self._recurrent_buffers: dict[tuple[int, DataRole], torch.Tensor | None] = {}
+        layout = self.region_layout
+        for layer_id, owner in layout.owners.items():
+            if layout.region(owner.region).life_cycle.allocation == AllocationUnit.REQUEST:
+                for plane in layout.region_layer(layer_id).planes:
+                    self._recurrent_buffers[layer_id, plane.role] = None
         for local_layer_idx, global_layer_idx in enumerate(self.pp_layers):
             if (
                 self._mamba_layer_mask[global_layer_idx]
@@ -1142,9 +1154,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             conv=self.get_conv_states(layer_idx), temporal=self.get_ssm_states(layer_idx)
         )
 
+    def _primary_region(self) -> Optional[Region]:
+        """The first declared token-block region stored under model layer ids, if any."""
+        for region in self.region_layout.regions:
+            if (
+                region.life_cycle.allocation == AllocationUnit.TOKEN_BLOCK
+                and region.storage_index == 0
+                and region.layers
+            ):
+                return region
+        return None
+
     def _attention_cache_bytes_per_token(self) -> int:
         layout = self.region_layout
-        if not layout.regions:
+        if self._primary_region() is None:
             # Mamba layers have zero KV heads, so the generic calculation
             # naturally returns only bytes owned by local attention layers.
             return super().get_cache_bytes_per_token()
@@ -1183,7 +1206,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         assert not set(self.kv_cache_map) - reserved, (
             "get_num_free_blocks is only used when the kv cache manager is empty"
         )
-        if self.region_layout.regions:
+        if self._primary_region() is not None:
             return self.blocks_in_primary_pool
         attention_pages = []
         ssm_pages = []
@@ -1205,18 +1228,15 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     @property
     @override
     def blocks_in_primary_pool(self) -> int:
-        """Blocks of the first attention layer: the primary region's when regions exist.
+        """Blocks of the primary attention pool.
 
-        The primary region is the first declared token-block region stored
-        under model layer ids.
+        That is the first layer of the primary region (the first declared
+        token-block region stored under model layer ids) when one exists, and
+        the first attention layer otherwise.
         """
-        for region in self.region_layout.regions:
-            if (
-                region.life_cycle.allocation == AllocationUnit.TOKEN_BLOCK
-                and region.storage_index == 0
-                and region.layers
-            ):
-                return self.get_kv_cache_num_blocks(self.pp_layers[region.layers[0].model_layer])
+        region = self._primary_region()
+        if region is not None:
+            return self.get_kv_cache_num_blocks(self.pp_layers[region.layers[0].model_layer])
         for local_layer_idx in range(self.num_local_layers):
             if self._is_local_mamba_layer(local_layer_idx):
                 continue

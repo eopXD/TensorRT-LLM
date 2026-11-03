@@ -88,7 +88,12 @@ def _hybrid_regions():
             tuple(RegionLayer(i, (Plane(SSM, 512), Plane(CONV, 96))) for i in (0, 2)),
         ),
         Region("latent", FULL_HISTORY, tuple(RegionLayer(i, (Plane(KEY, 128),)) for i in (1, 3))),
-        Region("ring", RING_OF_19, tuple(RegionLayer(i, (Plane(RING, 76),)) for i in (1, 3))),
+        Region(
+            "ring",
+            RING_OF_19,
+            tuple(RegionLayer(i, (Plane(RING, 76),)) for i in (1, 3)),
+            storage_index=1,
+        ),
     ]
 
 
@@ -146,8 +151,8 @@ def test_regions_take_their_model_layers_and_append_shared_ones():
             ReusePolicy.REQUIRED,
         ),
         ("attention", 3, [("key", 128, 0, None)], None, None, ReusePolicy.REQUIRED),
-        # The ring shares model layers 1 and 3 with the latent, so it is stored
-        # after the model layers, in its own declaration order.
+        # The ring is the second storage of model layers 1 and 3, so it is
+        # stored after the model layers, in its own declaration order.
         ("attention", 4, [("ring", 76, 0, None)], 19, None, ReusePolicy.REQUIRED),
         ("attention", 5, [("ring", 76, 0, None)], 19, None, ReusePolicy.REQUIRED),
     ]
@@ -158,6 +163,34 @@ def test_regions_take_their_model_layers_and_append_shared_ones():
     assert layout.is_model_layer(3) and not layout.is_model_layer(4)
     assert layout.model_layer_of(4) == 1
     assert layout.region("ring").life_cycle.window == 19
+    assert layout.region_layer(5).planes == (Plane(RING, 76),)
+    # Transfer ids enumerate two storage layers per model layer.
+    assert layout.storage_stride == 2
+    assert [layout.storage_index(i) for i in range(6)] == [0, 0, 0, 0, 1, 1]
+    assert layout.covered_model_layers() == {0, 1, 2, 3}
+
+
+def test_storage_index_zero_is_one_region_per_model_layer():
+    regions = [
+        Region("latent", FULL_HISTORY, (RegionLayer(1, (Plane(KEY, 128),)),)),
+        Region("other", FULL_HISTORY, (RegionLayer(1, (Plane(RING, 76),)),)),
+    ]
+    with pytest.raises(ValueError, match="storage index 0"):
+        lay_out_regions(regions, _base_layers(2))
+    with pytest.raises(ValueError, match="non-negative"):
+        Region("r", FULL_HISTORY, (), storage_index=-1)
+
+
+def test_higher_index_storage_keeps_the_manager_layer():
+    ring = Region("ring", RING_OF_19, (RegionLayer(1, (Plane(RING, 76),)),), storage_index=1)
+
+    layers, layout = lay_out_regions([ring], _base_layers(2))
+
+    assert [_layer_summary(layer) for layer in layers][:2] == [
+        _layer_summary(layer) for layer in _base_layers(2)
+    ]
+    assert layout.owner(1) is None and layout.owner(2) == StorageOwner("ring", 1)
+    assert layout.covered_model_layers() == frozenset()
 
 
 def test_private_regions_never_reach_the_prefix_index():
@@ -186,7 +219,7 @@ def test_layout_rejects_unknown_layers_and_duplicate_names():
 def test_renumbering_follows_the_compacted_layer_list():
     regions = [
         Region("latent", FULL_HISTORY, (RegionLayer(1, (Plane(KEY, 128),)),)),
-        Region("ring", RING_OF_19, (RegionLayer(1, (Plane(RING, 76),)),)),
+        Region("ring", RING_OF_19, (RegionLayer(1, (Plane(RING, 76),)),), storage_index=1),
     ]
     _, layout = lay_out_regions(regions, _base_layers(4))
     assert layout.owners == {1: StorageOwner("latent", 1), 4: StorageOwner("ring", 1)}
@@ -201,7 +234,7 @@ def test_renumbering_follows_the_compacted_layer_list():
 
 
 @dataclass
-class _Provider:
+class _Provider(RegionProvider):
     regions: list
 
     def declare_regions(self):
@@ -234,9 +267,11 @@ def test_manager_without_regions_keeps_its_config():
 
 
 def test_manager_stores_its_providers_regions():
-    provider = _Provider(_hybrid_regions())
-    assert isinstance(provider, RegionProvider)
-    mgr = _manager_stub([provider])
+    mgr = _manager_stub([_Provider(_hybrid_regions())])
+    # Regions are declared before the cache config exists, so costing can read them.
+    mgr._declare_regions()
+    assert [region.name for region in mgr.region_layout.regions] == ["state", "latent", "ring"]
+    assert mgr.region_layout.owners == {}
 
     config = mgr._lay_out_regions(_config(_base_layers(4)))
 
@@ -252,7 +287,7 @@ def test_manager_stores_its_providers_regions():
 def test_dropping_an_empty_layer_keeps_region_ownership_consistent():
     regions = [
         Region("latent", FULL_HISTORY, (RegionLayer(1, (Plane(KEY, 128),)),)),
-        Region("ring", RING_OF_19, (RegionLayer(1, (Plane(RING, 76),)),)),
+        Region("ring", RING_OF_19, (RegionLayer(1, (Plane(RING, 76),)),), storage_index=1),
     ]
     mgr = _manager_stub([_Provider(regions)])
     base = _base_layers(3)
@@ -272,3 +307,15 @@ def test_dropping_an_empty_layer_keeps_region_ownership_consistent():
     assert mgr.num_local_layers == 2
     assert mgr.region_layout.num_model_layers == 2
     assert mgr.region_layout.owner(2) == StorageOwner("ring", 1)
+
+
+def test_provider_hooks_default_to_no_change():
+    provider = _Provider([])
+    config = object()
+
+    assert provider.configure(None, config) is config
+    assert list(provider.iter_cache_views()) == []
+    provider.on_layout(RegionLayout(num_model_layers=0))
+    provider.finalize(None)
+    with pytest.raises(NotImplementedError):
+        RegionProvider().declare_regions()

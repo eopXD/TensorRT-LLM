@@ -33,8 +33,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Dict, Iterable, Optional, Protocol, Sequence, Tuple, Union, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    FrozenSet,
+    Iterable,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
+from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttentionLayerConfig,
     BufferConfig,
@@ -43,6 +55,11 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReusePolicy,
     SsmLayerConfig,
 )
+
+if TYPE_CHECKING:
+    import torch
+
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 LayerConfig = Union[AttentionLayerConfig, SsmLayerConfig]
 
@@ -146,10 +163,13 @@ class RegionLayer:
         model_layer: Rank-local model layer index, as used by the manager's
             per-layer views.
         planes: The planes stored for this layer, in declaration order.
+        bytes_per_token: What one token costs in this layer when the manager
+            converts a memory budget into token capacity.
     """
 
     model_layer: int
     planes: Tuple[Plane, ...]
+    bytes_per_token: int = 0
 
     def __post_init__(self) -> None:
         if not self.planes:
@@ -160,6 +180,24 @@ class RegionLayer:
 
 
 @dataclass(frozen=True)
+class RegionTransfer:
+    """How a region's planes move between disaggregated workers.
+
+    Attributes:
+        mapper_kinds: Layout each transferred plane role is written in, which
+            decides how it is resharded across tensor-parallel ranks.
+        role_layouts: Resharding geometry of the roles whose mapper kind needs it.
+        rebuilt_roles: Roles never transferred; the receiving worker rebuilds
+            them from the transferred planes. Listed even where this worker
+            omits the plane, so both sides of a transfer agree on the set.
+    """
+
+    mapper_kinds: Mapping[DataRole, MapperKind] = field(default_factory=dict)
+    role_layouts: Mapping[DataRole, RoleLayout] = field(default_factory=dict)
+    rebuilt_roles: FrozenSet[DataRole] = frozenset()
+
+
+@dataclass(frozen=True)
 class Region:
     """A unit of persistent state with one life cycle.
 
@@ -167,16 +205,33 @@ class Region:
         name: Identifies the region in the ownership map; unique per manager.
         life_cycle: When the region's memory is allocated, released and handed off.
         layers: The model layers the region covers, each with its planes.
+        storage_index: Position of this region's storage among the regions
+            covering the same model layers. Index 0 is stored under the model
+            layer's own id; each higher index is stored after the model layers
+            and enumerated in the layer's transfer ids.
+        transfer: How the region's planes move between disaggregated workers.
+        resumes_at_block_boundaries: Another request can resume from this
+            region's committed memory only at a token-block boundary, so every
+            declared hand-off point of the manager is moved onto one.
+        positioned_by_history: The region's live window is placed by the
+            request's history length, so the history length must follow every
+            completed context chunk.
     """
 
     name: str
     life_cycle: RegionLifeCycle
     layers: Tuple[RegionLayer, ...]
+    storage_index: int = 0
+    transfer: RegionTransfer = field(default_factory=RegionTransfer)
+    resumes_at_block_boundaries: bool = False
+    positioned_by_history: bool = False
 
     def __post_init__(self) -> None:
         model_layers = [layer.model_layer for layer in self.layers]
         if len(set(model_layers)) != len(model_layers):
             raise ValueError(f"Region {self.name!r} covers a model layer twice: {model_layers}")
+        if self.storage_index < 0:
+            raise ValueError(f"storage_index must be non-negative, got {self.storage_index}")
 
     def layer_config(self, layer_id: int, layer: RegionLayer) -> LayerConfig:
         """Return the V2 layer config storing ``layer`` under ``layer_id``."""
@@ -204,13 +259,57 @@ class Region:
         )
 
 
-@runtime_checkable
-class RegionProvider(Protocol):
-    """Model- or backend-side code that declares persistent-state regions."""
+@dataclass(frozen=True)
+class RegionContext:
+    """Construction arguments of the manager that a provider may need.
+
+    Attributes:
+        kv_cache_type: The manager's ``CacheTypeCpp``.
+        dtype: The manager's KV cache ``DataType``.
+        tokens_per_block: Tokens per cache block.
+        head_dim: Attention head dimension passed to the manager.
+        pretrained_config: The model's pretrained config, if the caller passed one.
+        spec_config: The speculative decoding config, if any.
+        is_disagg: Whether the worker serves disaggregated requests.
+        mapping: The parallel mapping.
+    """
+
+    kv_cache_type: Any
+    dtype: Any
+    tokens_per_block: int
+    head_dim: Any
+    pretrained_config: Any
+    spec_config: Any
+    is_disagg: bool
+    mapping: Any
+
+
+class RegionProvider:
+    """Model- or backend-side code that declares persistent-state regions.
+
+    The manager calls the hooks in order: ``configure`` before it builds
+    anything, ``declare_regions`` once its per-layer views exist and before it
+    costs its memory budget, ``on_layout`` once storage ids are final, and
+    ``finalize`` after its pools exist.
+    """
+
+    def configure(self, manager: Any, kv_cache_config: "KvCacheConfig") -> "KvCacheConfig":
+        """Validate and adjust the cache config before the manager is built."""
+        return kv_cache_config
 
     def declare_regions(self) -> Sequence[Region]:
-        """Return this provider's regions; called once while the manager is built."""
-        ...
+        """Return this provider's regions."""
+        raise NotImplementedError
+
+    def on_layout(self, layout: "RegionLayout") -> None:
+        """Receive the storage ids the manager assigned to this provider's regions."""
+
+    def finalize(self, manager: Any) -> None:
+        """Initialize or validate region storage once the manager's pools exist."""
+
+    def iter_cache_views(self) -> Iterable["torch.Tensor"]:
+        """Yield views covering this provider's storage, for the invalid-value scan."""
+        return ()
 
 
 @dataclass(frozen=True)
@@ -226,10 +325,10 @@ class RegionLayout:
     """Which region owns each storage layer of the manager's V2 layer list.
 
     Storage layer ids below ``num_model_layers`` coincide with rank-local model
-    layer indices. A model layer covered by more than one region is stored under
-    its own id only for the first region that declares it; each later region
-    gets a storage layer appended after the model layers, so storage ids at or
-    above ``num_model_layers`` never index per-model-layer tables.
+    layer indices: a region's storage at index 0 takes the id of the model layer
+    it covers. Storage at a higher index is appended after the model layers, so
+    storage ids at or above ``num_model_layers`` never index per-model-layer
+    tables.
 
     Attributes:
         num_model_layers: Number of rank-local model layers.
@@ -240,6 +339,25 @@ class RegionLayout:
     num_model_layers: int
     owners: Dict[int, StorageOwner] = field(default_factory=dict)
     regions: Tuple[Region, ...] = ()
+
+    @property
+    def storage_stride(self) -> int:
+        """Storage layers each model layer may own: one plus the highest storage index."""
+        return 1 + max((region.storage_index for region in self.regions), default=0)
+
+    def covered_model_layers(self) -> FrozenSet[int]:
+        """Model layers whose own storage id a region declares (storage index 0)."""
+        return frozenset(
+            layer.model_layer
+            for region in self.regions
+            if region.storage_index == 0
+            for layer in region.layers
+        )
+
+    def storage_index(self, layer_id: int) -> int:
+        """Storage index of ``layer_id``; 0 for a layer the manager built itself."""
+        owner = self.owner(layer_id)
+        return 0 if owner is None else self.region(owner.region).storage_index
 
     def owner(self, layer_id: int) -> Optional[StorageOwner]:
         """Return the region storing ``layer_id``, or None for a manager-built layer."""
@@ -263,6 +381,16 @@ class RegionLayout:
             for layer_id, owner in sorted(self.owners.items())
             if owner.region == region
         )
+
+    def region_layer(self, layer_id: int) -> RegionLayer:
+        """Return the declaration stored under ``layer_id``."""
+        owner = self.owner(layer_id)
+        if owner is None:
+            raise KeyError(f"Storage layer {int(layer_id)} belongs to no region")
+        for layer in self.region(owner.region).layers:
+            if layer.model_layer == owner.model_layer:
+                return layer
+        raise KeyError(f"Region {owner.region!r} has no layer for model layer {owner.model_layer}")
 
     def model_layer_of(self, layer_id: int) -> Optional[int]:
         """Model layer served by ``layer_id``: itself for a model layer id, else its owner's."""
@@ -299,9 +427,9 @@ def lay_out_regions(
     """Lay regions out over the manager's per-model-layer configs.
 
     Args:
-        regions: The regions to store, in declaration order. Their order fixes
-            which region keeps a shared model layer's id and the order of the
-            appended storage layers.
+        regions: The regions to store. Storage with index 0 replaces the config
+            of the model layer it covers; higher-index storage is appended in
+            declaration order.
         model_layers: The manager's config for each rank-local model layer,
             indexed by layer id.
 
@@ -318,7 +446,7 @@ def lay_out_regions(
     layers = list(model_layers)
     appended = []
     owners: Dict[int, StorageOwner] = {}
-    claimed = set()
+    claimed: Dict[Tuple[int, int], str] = {}
     for region in regions:
         for region_layer in region.layers:
             model_layer = region_layer.model_layer
@@ -327,8 +455,14 @@ def lay_out_regions(
                     f"Region {region.name!r} covers model layer {model_layer}, but this "
                     f"rank has {num_model_layers} model layers"
                 )
-            if model_layer not in claimed:
-                claimed.add(model_layer)
+            slot = (model_layer, region.storage_index)
+            if slot in claimed:
+                raise ValueError(
+                    f"Regions {claimed[slot]!r} and {region.name!r} both store model layer "
+                    f"{model_layer} at storage index {region.storage_index}"
+                )
+            claimed[slot] = region.name
+            if region.storage_index == 0:
                 layer_id = model_layer
                 layers[layer_id] = region.layer_config(layer_id, region_layer)
             else:
@@ -345,10 +479,12 @@ __all__ = [
     "LayerConfig",
     "Plane",
     "Region",
+    "RegionContext",
     "RegionLayer",
     "RegionLayout",
     "RegionLifeCycle",
     "RegionProvider",
+    "RegionTransfer",
     "StorageOwner",
     "lay_out_regions",
 ]

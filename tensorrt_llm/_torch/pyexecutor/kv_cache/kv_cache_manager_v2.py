@@ -1821,8 +1821,10 @@ class KVCacheManagerV2(BaseResourceManager):
     # need snapshotted (request_prefix_snapshot); kept apart from the request's
     # own expect_snapshot_points, which other code rewrites. Created on first use.
     _waiter_snapshot_points: Optional[Dict[int, set[int]]] = None
-    # Ownership of region storage, set while the cache config is built; see region_layout.
+    # Declared regions and, once laid out, the ownership of their storage; see region_layout.
     _region_layout: Optional[RegionLayout] = None
+    # Region providers of this manager; a subclass sets it before KVCacheManagerV2.__init__ runs.
+    _region_provider_list: Tuple[RegionProvider, ...] = ()
 
     def __init__(
         self,
@@ -2235,6 +2237,8 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
 
         self.is_vswa = uses_vswa_kv_cache_layout(self.max_attention_window_vec)
+        # Costing the memory budget below already reads the declared regions.
+        self._declare_regions()
 
         max_util_for_resume = kv_cache_config.max_util_for_resume
         quota = sys.maxsize
@@ -2385,6 +2389,8 @@ class KVCacheManagerV2(BaseResourceManager):
         config = self._build_cache_config(config)
         config = self._remove_zero_size_buffers(config)
         config = self._add_mixed_precision_layers(config)
+        for provider in self._region_providers():
+            provider.on_layout(self.region_layout)
         has_host_cache_tier = any(
             isinstance(tier, HostCacheTierConfig) for tier in config.cache_tiers
         )
@@ -3951,16 +3957,27 @@ class KVCacheManagerV2(BaseResourceManager):
     def _region_providers(self) -> Sequence[RegionProvider]:
         """Return the providers whose regions this manager stores.
 
-        Called once while the cache config is built, after the per-layer views
-        (``pp_layers``, ``num_local_layers``) are known.
+        Their regions are declared once the per-layer views (``pp_layers``,
+        ``num_local_layers``) are known, before the memory budget is costed.
         """
-        return ()
+        return self._region_provider_list
+
+    def _declare_regions(self) -> None:
+        """Collect the providers' regions; their storage is laid out with the cache config."""
+        self._region_layout = RegionLayout(
+            num_model_layers=self.num_local_layers,
+            regions=tuple(
+                region
+                for provider in self._region_providers()
+                for region in provider.declare_regions()
+            ),
+        )
 
     def _lay_out_regions(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
         """Replace the base layer configs with the declared regions' storage."""
-        regions = [
-            region for provider in self._region_providers() for region in provider.declare_regions()
-        ]
+        if self._region_layout is None:
+            self._declare_regions()
+        regions = self._region_layout.regions
         layers, self._region_layout = lay_out_regions(regions, config.layers)
         if not regions:
             return config
@@ -3977,7 +3994,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def region_layout(self) -> RegionLayout:
         """Which region owns each storage layer; empty when no region is declared."""
         if self._region_layout is None:
-            return RegionLayout(num_model_layers=self.num_local_layers)
+            return RegionLayout(num_model_layers=getattr(self, "num_local_layers", 0))
         return self._region_layout
 
     def _remove_zero_size_buffers(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:

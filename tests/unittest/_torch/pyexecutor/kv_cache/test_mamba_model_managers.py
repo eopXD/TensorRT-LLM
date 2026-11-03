@@ -70,7 +70,10 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ],
 )
 def test_model_managers_inherit_the_common_lifecycle(manager_cls):
-    assert manager_cls.__bases__ == (MambaHybridCacheManagerV2,)
+    # A model manager may sit on a manager that stores attention-backend
+    # regions, but has one base and keeps the common lifecycle.
+    (base,) = manager_cls.__bases__
+    assert issubclass(base, MambaHybridCacheManagerV2)
     for method in (
         "try_commit_blocks",
         "_setup_state_pool",

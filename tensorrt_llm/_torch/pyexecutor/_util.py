@@ -253,17 +253,19 @@ def get_kv_cache_manager_cls(
                     f"backend={backend!r}, transceiver_runtime={runtime!r}).")
         if (is_hybrid_linear(config)
                 and model_config.get_num_mamba_layers() > 0):
-            # The hybrid V2 manager composes the FP4 MLA cache layout with
-            # its recurrent-state lifecycle; the Kimi K3 manager adds the KDA
-            # replay caches used by fused speculative verification. Its
-            # disaggregation declarations cover both the MLA and the
-            # recurrent-state roles.
+            # The FP4 MLA hybrid manager stores the MLA latent cache in the
+            # FP4 MLA regions next to the recurrent state; the Kimi K3 manager
+            # adds the KDA replay caches used by fused speculative
+            # verification. Their disaggregation declarations cover both the
+            # MLA and the recurrent-state roles.
             _validate_v2_mamba_block_reuse_without_rebalance(kv_cache_config)
             if is_kimi_linear(config):
                 from ..modules.kimi_kda.cache_manager import \
                     KimiK3HybridCacheManager
                 return KimiK3HybridCacheManager
-            return MambaHybridCacheManagerV2
+            from ..attention.backends.fp4_mla.regions import \
+                Fp4MlaHybridCacheManager
+            return Fp4MlaHybridCacheManager
         from ..attention.backends.fp4_mla.cache_manager import \
             Fp4MlaKVCacheManagerV2
 

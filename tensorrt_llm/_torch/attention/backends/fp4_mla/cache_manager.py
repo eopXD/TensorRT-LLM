@@ -18,7 +18,6 @@ from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_p
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
-    AttentionLayerConfig,
     BufferConfig,
     DataRole,
     KVCacheManagerConfig,
@@ -473,53 +472,15 @@ class Fp4MlaV2CacheLayoutPolicy:
         return result
 
     def _build_cache_config(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
-        cache_layers = list(config.layers)
-        fp8_local_layers = self._fp8_mla_local_layer_indices()
-        fp4_local_layers = self._fp4_mla_local_layer_indices()
-        if not fp4_local_layers:
-            raise ValueError("FP4 MLA V2 layout requires at least one local attention layer.")
-        self._fp8_mla_manager_layer_ids = [LayerId(local_layer) for local_layer in fp8_local_layers]
-        if fp8_local_layers:
-            fp8_lifecycle_window = (
-                self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
-            )
-            for local_layer in fp8_local_layers:
-                cache_layers[local_layer] = AttentionLayerConfig(
-                    layer_id=LayerId(local_layer),
-                    buffers=[
-                        BufferConfig(
-                            role=Role.KEY,
-                            size=self._fp8_mla_bytes_per_token(local_layer) * self.tokens_per_block,
-                        )
-                    ],
-                    # A distinct, non-evicting lifecycle gives FP8 pages their
-                    # own attention-op pool without changing the model window.
-                    sliding_window_size=fp8_lifecycle_window,
-                    num_sink_tokens=None,
-                )
-        self._fp4_mla_local_to_compact = {
-            local_layer: compact_layer for compact_layer, local_layer in enumerate(fp4_local_layers)
-        }
-        self._fp4_mla_compact_to_local = fp4_local_layers
-        self._cache_manager_layer_ids = [LayerId(i) for i in fp4_local_layers]
-        self._hp_manager_layer_ids = []
-        for local_layer in fp4_local_layers:
-            layer_id = LayerId(len(cache_layers))
-            self._hp_manager_layer_ids.append(layer_id)
-            cache_layers.append(
-                AttentionLayerConfig(
-                    layer_id=layer_id,
-                    buffers=[
-                        BufferConfig(
-                            role=Role.MLA_HP_TAIL,
-                            size=self._hp_bytes_per_page(local_layer),
-                        )
-                    ],
-                    sliding_window_size=self._fp4_mla_hp_pool_size,
-                    num_sink_tokens=None,
-                )
-            )
-        return replace(config, layers=cache_layers)
+        from tensorrt_llm._torch.pyexecutor.kv_cache.regions import lay_out_regions
+
+        from .regions import HP_RING, fp4_mla_regions
+
+        # The FP4 latent keeps the base layer configs; the FP8 latent replaces
+        # its layers and the HP ring is stored after the model layers.
+        layers, layout = lay_out_regions(fp4_mla_regions(self, include_latent=False), config.layers)
+        self._hp_manager_layer_ids = list(layout.layer_ids(HP_RING))
+        return replace(config, layers=list(layers))
 
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
         cache_layer = self._cache_manager_layer_ids[0]

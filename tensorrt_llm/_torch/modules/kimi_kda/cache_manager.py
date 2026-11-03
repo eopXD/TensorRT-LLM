@@ -18,6 +18,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+from tensorrt_llm._torch.attention.backends.fp4_mla.regions import Fp4MlaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     MambaLayerCache,
@@ -928,7 +929,7 @@ def get_kda_replay_num_spec(
     return kda_mtp_replay_num_spec(spec_config.tokens_per_gen_step - 1)
 
 
-class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
+class KimiK3HybridCacheManager(Fp4MlaHybridCacheManager):
     """KDA/MLA cache layout and K3-only replay lifecycle handling."""
 
     kda_context_only = False

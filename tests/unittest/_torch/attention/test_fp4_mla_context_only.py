@@ -115,9 +115,10 @@ def test_context_only_layer_bytes_exclude_v_scales(monkeypatch):
     "attrs,expected",
     [
         ({}, False),
-        ({"kda_context_only": True}, True),
-        ({"fp4_mla_context_only_cache": True}, True),
-        ({"kda_context_only": False, "fp4_mla_context_only_cache": False}, False),
+        ({"context_only_cache": True}, True),
+        ({"context_only_cache": False}, False),
+        # Model-specific flags no longer reach the executor's predicate.
+        ({"kda_context_only": True, "fp4_mla_context_only_cache": True}, False),
     ],
 )
 def test_context_only_kv_cache_predicate(attrs, expected):
@@ -127,7 +128,7 @@ def test_context_only_kv_cache_predicate(attrs, expected):
 
 
 def _dummy_requests(monkeypatch, context_only: bool):
-    cache = SimpleNamespace(fp4_mla_context_only_cache=context_only, context_swa_layer_limit=None)
+    cache = SimpleNamespace(context_only_cache=context_only, context_swa_layer_limit=None)
     resources = SimpleNamespace(
         get_resource_manager=lambda key: cache
         if key == ResourceManagerType.KV_CACHE_MANAGER

@@ -137,7 +137,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
-from .regions import RegionLayout, RegionProvider, lay_out_regions
+from .regions import AllocationUnit, RegionLayout, RegionProvider, lay_out_regions
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
@@ -3989,6 +3989,20 @@ class KVCacheManagerV2(BaseResourceManager):
             layers=list(layers),
             commit_min_snapshot=config.commit_min_snapshot or has_slot_storage,
         )
+
+    def is_slot_storage(self, layer_id: int) -> bool:
+        """Whether a storage layer keeps one slot per request rather than one page per block."""
+        layout = self.region_layout
+        owner = layout.owner(layer_id)
+        return (
+            owner is not None
+            and layout.region(owner.region).life_cycle.allocation == AllocationUnit.REQUEST
+        )
+
+    @property
+    def context_only_cache(self) -> bool:
+        """Whether this worker omits storage that only generation steps read."""
+        return any(provider.context_only for provider in self._region_providers())
 
     @property
     def region_layout(self) -> RegionLayout:

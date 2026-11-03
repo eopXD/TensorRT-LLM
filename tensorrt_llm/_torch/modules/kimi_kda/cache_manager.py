@@ -985,6 +985,11 @@ class KdaRegionProvider(RegionProvider):
             )
         ]
 
+    @property
+    def context_only(self) -> bool:
+        # A disaggregated context worker keeps no draft-verification buffers.
+        return self._manager.kda_context_only
+
 
 class KimiK3HybridCacheManager(Fp4MlaHybridCacheManager):
     """KDA/MLA cache layout and K3-only replay lifecycle handling."""

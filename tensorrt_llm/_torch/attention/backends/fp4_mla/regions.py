@@ -247,6 +247,11 @@ class Fp4MlaRegionProvider(RegionProvider):
         # pool is scanned once through a page-major view.
         return self._manager._iter_fp4_mla_physical_pool_views()
 
+    @property
+    def context_only(self) -> bool:
+        # A disaggregated context worker keeps no V scales or packed V.
+        return self._manager.fp4_mla_context_only_cache
+
 
 class Fp4MlaHybridCacheManager(MambaHybridCacheManagerV2):
     """Hybrid recurrent-state manager whose MLA latent cache may use the FP4 MLA layout.

@@ -2795,7 +2795,7 @@ class _StubADPExecutor:
         )
         kv_cache_manager.num_extra_kv_tokens = 0
         kv_cache_manager.tokens_per_block = 128
-        kv_cache_manager.kda_context_only = False
+        kv_cache_manager.context_only_cache = False
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
@@ -3732,7 +3732,7 @@ def test_pad_empty_batch_adds_generation_dummy_to_scheduled_batch(has_local_requ
 
 def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
     stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.kda_context_only = True
+    stub.kv_cache_manager.context_only_cache = True
     stub.max_total_draft_tokens = 3
 
     _run_pad_empty(stub, scheduled_batch)
@@ -3752,7 +3752,7 @@ def test_pad_empty_batch_uses_context_dummy_on_kda_context_only_worker():
 
 def test_pad_empty_batch_uses_context_dummy_on_context_only_fp4_mla_cache():
     stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.fp4_mla_context_only_cache = True
+    stub.kv_cache_manager.context_only_cache = True
     stub.max_total_draft_tokens = 3
 
     _run_pad_empty(stub, scheduled_batch)
@@ -3771,17 +3771,14 @@ def test_pad_empty_batch_uses_context_dummy_on_context_only_fp4_mla_cache():
 
 
 @pytest.mark.parametrize("enable_non_overlap_adp_forward_intent", [False, True])
-@pytest.mark.parametrize("context_only_attr", ["fp4_mla_context_only_cache", "kda_context_only"])
-def test_pad_dummy_is_context_on_context_only_cache(
-    enable_non_overlap_adp_forward_intent, context_only_attr
-):
+def test_pad_dummy_is_context_on_context_only_cache(enable_non_overlap_adp_forward_intent):
     # The default role and the peers' intent say generation, but a
     # context-only cache cannot run a generation row.
     stub = _StubADPExecutor(
         enable_non_overlap_adp_forward_intent=enable_non_overlap_adp_forward_intent,
         peer_forward_intent=_ADPForwardIntent.GENERATION,
     )
-    setattr(stub.kv_cache_manager, context_only_attr, True)
+    stub.kv_cache_manager.context_only_cache = True
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
@@ -3805,7 +3802,7 @@ def test_pad_dummy_keeps_generation_role_on_full_cache():
 
 def test_pad_empty_batch_context_dummy_checks_capacity_without_draft_reserve():
     stub, scheduled_batch = _unfittable_rank()
-    stub.kv_cache_manager.kda_context_only = True
+    stub.kv_cache_manager.context_only_cache = True
     stub.max_total_draft_tokens = 3
     # The dummy role can still say generation when no transceiver drives it.
     stub._adp_dummy_is_gen = True

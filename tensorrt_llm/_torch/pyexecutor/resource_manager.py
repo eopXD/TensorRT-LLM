@@ -164,14 +164,11 @@ class ResourceManagerType(enum.Enum):
 def is_context_only_kv_cache(kv_cache_manager: object) -> bool:
     """Whether a KV cache manager can serve context requests only.
 
-    A disaggregated context worker may omit generation-only cache state: the
-    KDA draft-verification buffers (``kda_context_only``) or the FP4 MLA V
-    scales and packed V (``fp4_mla_context_only_cache``). Such a worker
-    cannot run a generation row, including a warmup or padding dummy.
+    A disaggregated context worker may omit cache state that only generation
+    steps read (``context_only_cache``). Such a worker cannot run a generation
+    row, including a warmup or padding dummy.
     """
-    return (getattr(kv_cache_manager, "kda_context_only", False) is True
-            or getattr(kv_cache_manager, "fp4_mla_context_only_cache",
-                       False) is True)
+    return getattr(kv_cache_manager, "context_only_cache", False) is True
 
 
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
@@ -253,6 +250,12 @@ class BaseResourceManager(ABC):
 
     def free_resources(self, request: LlmRequest):
         pass
+
+    def on_state_transfer_complete(self, request_ids: List[int]) -> None:
+        """Called once a disaggregated transfer delivered these requests' cache state."""
+
+    def rebuild_disagg_imported_cache(self, requests: List[LlmRequest]) -> None:
+        """Rebuild cache state derived from these requests' transferred cache."""
 
     def shutdown(self):
         pass

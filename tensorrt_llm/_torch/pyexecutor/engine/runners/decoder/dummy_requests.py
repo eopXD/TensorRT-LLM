@@ -129,8 +129,7 @@ class DummyRequestFactory:
         )
         if num_gen_requests and is_context_only_kv_cache(kv_cache_manager):
             # A disaggregated context server keeps no generation-only cache
-            # state (KDA draft-verify buffers, FP4 MLA V scales), so
-            # generation shapes cannot run there.
+            # state, so generation shapes cannot run there.
             return None
         draft_kv_cache_manager = get_draft_kv_cache_manager(
             self._config.spec_config, resource_manager

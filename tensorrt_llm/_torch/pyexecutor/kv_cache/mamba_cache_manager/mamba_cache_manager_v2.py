@@ -585,6 +585,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         return self._mamba_layer_mask[self.pp_layers[local_layer_idx]]
 
     @override
+    def is_slot_storage(self, layer_id: int) -> bool:
+        if self.region_layout.owner(layer_id) is not None:
+            return super().is_slot_storage(layer_id)
+        return self._is_local_mamba_layer(int(layer_id))
+
+    @override
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
         layer_id = int(self.impl.layer_grouping[pool_id][0])
         if self.region_layout.owner(layer_id) is not None:

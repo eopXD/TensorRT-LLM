@@ -192,17 +192,16 @@ class _StandInMambaCacheManager:
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("cache_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
 @pytest.mark.parametrize("context_only", [False, True])
 def test_general_and_memory_pool_warmups_leave_out_generation_shapes_on_context_only_cache(
-    cache_flag: str, context_only: bool
+    context_only: bool,
 ) -> None:
     """A context-only cache that is not a Mamba hybrid one runs the general and memory-pool phases.
 
     Both take their shapes from these lists, so the lists must hold context shapes only.
     """
     warmup = decoder_warmup(decoder_config(), agreement=_agreement(world_size=4, dwdp_size=4))
-    resources = _context_only_cache_resources(cache_flag, context_only)
+    resources = _context_only_cache_resources(context_only)
 
     max_shapes = warmup._get_max_shape_warmup_requests(resources)
     general_shapes = warmup._get_full_general_warmup_requests(resources)
@@ -592,8 +591,10 @@ def _context_only_warmup_requests(context_only: bool) -> Mock:
     return requests
 
 
-def _context_only_cache_resources(cache_flag: str, context_only: bool) -> SimpleNamespace:
-    cache = SimpleNamespace(**{cache_flag: context_only}, get_num_available_tokens=lambda **_: 16)
+def _context_only_cache_resources(context_only: bool) -> SimpleNamespace:
+    cache = SimpleNamespace(
+        context_only_cache=context_only, get_num_available_tokens=lambda **_: 16
+    )
     return SimpleNamespace(
         get_resource_manager=lambda key: (
             cache if key == ResourceManagerType.KV_CACHE_MANAGER else None
@@ -602,10 +603,9 @@ def _context_only_cache_resources(cache_flag: str, context_only: bool) -> Simple
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("cache_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
 @pytest.mark.parametrize("context_only", [False, True])
 def test_attention_warmup_leaves_out_generation_shapes_on_context_only_cache(
-    cache_flag: str, context_only: bool
+    context_only: bool,
 ) -> None:
     """Under DWDP a missing warmup batch is fatal, so a context-only cache must not propose one."""
     agreement = _agreement(world_size=4, dwdp_size=4)
@@ -617,7 +617,7 @@ def test_attention_warmup_leaves_out_generation_shapes_on_context_only_cache(
         dummy_requests=requests,
         forward_warmup=forward_warmup,
     )
-    resources = _context_only_cache_resources(cache_flag, context_only)
+    resources = _context_only_cache_resources(context_only)
 
     with patch("torch.cuda.synchronize"):
         warmup._run_attention_warmup(resources, can_run_general_warmup=True)
@@ -630,10 +630,9 @@ def test_attention_warmup_leaves_out_generation_shapes_on_context_only_cache(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("cache_flag", ["kda_context_only", "fp4_mla_context_only_cache"])
 @pytest.mark.parametrize("context_only", [False, True])
 def test_autotuner_warmup_leaves_out_generation_shape_on_context_only_cache(
-    monkeypatch: pytest.MonkeyPatch, cache_flag: str, context_only: bool
+    monkeypatch: pytest.MonkeyPatch, context_only: bool
 ) -> None:
     """The autotuner tunes only the context batch on a context-only cache, also under DWDP."""
     requests = _context_only_warmup_requests(context_only)
@@ -663,7 +662,7 @@ def test_autotuner_warmup_leaves_out_generation_shape_on_context_only_cache(
         _release_megamoe_profiling_scratch=Mock(),
         _forward_warmup=Mock(),
     )
-    resources = _context_only_cache_resources(cache_flag, context_only)
+    resources = _context_only_cache_resources(context_only)
     monkeypatch.delenv("TLLM_AUTOTUNER_CACHE_PATH", raising=False)
     monkeypatch.setattr(
         decoder_warmup_module.AutoTuner, "get", Mock(return_value=Mock(profiling_cache={}))

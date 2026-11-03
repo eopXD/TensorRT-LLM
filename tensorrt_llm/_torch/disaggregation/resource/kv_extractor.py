@@ -44,7 +44,6 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_physical_pool,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole
 
@@ -486,14 +485,14 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
                 for iid, gid in zip(all_internal_layer_ids, all_global_layer_ids)
             ]
 
-            # A life cycle is recurrent when its layers are the manager's
-            # mamba layers. Recurrent and attention layers never share a life
-            # cycle: their buffer configs differ, so V2 groups them apart.
-            is_recurrent = isinstance(manager, MambaHybridCacheManagerV2) and any(
-                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+            # A life cycle is recurrent when its layers keep one slot per
+            # request. Slot and paged storage never share a life cycle: their
+            # buffer configs differ, so V2 groups them apart.
+            is_recurrent = any(
+                manager.is_slot_storage(int(layer_id)) for layer_id in all_internal_layer_ids
             )
             if is_recurrent and not all(
-                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+                manager.is_slot_storage(int(layer_id)) for layer_id in all_internal_layer_ids
             ):
                 raise ValueError(
                     f"Layer group {layer_group_id} mixes recurrent and attention layers"

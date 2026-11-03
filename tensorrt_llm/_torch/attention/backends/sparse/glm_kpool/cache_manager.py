@@ -60,6 +60,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
 
     kda_context_only = False
 
+    @property
+    @override
+    def context_only_cache(self) -> bool:
+        return self.kda_context_only
+
     @override
     def __init__(
         self,

@@ -8684,9 +8684,9 @@ class PyExecutor:
 
         if self._adp_dummy_is_gen and is_context_only_kv_cache(
                 self.kv_cache_manager):
-            # A context-only cache (KDA draft-verify buffers or FP4 MLA V
-            # scales omitted) cannot run a generation row, even when the
-            # peers' intent is generation; pad with a context dummy.
+            # A context-only cache omits storage that generation reads, so it
+            # cannot run a generation row even when the peers' intent is
+            # generation; pad with a context dummy.
             self._adp_dummy_is_gen = False
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
@@ -8825,9 +8825,9 @@ class PyExecutor:
         if any(request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
                for request in self.active_requests):
             return
-        # A context-only cache manager keeps no KDA replay or draft-verification
-        # buffers, or no FP4 MLA V scales, so it cannot run a generation row;
-        # pad with a one-token context dummy instead.
+        # A context-only cache manager omits storage that generation reads, so
+        # it cannot run a generation row; pad with a one-token context dummy
+        # instead.
         context_dummy = is_context_only_kv_cache(self.kv_cache_manager)
         token_nums = [1] if context_dummy else None
         if not self._has_adp_dummy_kv_capacity(
@@ -8949,22 +8949,17 @@ class PyExecutor:
         self.resource_manager.resource_managers[
             ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(requests)
         self._setup_sampler_step(requests)
-        if self.enable_spec_decode:
-            kv_mgr = self.resource_manager.resource_managers.get(
-                ResourceManagerType.KV_CACHE_MANAGER)
-            if isinstance(kv_mgr, BaseMambaCacheManager):
-                kv_mgr.on_state_transfer_complete([
-                    req.py_request_id for req in cache_trans_complete_requests
-                ])
-        # Cache state that the generation worker derives from the imported KV
-        # (e.g. FP4 MLA V scales and packed V) is not transferred. Rebuild it
-        # before the first forward reads it. The sampler setup above may have
-        # terminated requests, whose caches must not be touched.
         kv_mgr = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        rebuild = getattr(kv_mgr, "rebuild_disagg_imported_cache", None)
-        if rebuild is not None:
-            rebuild([
+        if self.enable_spec_decode and kv_mgr is not None:
+            kv_mgr.on_state_transfer_complete(
+                [req.py_request_id for req in cache_trans_complete_requests])
+        # Cache state that the generation worker derives from the imported KV
+        # is not transferred. Rebuild it before the first forward reads it.
+        # The sampler setup above may have terminated requests, whose caches
+        # must not be touched.
+        if kv_mgr is not None:
+            kv_mgr.rebuild_disagg_imported_cache([
                 req for req in cache_trans_complete_requests
                 if req.is_disagg_generation_transmission_complete
             ])

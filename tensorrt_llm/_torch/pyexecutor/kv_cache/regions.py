@@ -311,6 +311,11 @@ class RegionProvider:
         """Yield views covering this provider's storage, for the invalid-value scan."""
         return ()
 
+    @property
+    def context_only(self) -> bool:
+        """Whether this worker omits storage that only generation steps read."""
+        return False
+
 
 @dataclass(frozen=True)
 class StorageOwner:

@@ -1,0 +1,91 @@
+# KV Cache Regions Developer Guide
+
+Model and attention-backend code declares persistent memory that the KV cache manager does not
+derive from a layer config as a **region**. A region names its planes per model layer and one life
+cycle. `KVCacheManagerV2` lays each region out as a native `RegionConfig`, so the region's buffers
+get a life cycle, and a layer group, of their own. Shared code asks what a region declared, not
+what a model is.
+
+Code: `tensorrt_llm/_torch/pyexecutor/kv_cache/regions.py` (declarations and their layout),
+`KVCacheManagerV2` (declaration and layout hooks, region lookups), `MambaHybridCacheManagerV2`
+(the replay region of linear-attention layers) and the native side in
+`cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/` (`RegionConfig` in `config.h`, the life-cycle
+registry and pool grouping; see that directory's `AGENTS.md`).
+
+## Vocabulary
+
+| Term | Meaning | Type |
+|---|---|---|
+| Plane | One kind of data a region stores per model layer, under one buffer role | `Plane` |
+| Region layer | The planes a region stores for one rank-local model layer | `RegionLayer` |
+| Life cycle | How the region's memory is allocated and when it is handed off to the prefix index | `RegionLifeCycle` |
+| Transfer | Which planes the receiving disaggregated worker rebuilds instead of receiving | `RegionTransfer` |
+| Region | Planes over a set of model layers with one life cycle, and optionally a fixed slot count | `Region` |
+| Provider | Code that declares regions | `RegionProvider` |
+| Layout | The declared regions and which region owns each buffer | `RegionLayout` |
+
+## The native contract
+
+| Property | Rule |
+|---|---|
+| Supported life cycle | `REQUEST` allocation, `NEVER` handed off: reuse policy `PRIVATE`. `lay_out_regions` rejects every other pair until the native side supports it. |
+| Slots | One slot per living KV cache and beam, held while the cache is suspended and released when it closes. Never published to the prefix index. |
+| Identity | The region index is part of the native life cycle, so a region never shares a layer group with a layer config's buffers or another region, even with equal parameters. |
+| Numbering | Region layer groups follow every layer-config group, in declaration order. Declaring a region never renumbers the other groups. |
+| Ownership | Each `(layer, role)` belongs to one layer config or one region. A region buffer sits on a layer that has an `SsmLayerConfig`, and sets no reuse policy, `tokens_per_block_override` or sparsity of its own. |
+| Fixed slot count | Set, the region's group gets a pool group of its own with exactly that many GPU slots, taken from the quota before ratio sizing. `resize()`, `adjust()` and the pool-rebalance tuner leave it at that size, and a GPU quota too small to hold it is raised, as for the constraint floors. Unset, the group is sized by ratio like the others. |
+
+**The provider computes the fixed slot count.** The core does not count owners. A count that must
+let every owner resume includes the headroom `KvCache.resume` needs: resume fails when any pool
+group is above `max_util_for_resume`, so `N` owners need `ceil(N / max_util_for_resume)` slots.
+The pool group belongs to the region alone, so this arithmetic is exact.
+
+## Manager hooks
+
+| Hook | When | Use |
+|---|---|---|
+| `_region_providers()` | `KVCacheManagerV2.__init__`, after the per-layer views and the IndexMapper capacity exist and before the memory budget is costed | Return the providers of this manager's regions |
+| `_declare_regions()` | Same point | Collects the providers' regions into `region_layout` |
+| `_remove_zero_size_buffers()` | Config build | Renumbers the declared regions when it compacts the layer list |
+| `_lay_out_regions(config)` | Config build, after `_build_cache_config`, zero-size removal and mixed-precision layers | Adds one native `RegionConfig` per region to `config.regions` |
+| `region_layout` | After declaration | The regions and, once laid out, the owner of each buffer |
+| `get_region_group_ids(name)` | After construction | The region's layer group, through `KVCacheManager.get_region_group_id`; empty for an undeclared region |
+| `get_disagg_ignored_roles()` | Disaggregated transfer | Includes every region's `transfer.rebuilt_roles` |
+
+## The KDA replay region
+
+`MambaHybridCacheManagerV2` declares `replay_state` for a recurrent state that implements
+`MambaReplayState`. Kimi K3 and GLM5Next do so through `KDAReplayState`
+(`tensorrt_llm/_torch/modules/kimi_kda/cache_manager.py`).
+
+| Field | Value |
+|---|---|
+| Life cycle | `REQUEST`, `NEVER` |
+| Layers | The local KDA layers |
+| Planes | `replay_layout()`: the convolution replay windows and k/g/v/beta caches per layer, plus the accepted-draft count on the first local KDA layer |
+| Transfer | Every plane rebuilt: the generation worker seeds the replay state from the transferred recurrent state |
+| Fixed slot count | `KDAReplayState.replay_slot_count()`: `ceil(IndexMapper capacity * max_beam_width / max_util_for_resume)`. The IndexMapper capacity bounds the living caches, active and suspended, reserved dummies included. |
+
+Replay state follows its request through suspend and resume; the physical slot can move. The
+manager uploads each request's replay slot (`get_replay_state_indices`,
+`cuda_replay_state_indices`), the metadata keeps them in `Mamba2Metadata.replay_state_indices`,
+and the mixer and kernels address the replay buffers by them. A replay slot a request acquires for
+the first time is reset (`reset_replay_slots`).
+
+A disaggregated context server declares no replay region. When the kernels address the replay
+buffers by the recurrent-state slot (`replay_shares_state_slot`, the experimental Kimi K3 engine's
+draft-records mode), the manager stores them as buffers of the recurrent `SsmLayerConfig` and
+declares no region; the replay slot then equals the state slot.
+
+KDA keeps `enable_kv_pool_rebalance` off: its views are bound once to the recurrent-state pool.
+
+## Adding a region
+
+1. Implement `declare_regions()` on a provider and return it from `_region_providers()`.
+2. Give every plane its exact per-slot byte size; the manager costs the budget from the declaration.
+3. Decide whether the region needs a fixed slot count. A request-private region whose demand is
+   its owners' count gains nothing from slots beyond it, so give it the count those owners need,
+   including the resume headroom.
+4. Resolve the region's layer group with `get_region_group_ids(name)` and its buffers with the
+   per-buffer APIs (`get_buffer_group_id`, page strides, base addresses).
+5. List the roles a receiving disaggregated worker rebuilds in `transfer.rebuilt_roles`.

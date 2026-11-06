@@ -29,7 +29,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     Region,
     RegionLayer,
     RegionLifeCycle,
-    RegionTransfer,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._utils import prefer_pinned
@@ -86,7 +85,6 @@ class KDAReplayRegion:
                     )
                     for layer, layout in self.layouts.items()
                 ),
-                transfer=RegionTransfer(rebuilt_roles=self.roles),
                 fixed_slot_count=state.replay_slot_count(
                     max_living_caches, max_beam_width, max_util_for_resume
                 ),

@@ -20,7 +20,7 @@ import os
 import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields, replace
-from typing import TYPE_CHECKING, List, Literal, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 
@@ -49,6 +49,9 @@ if TYPE_CHECKING:
 
 GB = 1 << 30
 _mamba_effective_tp_size = mamba_effective_tp_size
+
+# Per-slot dtype and shape of one layer's replay buffers: {role: (dtype, slot shape)}.
+ReplayLayout = Dict[DataRole, Tuple[torch.dtype, List[int]]]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -108,6 +111,9 @@ class MambaAcceptanceBatch:
     source_state_indices: torch.Tensor
     destination_state_indices: torch.Tensor
     is_dummy_request: torch.Tensor | None
+    # Replay-history slots of the generation rows; None means the
+    # destination state slots.
+    replay_indices: torch.Tensor | None = None
 
 
 class MambaState(Protocol):
@@ -138,6 +144,60 @@ class MambaState(Protocol):
     def make_layer_cache(
         self, layer_offset: int, conv: torch.Tensor, temporal: torch.Tensor
     ) -> MambaLayerCache: ...
+
+
+@runtime_checkable
+class MambaReplayState(MambaState, Protocol):
+    """Recurrent state whose replay history lives in manager-declared buffers.
+
+    Unless ``replay_shares_state_slot``, the hybrid manager declares the buffers
+    of ``replay_layout()`` as a request region of their own (see
+    ``MambaHybridCacheManagerV2.declare_regions``) with ``replay_slot_count()``
+    slots, and binds their views through ``bind_replay_pool()``.
+    """
+
+    @property
+    def replay_shares_state_slot(self) -> bool:
+        """Whether the kernels address the replay buffers by the recurrent-state slot.
+
+        Such buffers live in the recurrent-state slot and are snapshotted with
+        it; otherwise they have a request-private slot of their own.
+        """
+
+    def replay_layout(self, context: MambaStateLayout, layer_id: int) -> ReplayLayout:
+        """Per-slot dtype and shape of each replay buffer of one local recurrent layer."""
+
+    def replay_slot_count(
+        self, max_living_caches: int, max_beam_width: int, max_util_for_resume: float
+    ) -> int:
+        """GPU slots the replay region needs for every owner the manager can hold.
+
+        ``max_living_caches`` bounds the active and suspended KV caches, reserved
+        dummies included; each holds one replay slot per beam. ``KvCache.resume``
+        fails above ``max_util_for_resume``, so the count includes the headroom
+        that keeps the region at or below it with every owner resident.
+        """
+
+    def bind_replay_pool(self, layers: list[dict[DataRole, torch.Tensor]]) -> None:
+        """Bind the per-local-layer replay views before ``bind()``.
+
+        Each view's first dimension is a replay slot.
+        """
+
+    def reset_replay_slots(self, replay_slots: torch.Tensor) -> None:
+        """Reset the replay history and bookkeeping of ``replay_slots``."""
+
+    def reset_slots(
+        self,
+        slots: torch.Tensor,
+        host_slots: list[int],
+        replay_slots: torch.Tensor | None = None,
+    ) -> None:
+        """Reset the context requests in recurrent-state ``slots``.
+
+        ``replay_slots`` are the requests' replay slots; ``None`` means
+        ``slots``. The manager passes them only for a replay region of its own.
+        """
 
 
 class BaseMambaCacheManager(ABC):
@@ -171,6 +231,11 @@ class _PrefixReuseDiagnostics(Protocol):
     def _get_num_reusable_tokens_before_hybrid_pruning(self) -> int: ...
 
     def _get_num_reusable_tokens_before_pruning(self) -> int: ...
+
+
+def _is_disagg_context_server(is_disagg: bool) -> bool:
+    """Whether this worker only serves the context phase of disagg requests."""
+    return is_disagg and os.getenv("TRTLLM_DISAGG_ROLE") == "context"
 
 
 def _get_num_cuda_graph_padding_dummy_slots(
@@ -681,9 +746,11 @@ __all__ = [
     "BaseMambaCacheManager",
     "MambaHybridCacheManager",
     "MambaLayerCache",
+    "MambaReplayState",
     "MambaStateLayout",
     "MambaAcceptanceBatch",
     "MambaRole",
+    "ReplayLayout",
     "use_py_mamba_cache_manager",
     "get_tensor_size_bytes",
 ]

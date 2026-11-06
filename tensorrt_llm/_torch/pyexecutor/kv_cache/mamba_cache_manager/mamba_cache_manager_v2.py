@@ -174,7 +174,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Set per instance by the FP4 MLA layout on a disaggregated context
     # worker, which keeps no generation-only V scales or packed V.
     fp4_mla_context_only_cache = False
-
     # Construction and cache configuration
 
     @override
@@ -342,7 +341,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             conv_state_layout=conv_state_layout,
         )
         self._speculative_state: MambaState | None = self._initialize_spec_state()
-
         if isinstance(num_kv_heads, int):
             per_layer_kv_heads = [num_kv_heads] * total_layers
         else:
@@ -539,8 +537,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """
         layout_policy = self._attention_cache_layout_policy
         result = []
-        for layer_id in self.impl.layer_grouping[layer_group_id]:
-            internal_layer = int(layer_id)
+        # A recurrent layer split by buffer reuse policies is listed once per group.
+        layer_ids = dict.fromkeys(
+            int(buffer.layer_id) for buffer in self.impl.buffer_grouping[layer_group_id]
+        )
+        for internal_layer in layer_ids:
             if layout_policy is None:
                 global_layer_id = int(self.pp_layers[internal_layer])
             elif self._is_local_mamba_layer(internal_layer):
@@ -554,11 +555,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:
-        """Keep FP4 MLA V scales and packed V out of disaggregated transfers.
-
-        The generation worker rebuilds them from the transferred K and K
-        scales.
-        """
+        """Exclude buffers rebuilt by the receiving worker."""
         roles = super().get_disagg_ignored_roles()
         layout_policy = self._attention_cache_layout_policy
         if layout_policy is not None:
@@ -572,7 +569,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         With the FP4 MLA cache layout, the policy's HP ring geometry joins
         them.
         """
-        layouts = {}
+        layouts = super().get_disagg_role_layouts()
         if self._attention_cache_layout_policy is not None:
             layouts.update(self._fp4_mla_disagg_role_layouts())
         if self.local_num_mamba_layers == 0:
@@ -623,7 +620,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
     @override
     def _get_pool_roles(self, pool_id: int) -> Tuple[DataRole, Optional[DataRole]]:
-        layer_id = int(self.impl.layer_grouping[pool_id][0])
+        buffers = self.impl.buffer_grouping[pool_id]
+        layer_id = int(buffers[0].layer_id)
         if layer_id >= self.num_local_layers:
             if (
                 self._attention_cache_layout_policy is not None
@@ -633,15 +631,25 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             if layer_id in self.mixed_precision_high_layers.values():
                 return super()._get_pool_roles(pool_id)
             raise ValueError(f"Unknown hybrid V2 virtual layer {layer_id}.")
-        if self._is_local_mamba_layer(layer_id):
-            return MambaRole.SSM_STATE, None
-        return super()._get_pool_roles(pool_id)
+        if not self._is_local_mamba_layer(layer_id):
+            return super()._get_pool_roles(pool_id)
+        roles = [buffer.role for buffer in buffers]
+        # A recurrent layer can span several groups when its buffers use
+        # different reuse policies. A group without SSM_STATE is described by
+        # one of its own roles.
+        return (MambaRole.SSM_STATE if MambaRole.SSM_STATE in roles else roles[0]), None
+
+    @override
+    def _get_layer_execution_group(self, layer_id: int) -> int:
+        if self._is_local_mamba_layer(int(layer_id)):
+            return int(self.impl.get_buffer_group_id(LayerId(layer_id), MambaRole.SSM_STATE))
+        return super()._get_layer_execution_group(layer_id)
 
     def _max_resident_sequences(self) -> int:
         return self.max_batch_size * self.mapping.pp_size
 
     def _mamba_state_bytes_per_slot(self) -> int:
-        """Return persistent bytes per slot allocated by the native pools."""
+        """Return persistent bytes per recurrent-state slot allocated by the native pools."""
         return sum(
             buffer.size
             for layer_id in self.mamba_pp_layers
@@ -799,6 +807,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 high = mid
         return low
 
+    def _extra_live_gpu_quota(self) -> int:
+        """Additional pool capacity required by model-owned state."""
+        return 0
+
     def _minimum_live_gpu_quota(self) -> int:
         """Return the minimum quota for live states and one attention page."""
         attention_block_quota = self._attention_cache_bytes_per_token() * self.tokens_per_block
@@ -806,7 +818,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         state_quota = num_state_slots * self._mamba_state_bytes_per_slot()
         return max(
             self._get_quota_from_max_tokens(0),
-            state_quota + attention_block_quota,
+            state_quota + attention_block_quota + self._extra_live_gpu_quota(),
         )
 
     @override
@@ -837,6 +849,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     layer_id=layer_id,
                     buffers=buffers,
                 )
+        # The declared regions' buffers are bound the same way.
+        for region in self.region_layout.regions:
+            for region_layer in region.layers:
+                for plane in region_layer.planes:
+                    self._recurrent_buffers[region_layer.model_layer, plane.role] = None
 
         dummy_requests = [
             KVCacheDesc(capacity=0, history_length=0) for _ in range(self._num_reserved_dummy_slots)
@@ -925,7 +942,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         if self.local_num_mamba_layers > 0:
             first_mamba_local_layer = self.layer_offsets[self.mamba_pp_layers[0]]
-            self.ssm_layer_group_id = self.impl.get_layer_group_id(LayerId(first_mamba_local_layer))
+            self.ssm_layer_group_id = self.impl.get_buffer_group_id(
+                LayerId(first_mamba_local_layer), MambaRole.SSM_STATE
+            )
             self._ssm_page_index_scale = self.impl.get_page_index_scale(
                 LayerId(first_mamba_local_layer), MambaRole.SSM_STATE
             )
@@ -1511,7 +1530,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         is_dummy_request = self._dummy_request_mask[num_contexts : num_contexts + num_gens]
         if self._speculative_state is None:
             raise NotImplementedError("The model manager must provide speculative state")
-        self._speculative_state.update(
+        self._update_model_state(
             MambaAcceptanceBatch(
                 attention_metadata=attn_metadata,
                 num_contexts=num_contexts,
@@ -1523,6 +1542,10 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 is_dummy_request=is_dummy_request,
             ),
         )
+
+    def _update_model_state(self, batch: MambaAcceptanceBatch) -> None:
+        """Apply acceptance to the selected model state."""
+        self._speculative_state.update(batch)
 
     @override
     def try_commit_blocks(self, request: LlmRequest, kv_cache=None) -> None:
@@ -1796,11 +1819,20 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if report is None:
             return None
 
+        region_groups = {
+            group
+            for region in self.region_layout.regions
+            for group in self.get_region_group_ids(region.name)
+        }
         pool_group_ids = sorted(
             {
                 pool_group_id
-                for pool_group_id, _, kind in self._stats_life_cycle_metadata().values()
-                if kind == "ssm"
+                for life_cycle_id, (
+                    pool_group_id,
+                    _,
+                    kind,
+                ) in self._stats_life_cycle_metadata().items()
+                if kind == "ssm" and life_cycle_id not in region_groups
             }
         )
         if not pool_group_ids:
@@ -1896,4 +1928,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         super().shutdown()
 
 
-__all__ = ["InforwardSnapshotEntry", "MambaHybridCacheManagerV2"]
+__all__ = [
+    "InforwardSnapshotEntry",
+    "MambaHybridCacheManagerV2",
+]

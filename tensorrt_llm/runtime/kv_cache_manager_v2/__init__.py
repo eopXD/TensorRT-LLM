@@ -173,6 +173,7 @@ ScratchDesc = _cpp.ScratchDesc
 SlotDesc = _cpp.SlotDesc
 SlotDescVariant = _cpp.SlotDescVariant
 SsmLayerConfig = _cpp.SsmLayerConfig
+SsmLifeCycle = _cpp.SsmLifeCycle
 StorageStatistics = _cpp.StorageStatistics
 SsmSnapshotIterationStatsDelta = _cpp.SsmSnapshotIterationStatsDelta
 SwaScratchReuseConfig = _cpp.SwaScratchReuseConfig
@@ -297,6 +298,7 @@ __all__ = [
     "RegionBuffer",
     "RegionConfig",
     "SsmLayerConfig",
+    "SsmLifeCycle",
     "StreamingBlockRemovedData",
     "StreamingBlockStoredData",
     "StreamingAllBlocksClearedData",

@@ -24,7 +24,18 @@ import numpy as np
 import pytest
 import torch
 
+from tensorrt_llm._torch.attention.backends.fp4_mla import (
+    FP4_MLA_ATTENTION_BACKEND_ENV,
+    FP4_MLA_TOKENS_PER_BLOCK,
+)
+from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
+    FP4_MLA_LATENT_REGION,
+    FP8_MLA_LATENT_REGION,
+    MLA_HP_RING_REGION,
+)
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
+from tensorrt_llm._torch.kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV
+from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.dummy_requests import DummyRequestFactory
 from tensorrt_llm._torch.pyexecutor.kv_cache import kv_cache_manager_v2 as kv_cache_v2_module
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
@@ -703,11 +714,17 @@ def _layer_api_snapshot(manager: KVCacheManagerV2) -> dict:
             (int(group.num_slots), list(group.slot_desc.slot_size_list), len(group.pools))
             for group in impl.pool_group_descs
         ],
-        "layer_grouping": [[int(layer_id) for layer_id in group] for group in impl.layer_grouping],
-        "layer_group_ids": [
-            int(impl.get_layer_group_id(LayerId(layer_id)))
-            for layer_id in range(manager.num_local_layers)
+        "buffer_grouping": [
+            [(int(buffer.layer_id), str(buffer.role)) for buffer in group]
+            for group in impl.buffer_grouping
         ],
+        "buffer_group_ids": {
+            (int(buffer.layer_id), str(buffer.role)): int(
+                impl.get_buffer_group_id(buffer.layer_id, buffer.role)
+            )
+            for group in impl.buffer_grouping
+            for buffer in group
+        },
         "layer_to_pool_mapping_dict": dict(manager.layer_to_pool_mapping_dict),
         "pool_pointers": [
             pool_offset(int(address))
@@ -764,7 +781,147 @@ def test_manager_without_regions_builds_as_before(monkeypatch, enable_block_reus
             manager.shutdown()
 
     assert with_hooks == without_hooks
-    assert len(with_hooks["layer_grouping"]) == 2
+    assert len(with_hooks["buffer_grouping"]) == 2
+
+
+def _buffer_layout_snapshot(manager: KVCacheManagerV2) -> dict:
+    """Every buffer's slot placement and page-index geometry, keyed by (global model layer, role).
+
+    A buffer on a virtual HP-ring layer past the model layers is keyed by the FP4 MLA layer its
+    ring belongs to. ``group`` is the set of keys sharing the buffer's layer group, so two managers
+    that number their groups differently compare equal.
+    """
+    impl = manager.impl
+    pools = {
+        int(pool.base_address): (int(group.pool_group_index), int(pool.pool_index))
+        for group in impl.pool_group_descs
+        for pool in group.pools
+    }
+    slots = {int(group.pool_group_index): int(group.num_slots) for group in impl.pool_group_descs}
+    hp_model_layers = {
+        int(layer_id): manager.pp_layers[manager._fp4_mla_compact_to_local[compact]]
+        for compact, layer_id in enumerate(manager._hp_manager_layer_ids)
+    }
+
+    def key(buffer) -> tuple[int, str]:
+        layer = int(buffer.layer_id)
+        model_layer = (
+            manager.pp_layers[layer] if layer < len(manager.pp_layers) else hp_model_layers[layer]
+        )
+        return model_layer, str(buffer.role)
+
+    snapshot = {}
+    for group_id, buffers in enumerate(impl.buffer_grouping):
+        members = frozenset(key(buffer) for buffer in buffers)
+        for buffer in buffers:
+            assert int(impl.get_buffer_group_id(buffer.layer_id, buffer.role)) == group_id
+            address = int(impl.get_mem_pool_base_address(buffer.layer_id, buffer.role))
+            base = max(base for base in pools if base <= address)
+            converter = impl.get_page_index_converter(buffer.layer_id, buffer.role)
+            snapshot[key(buffer)] = {
+                "group": members,
+                "pool": pools[base],
+                "offset": address - base,
+                "slots": slots[pools[base][0]],
+                "page_stride": int(impl.get_page_stride(buffer.layer_id, buffer.role)),
+                "converter": (
+                    int(converter.scale),
+                    int(converter.expansion),
+                    int(converter.layer_offset),
+                ),
+                "page_index_upper_bound": int(
+                    impl.get_page_index_upper_bound(buffer.layer_id, buffer.role)
+                ),
+            }
+    return snapshot
+
+
+def _build_k3_fp4_mla_manager(monkeypatch, *, mla_regions: bool, fp8_layers: str):
+    """A real Kimi K3 hybrid manager with the FP4 MLA layout: KDA layers 0 and 2, MLA layers 1 and 3."""
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, fp8_layers)
+    monkeypatch.setattr(KimiK3HybridCacheManager, "_fp4_mla_lowers_to_regions", mla_regions)
+    return KimiK3HybridCacheManager(
+        mamba_d_state=8,
+        mamba_d_conv=4,
+        mamba_num_heads=4,
+        mamba_n_groups=1,
+        mamba_head_dim=8,
+        mamba_num_layers=2,
+        mamba_layer_mask=[True, False, True, False],
+        mamba_cache_dtype=torch.float16,
+        mamba_ssm_cache_dtype=torch.float16,
+        kv_cache_config=KvCacheConfig(
+            max_tokens=2048, dtype="nvfp4", enable_block_reuse=False, enable_partial_reuse=False
+        ),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=96,
+        tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
+        max_seq_len=512,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        layer_mask=[False, True, False, True],
+        vocab_size=1024,
+        dtype=DataType.NVFP4,
+        pretrained_config=SimpleNamespace(
+            model_type="kimi_linear",
+            num_hidden_layers=4,
+            kv_lora_rank=32,
+            qk_rope_head_dim=64,
+            linear_attn_config={"full_attn_layers": [2, 4]},
+        ),
+    )
+
+
+@pytest.mark.parametrize("fp8_layers", ["3", ""], ids=["fp8-layer-3", "no-fp8"])
+def test_k3_mla_regions_keep_every_buffer_layout(monkeypatch, fp8_layers: str) -> None:
+    """Kimi K3's MLA state stored in token-block regions gets, buffer for buffer, the layout the
+    layer-config lowering gives it: the same group members, pool, slot offset, slot count, page
+    stride and page-index converter, with the HP ring keyed by its FP4 layer. Only the FP8
+    latent's window differs: the region keeps every block without one."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    snapshots = {}
+    windows = {}
+    for mla_regions in (False, True):
+        with monkeypatch.context() as patch:
+            manager = _build_k3_fp4_mla_manager(
+                patch, mla_regions=mla_regions, fp8_layers=fp8_layers
+            )
+        try:
+            snapshots[mla_regions] = _buffer_layout_snapshot(manager)
+            windows[mla_regions] = {
+                key: manager.impl.get_group_life_cycle(
+                    manager.impl.get_buffer_group_id(LayerId(manager.layer_offsets[key[0]]), key[1])
+                ).window_size
+                for key in ((1, str(Role.KEY)), (3, str(Role.KEY)))
+            }
+            if mla_regions:
+                assert manager._hp_manager_layer_ids == [
+                    LayerId(layer) for layer in manager._fp4_mla_compact_to_local
+                ]
+                assert [region.name for region in manager.region_layout.regions] == [
+                    FP4_MLA_LATENT_REGION,
+                    *([FP8_MLA_LATENT_REGION] if fp8_layers else []),
+                    MLA_HP_RING_REGION,
+                ]
+                hp_group = manager.get_region_group_ids(MLA_HP_RING_REGION)[0]
+                assert (
+                    manager.impl.get_group_life_cycle(hp_group).window_size
+                    == manager.fp4_mla_hp_pool_size
+                )
+        finally:
+            manager.shutdown()
+
+    assert snapshots[True] == snapshots[False]
+    fp4_key, fp8_key = (1, str(Role.KEY)), (3, str(Role.KEY))
+    assert windows[True][fp4_key] is None and windows[False][fp4_key] is None
+    if fp8_layers:
+        assert windows[False][fp8_key] is not None
+        assert windows[True][fp8_key] is None
 
 
 @pytest.mark.parametrize("kv_first", [False, True], ids=["key-first", "kv-first"])

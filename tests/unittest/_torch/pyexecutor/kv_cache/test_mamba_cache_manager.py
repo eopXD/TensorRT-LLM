@@ -16,7 +16,12 @@ from tensorrt_llm._torch.attention.backends.fp4_mla import (
     FP4_MLA_ATTENTION_BACKEND_ENV,
     FP4_MLA_TOKENS_PER_BLOCK,
 )
-from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import Fp4MlaV2CacheLayoutPolicy
+from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
+    FP4_MLA_LATENT_REGION,
+    FP8_MLA_LATENT_REGION,
+    MLA_HP_RING_REGION,
+    Fp4MlaV2CacheLayoutPolicy,
+)
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager import (
     Glm5NextCacheManager,
 )
@@ -141,6 +146,8 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     KVCacheDesc,
     KVCacheManagerConfig,
     LayerId,
+    RegionAllocationUnit,
+    ReusePolicy,
     SsmLayerConfig,
     _introspection,
 )
@@ -2577,10 +2584,14 @@ def _fp4_mla_hybrid_manager_stub(
     mgr._minimum_live_gpu_quota = lambda: 0
     mgr.kv_cache_type = CacheTypeCpp.SELFKONLY
     mgr.dtype = DataType.NVFP4
+    mgr.layer_specs = None
+    mgr.max_attention_window_vec = [None] * 4
     return mgr
 
 
 def _configure_fp4_mla_hybrid(mgr, pretrained_config) -> KVCacheManagerConfig:
+    """Configure the FP4 MLA layout and build the cache config in the manager's order: declare the
+    regions, build the layer configs, then lay the regions out beside them."""
     mgr.kv_cache_config = Fp4MlaV2CacheLayoutPolicy.configure_manager(
         mgr,
         KvCacheConfig(
@@ -2594,13 +2605,14 @@ def _configure_fp4_mla_hybrid(mgr, pretrained_config) -> KVCacheManagerConfig:
         head_dim=96,
         pretrained_config=pretrained_config,
     )
+    mgr._declare_regions()
     base_config = KVCacheManagerConfig(
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
         layers=_base_attention_layer_configs(4),
         initial_pool_ratio=[1.0],
     )
-    return MambaHybridCacheManagerV2._build_cache_config(mgr, mgr._lay_out_regions(base_config))
+    return mgr._lay_out_regions(MambaHybridCacheManagerV2._build_cache_config(mgr, base_config))
 
 
 def test_v2_hybrid_composes_fp4_mla_layout_with_ssm_layers(
@@ -2661,6 +2673,16 @@ def test_v2_hybrid_composes_fp8_fallback_with_fp4_mla_and_ssm_layers(
     assert mgr.get_kv_cache_dtype(3) == DataType.FP8
 
 
+def _fp8_fallback_pretrained_config() -> SimpleNamespace:
+    """K3-like layer pattern: KDA layers 0 and 2, MLA layers 1 and 3."""
+    return SimpleNamespace(
+        model_type="kimi_linear",
+        num_hidden_layers=4,
+        kv_lora_rank=32,
+        linear_attn_config={"full_attn_layers": [2, 4]},
+    )
+
+
 def _fp4_mla_hybrid_with_fp8_fallback(
     monkeypatch: pytest.MonkeyPatch,
     manager_cls: type[MambaHybridCacheManagerV2] = MambaHybridCacheManagerV2,
@@ -2669,18 +2691,65 @@ def _fp4_mla_hybrid_with_fp8_fallback(
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
     mgr = _fp4_mla_hybrid_manager_stub(manager_cls)
-    _configure_fp4_mla_hybrid(
-        mgr,
-        SimpleNamespace(
-            model_type="kimi_linear",
-            num_hidden_layers=4,
-            kv_lora_rank=32,
-            linear_attn_config={"full_attn_layers": [2, 4]},
-        ),
+    _configure_fp4_mla_hybrid(mgr, _fp8_fallback_pretrained_config())
+    # Lifecycles: SSM layers, FP4 MLA latent cache, FP8 fallback, HP ring. The HP ring
+    # sits on a virtual layer past the model layers, or on the FP4 layer itself when
+    # the manager stores the MLA state in regions.
+    hp_layer = mgr._hp_manager_layer_ids[0]
+    mgr.impl = SimpleNamespace(
+        buffer_grouping=[
+            *_stub_buffer_grouping([[0, 2], [1], [3]]),
+            [SimpleNamespace(layer_id=hp_layer, role=Role.MLA_HP_TAIL)],
+        ]
     )
-    # Lifecycles: SSM layers, FP4 MLA latent cache, FP8 fallback, HP ring.
-    mgr.impl = SimpleNamespace(buffer_grouping=_stub_buffer_grouping([[0, 2], [1], [3], [4]]))
     return mgr
+
+
+def test_k3_hybrid_lowers_fp4_mla_state_to_regions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """KimiK3HybridCacheManager keeps its MLA state in three token-block regions on the real MLA
+    layers: the HP ring and FP8 buffers the layer-config lowering builds, with the HP window, and
+    FP8 without one. Only KDA region planes would be bound as recurrent buffers."""
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
+    monkeypatch.setenv(KIMI_K3_FP8_KV_LAYERS_ENV, "3")
+    legacy = _configure_fp4_mla_hybrid(
+        _fp4_mla_hybrid_manager_stub(), _fp8_fallback_pretrained_config()
+    )
+    mgr = _fp4_mla_hybrid_manager_stub(KimiK3HybridCacheManager)
+    config = _configure_fp4_mla_hybrid(mgr, _fp8_fallback_pretrained_config())
+
+    assert len(config.layers) == 4
+    assert isinstance(config.layers[1], AttentionLayerConfig) and not config.layers[1].buffers
+    assert isinstance(config.layers[3], AttentionLayerConfig) and not config.layers[3].buffers
+    hp_window = mgr.fp4_mla_hp_pool_size
+    assert [
+        (region.name, region.allocation_unit, region.reuse_policy, region.window_size)
+        for region in config.regions
+    ] == [
+        (FP4_MLA_LATENT_REGION, RegionAllocationUnit.TOKEN_BLOCK, ReusePolicy.REQUIRED, None),
+        (FP8_MLA_LATENT_REGION, RegionAllocationUnit.TOKEN_BLOCK, ReusePolicy.REQUIRED, None),
+        (MLA_HP_RING_REGION, RegionAllocationUnit.TOKEN_BLOCK, ReusePolicy.REQUIRED, hp_window),
+    ]
+    tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
+    latent_roles = [Role.KEY, Role.KEY_BLOCK_SCALE]
+    fp4, fp8, hp = (
+        [(int(b.layer_id), b.buffer.role, b.buffer.size) for b in region.buffers]
+        for region in config.regions
+    )
+    assert fp4 == [
+        *(
+            (1, role, mgr.get_layer_bytes_per_token(1, role) * tokens_per_block)
+            for role in latent_roles
+        ),
+        (1, Role.MLA_V_SCALE, mgr._v_scale_bytes_per_page()),
+    ]
+    # The FP8 and HP buffers the layer-config lowering builds, and the HP ring's window.
+    assert fp8 == [(3, Role.KEY, legacy.layers[3].buffers[0].size)]
+    assert hp == [(1, Role.MLA_HP_TAIL, legacy.layers[4].buffers[0].size)]
+    assert legacy.layers[4].sliding_window_size == hp_window
+    assert mgr._cache_manager_layer_ids == [LayerId(1)]
+    assert mgr._fp8_mla_manager_layer_ids == [LayerId(3)]
+    assert mgr._hp_manager_layer_ids == [LayerId(1)]
+    assert {layer for layer, _ in mgr._recurrent_buffers} == {0, 2}
 
 
 def test_v2_hybrid_fp4_disagg_role_mapping_covers_mla_and_ssm_roles(

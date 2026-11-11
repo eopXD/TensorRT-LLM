@@ -13,6 +13,14 @@ import torch
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
+    AllocationUnit,
+    HandOff,
+    Plane,
+    Region,
+    RegionLayer,
+    RegionLifeCycle,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.logger import logger
@@ -46,6 +54,11 @@ from .layout import get_fp4_mla_v_scale_pool_size
 # The serving launcher publishes the worker role here, and every MPI rank of
 # the worker inherits it.
 _DISAGG_ROLE_ENV = "TRTLLM_DISAGG_ROLE"
+
+# Names of the regions that hold the MLA state when a manager lowers it to regions.
+FP4_MLA_LATENT_REGION = "fp4_mla_latent"
+FP8_MLA_LATENT_REGION = "fp8_mla_latent"
+MLA_HP_RING_REGION = "mla_hp_ring"
 
 
 def _persistent_cache_view_mode() -> torch.inference_mode:
@@ -92,6 +105,15 @@ class Fp4MlaV2CacheLayoutPolicy:
     ``Fp4MlaKVCacheManagerV2`` applies this policy directly for pure MLA
     models. Hybrid linear-attention managers compose the same policy with
     their SSM lifecycle and forward only attention-layout operations here.
+
+    The policy lowers the MLA state in one of two ways. By default the FP4
+    layers' configs hold the latent buffers, the FP8 fallback layers get a
+    lifecycle of their own through a window that never marks a block stale, and
+    the HP rings sit on virtual layers appended past the model layers. A manager
+    that sets ``_fp4_mla_lowers_to_regions`` declares the same state as three
+    token-block regions instead (``declare_mla_regions``): the latents without
+    a window and the HP ring with its window, on the real FP4 layers, whose
+    configs are left empty.
     Such a manager keeps its own disaggregation declarations and merges the
     policy's attention roles into them (``DISAGG_ROLE_MAPPER_KINDS``,
     ``DISAGG_IGNORED_ROLES``, ``_fp4_mla_disagg_global_layer_id``), so the
@@ -112,6 +134,9 @@ class Fp4MlaV2CacheLayoutPolicy:
     # Set by configure_manager: a disaggregated context worker keeps neither
     # V scales nor packed V (see is_fp4_mla_context_only_cache).
     fp4_mla_context_only_cache: bool = False
+    # Set by a manager that stores the MLA state as the regions of
+    # declare_mla_regions rather than in layer configs.
+    _fp4_mla_lowers_to_regions: bool = False
 
     def __init__(self, *args, **kwargs) -> None:
         kv_cache_config = args[0] if args else kwargs.get("kv_cache_config")
@@ -472,6 +497,86 @@ class Fp4MlaV2CacheLayoutPolicy:
             result[local_layer] = buffers
         return result
 
+    def declare_mla_regions(self) -> tuple[Region, ...]:
+        """Declare the MLA state as token-block regions on the local MLA layers.
+
+        ``FP4_MLA_LATENT_REGION`` holds each FP4 layer's K, K scales and the
+        optional V scales and packed V; ``FP8_MLA_LATENT_REGION`` each FP8
+        fallback layer's K, and is omitted on a rank without one;
+        ``MLA_HP_RING_REGION`` each FP4 layer's BF16 HP ring. Each plane has
+        the per-block size the layer-config lowering gives the same buffer.
+        The latents keep every block. The HP ring keeps the last
+        ``fp4_mla_hp_pool_size`` tokens, so its window is the ring size. All
+        three are handed off at block boundaries, so every prefix match needs
+        them.
+        """
+        fp4_local_layers = self._fp4_mla_local_layer_indices()
+        fp8_local_layers = self._fp8_mla_local_layer_indices()
+        if not fp4_local_layers:
+            raise ValueError("FP4 MLA V2 layout requires at least one local attention layer.")
+        tokens_per_block = self.tokens_per_block
+        extra_buffers = self._extra_buffers_per_layer(tokens_per_block=tokens_per_block) or {}
+
+        def latent_planes(local_layer: int) -> tuple[Plane, ...]:
+            buffers = [
+                BufferConfig(
+                    role=role,
+                    size=self.get_layer_bytes_per_token(local_layer, role) * tokens_per_block,
+                )
+                for role in self._get_buffer_roles_for_layer(local_layer)
+            ]
+            buffers.extend(extra_buffers.get(local_layer, ()))
+            return tuple(Plane(buffer.role, buffer.size) for buffer in buffers if buffer.size != 0)
+
+        latent = RegionLifeCycle(AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES)
+        regions = [
+            Region(
+                FP4_MLA_LATENT_REGION,
+                latent,
+                tuple(
+                    RegionLayer(local_layer, latent_planes(local_layer))
+                    for local_layer in fp4_local_layers
+                ),
+            )
+        ]
+        if fp8_local_layers:
+            regions.append(
+                Region(
+                    FP8_MLA_LATENT_REGION,
+                    latent,
+                    tuple(
+                        RegionLayer(
+                            local_layer,
+                            (
+                                Plane(
+                                    Role.KEY,
+                                    self._fp8_mla_bytes_per_token(local_layer) * tokens_per_block,
+                                ),
+                            ),
+                        )
+                        for local_layer in fp8_local_layers
+                    ),
+                )
+            )
+        regions.append(
+            Region(
+                MLA_HP_RING_REGION,
+                RegionLifeCycle(
+                    AllocationUnit.TOKEN_BLOCK,
+                    HandOff.BLOCK_BOUNDARIES,
+                    window=self._fp4_mla_hp_pool_size,
+                ),
+                tuple(
+                    RegionLayer(
+                        local_layer,
+                        (Plane(Role.MLA_HP_TAIL, self._hp_bytes_per_page(local_layer)),),
+                    )
+                    for local_layer in fp4_local_layers
+                ),
+            )
+        )
+        return tuple(regions)
+
     def _build_cache_config(self, config: KVCacheManagerConfig) -> KVCacheManagerConfig:
         cache_layers = list(config.layers)
         fp8_local_layers = self._fp8_mla_local_layer_indices()
@@ -479,6 +584,31 @@ class Fp4MlaV2CacheLayoutPolicy:
         if not fp4_local_layers:
             raise ValueError("FP4 MLA V2 layout requires at least one local attention layer.")
         self._fp8_mla_manager_layer_ids = [LayerId(local_layer) for local_layer in fp8_local_layers]
+        self._fp4_mla_local_to_compact = {
+            local_layer: compact_layer for compact_layer, local_layer in enumerate(fp4_local_layers)
+        }
+        self._fp4_mla_compact_to_local = fp4_local_layers
+        self._cache_manager_layer_ids = [LayerId(i) for i in fp4_local_layers]
+        if getattr(self, "_fp4_mla_lowers_to_regions", False):
+            # The regions of declare_mla_regions hold every MLA buffer; the layer
+            # configs only place them. The HP ring's buffers sit on the FP4 layers.
+            windowed = [
+                local_layer
+                for local_layer in fp4_local_layers
+                if self.max_attention_window_vec[local_layer] is not None
+            ]
+            if windowed:
+                raise ValueError(
+                    "FP4 MLA KV cache keeps the whole history of its latent cache; "
+                    "kv_cache_config.max_attention_window below max_seq_len is not supported "
+                    f"(local layers {windowed})."
+                )
+            for local_layer in (*fp4_local_layers, *fp8_local_layers):
+                cache_layers[local_layer] = AttentionLayerConfig(
+                    layer_id=LayerId(local_layer), buffers=[]
+                )
+            self._hp_manager_layer_ids = list(self._cache_manager_layer_ids)
+            return replace(config, layers=cache_layers)
         if fp8_local_layers:
             fp8_lifecycle_window = (
                 self.max_seq_len + self.num_extra_kv_tokens + self._kv_reserve_draft_tokens + 1
@@ -497,11 +627,6 @@ class Fp4MlaV2CacheLayoutPolicy:
                     sliding_window_size=fp8_lifecycle_window,
                     num_sink_tokens=None,
                 )
-        self._fp4_mla_local_to_compact = {
-            local_layer: compact_layer for compact_layer, local_layer in enumerate(fp4_local_layers)
-        }
-        self._fp4_mla_compact_to_local = fp4_local_layers
-        self._cache_manager_layer_ids = [LayerId(i) for i in fp4_local_layers]
         self._hp_manager_layer_ids = []
         for local_layer in fp4_local_layers:
             layer_id = LayerId(len(cache_layers))
@@ -524,14 +649,14 @@ class Fp4MlaV2CacheLayoutPolicy:
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
         cache_layer = self._cache_manager_layer_ids[0]
         hp_layer = self._hp_manager_layer_ids[0]
-        cache_pool_id = int(self.impl.get_layer_group_id(cache_layer))
-        hp_pool_id = int(self.impl.get_layer_group_id(hp_layer))
+        cache_pool_id = int(self.impl.get_buffer_group_id(cache_layer, Role.KEY))
+        hp_pool_id = int(self.impl.get_buffer_group_id(hp_layer, Role.MLA_HP_TAIL))
         if cache_pool_id == hp_pool_id:
             raise RuntimeError("FP4 MLA full-history and HP state must use distinct lifecycles.")
         fp8_pool_id = None
         if self._fp8_mla_manager_layer_ids:
             fp8_layer = self._fp8_mla_manager_layer_ids[0]
-            fp8_pool_id = int(self.impl.get_layer_group_id(fp8_layer))
+            fp8_pool_id = int(self.impl.get_buffer_group_id(fp8_layer, Role.KEY))
             if fp8_pool_id in (cache_pool_id, hp_pool_id):
                 raise RuntimeError("FP4 MLA, FP8 MLA, and HP state must use distinct lifecycles.")
 
@@ -625,11 +750,12 @@ class Fp4MlaV2CacheLayoutPolicy:
 
     def _validate_fp4_mla_layer_groups(self) -> None:
         cache_groups = {
-            int(self.impl.get_layer_group_id(layer_id))
+            int(self.impl.get_buffer_group_id(layer_id, Role.KEY))
             for layer_id in self._cache_manager_layer_ids
         }
         hp_groups = {
-            int(self.impl.get_layer_group_id(layer_id)) for layer_id in self._hp_manager_layer_ids
+            int(self.impl.get_buffer_group_id(layer_id, Role.MLA_HP_TAIL))
+            for layer_id in self._hp_manager_layer_ids
         }
         if len(cache_groups) != 1 or len(hp_groups) != 1 or cache_groups == hp_groups:
             raise RuntimeError(
@@ -637,7 +763,7 @@ class Fp4MlaV2CacheLayoutPolicy:
                 f"got cache={sorted(cache_groups)}, hp={sorted(hp_groups)}."
             )
         fp8_groups = {
-            int(self.impl.get_layer_group_id(layer_id))
+            int(self.impl.get_buffer_group_id(layer_id, Role.KEY))
             for layer_id in self._fp8_mla_manager_layer_ids
         }
         if self._fp8_mla_manager_layer_ids and (
@@ -695,10 +821,10 @@ class Fp4MlaV2CacheLayoutPolicy:
         cache_layer = self._cache_manager_layer_ids[compact_layer]
         hp_layer = self._hp_manager_layer_ids[compact_layer]
         return Fp4MlaPageTableSpec(
-            cache_pool_id=int(self.impl.get_layer_group_id(cache_layer)),
+            cache_pool_id=int(self.impl.get_buffer_group_id(cache_layer, Role.KEY)),
             # copy_batch_block_offsets already applies the V2 converter scale.
             cache_page_index_scale=1,
-            hp_pool_id=int(self.impl.get_layer_group_id(hp_layer)),
+            hp_pool_id=int(self.impl.get_buffer_group_id(hp_layer, Role.MLA_HP_TAIL)),
             hp_page_index_scale=1,
         )
 
@@ -1173,8 +1299,22 @@ class Fp4MlaKVCacheManagerV2(Fp4MlaV2CacheLayoutPolicy, KVCacheManagerV2):
     """Compatibility manager applying the FP4 MLA V2 layout policy."""
 
 
+class Fp4MlaRegionProvider:
+    """Region provider of a manager whose MLA state the FP4 MLA layout lowers to regions."""
+
+    def __init__(self, manager: KVCacheManagerV2) -> None:
+        self._manager = manager
+
+    def declare_regions(self) -> tuple[Region, ...]:
+        return Fp4MlaV2CacheLayoutPolicy.declare_mla_regions(self._manager)
+
+
 __all__ = [
+    "FP4_MLA_LATENT_REGION",
+    "FP8_MLA_LATENT_REGION",
+    "MLA_HP_RING_REGION",
     "Fp4MlaKVCacheManagerV2",
     "Fp4MlaPageTableSpec",
+    "Fp4MlaRegionProvider",
     "Fp4MlaV2CacheLayoutPolicy",
 ]

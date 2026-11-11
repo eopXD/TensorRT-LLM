@@ -871,9 +871,12 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     layer_id=layer_id,
                     buffers=buffers,
                 )
-        # The declared regions' buffers are bound the same way.
+        # The declared regions' buffers on recurrent layers are bound the same
+        # way. Regions on attention layers keep the attention layout's views.
         for region in self.region_layout.regions:
             for region_layer in region.layers:
+                if not self._is_local_mamba_layer(region_layer.model_layer):
+                    continue
                 for plane in region_layer.planes:
                     self._recurrent_buffers[region_layer.model_layer, plane.role] = None
 

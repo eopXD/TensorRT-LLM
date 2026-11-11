@@ -1003,6 +1003,10 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
 
     kda_context_only = False
     _kda_replay_region: KDAReplayRegion | None = None
+    # With the FP4 MLA cache layout, the MLA state is declared as the layout's
+    # token-block regions (published by _region_providers) rather than as layer
+    # configs and virtual HP layers.
+    _fp4_mla_lowers_to_regions = True
 
     @override
     def __init__(
@@ -1067,6 +1071,15 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
     @override
     def _region_providers(self) -> Sequence[RegionProvider]:
         providers = super()._region_providers()
+        if self._attention_cache_layout_policy is not None and self._fp4_mla_lowers_to_regions:
+            # The MLA regions come first, so on a stage whose first local layer is
+            # KDA the regions keep the layer-group ids the layer-config lowering
+            # gave the same state.
+            from tensorrt_llm._torch.attention.backends.fp4_mla.cache_manager import (
+                Fp4MlaRegionProvider,
+            )
+
+            providers = (*providers, Fp4MlaRegionProvider(self))
         if self._kda_replay is None or not self.mamba_pp_layers:
             return providers
         self._kda_replay_region = KDAReplayRegion(

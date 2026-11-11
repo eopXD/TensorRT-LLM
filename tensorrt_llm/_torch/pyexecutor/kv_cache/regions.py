@@ -22,10 +22,16 @@ shared prefix index. The cache manager lays each region out as a native
 from the life cycles the manager derives from its layer configs, even when the
 two have equal parameters.
 
-Only per-request regions that are never handed off are supported: one slot per
-living KV cache and beam, released when the cache closes. Such a region may
-supply a fixed slot count; its buffers then get a pool group of exactly that
-many GPU slots, which the manager's ratio-based sizing leaves alone.
+Two life cycles are supported:
+
+- A per-request region that is never handed off: one slot per living KV cache
+  and beam, released when the cache closes. It may supply a fixed slot count;
+  its buffers then get a pool group of exactly that many GPU slots, which the
+  manager's ratio-based sizing leaves alone.
+- A token-block region handed off at block boundaries: one page per token
+  block, committed to the prefix index with the block and required by every
+  prefix match, like an attention layer's KV. An optional window marks the
+  blocks before it stale. It is sized by ratio.
 """
 
 from __future__ import annotations
@@ -101,10 +107,14 @@ class RegionLifeCycle:
     Attributes:
         allocation: How the region's memory grows.
         hand_off: When committed memory passes to the prefix index.
+        window: Tokens of history a token-block region keeps; the blocks before
+            the window are stale. ``None`` keeps every block. A per-request
+            region has no window.
     """
 
     allocation: AllocationUnit
     hand_off: HandOff
+    window: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.hand_off not in _ALLOWED_HAND_OFF[self.allocation]:
@@ -112,6 +122,11 @@ class RegionLifeCycle:
                 f"A {self.allocation} region cannot hand off at {self.hand_off}; "
                 f"allowed: {[str(h) for h in _ALLOWED_HAND_OFF[self.allocation]]}"
             )
+        if self.window is not None:
+            if self.allocation != AllocationUnit.TOKEN_BLOCK:
+                raise ValueError(f"A {self.allocation} region has no window")
+            if self.window <= 0:
+                raise ValueError(f"A region window must be positive, got {self.window}")
 
     @property
     def reuse_policy(self) -> ReusePolicy:
@@ -126,7 +141,7 @@ class Plane:
     Attributes:
         role: The buffer role the plane is stored and addressed under.
         page_bytes: Bytes of this plane in one slot: one request's worth for a
-            per-request region.
+            per-request region, one token block's worth for a token-block region.
         coalescing_group: Planes may share a physical pool only when their
             groups and sizes match.
     """
@@ -172,11 +187,12 @@ class Region:
         name: Identifies the region; unique per manager.
         life_cycle: How the region's memory is allocated and handed off.
         layers: The model layers the region covers, each with its planes.
-        fixed_slot_count: GPU slots of the region's pool group, which the
-            manager then keeps at exactly this size. The declaring code computes
-            it for every owner it supports, including the headroom
+        fixed_slot_count: GPU slots of a per-request region's pool group,
+            which the manager then keeps at exactly this size. The declaring
+            code computes it for every owner it supports, including the headroom
             ``KvCache.resume`` needs below ``max_util_for_resume``. ``None``
-            sizes the region by ratio like the manager's other groups.
+            sizes the region by ratio like the manager's other groups; a
+            token-block region is always sized by ratio.
     """
 
     name: str
@@ -193,6 +209,11 @@ class Region:
                 f"Region {self.name!r} must have a positive fixed_slot_count, "
                 f"got {self.fixed_slot_count}"
             )
+        if (
+            self.fixed_slot_count is not None
+            and self.life_cycle.allocation == AllocationUnit.TOKEN_BLOCK
+        ):
+            raise ValueError(f"Token-block region {self.name!r} cannot have a fixed_slot_count")
 
     def bytes_per_slot(self) -> int:
         """Bytes of one slot across the region's layers."""
@@ -303,6 +324,13 @@ class RegionLayout:
         return RegionLayout(regions=regions, owners=owners)
 
 
+# The (allocation, hand-off) pairs native regions support, and their native allocation unit.
+_NATIVE_ALLOCATION_UNITS = {
+    (AllocationUnit.REQUEST, HandOff.NEVER): RegionAllocationUnit.REQUEST,
+    (AllocationUnit.TOKEN_BLOCK, HandOff.BLOCK_BOUNDARIES): RegionAllocationUnit.TOKEN_BLOCK,
+}
+
+
 def lay_out_regions(
     regions: Iterable[Region], model_layers: Sequence[LayerConfig]
 ) -> Tuple[List[RegionConfig], RegionLayout]:
@@ -320,7 +348,7 @@ def lay_out_regions(
     Raises:
         ValueError: If region names repeat, a region covers a layer this rank
             does not have, a region stores a role the layer's config already
-            stores, or a region's life cycle has no native region yet.
+            stores, or a region's life cycle has no native region.
     """
     regions = tuple(regions)
     names = [region.name for region in regions]
@@ -333,11 +361,12 @@ def lay_out_regions(
     owners: Dict[Tuple[int, DataRole], str] = {}
     for region in regions:
         life_cycle = region.life_cycle
-        if (life_cycle.allocation, life_cycle.hand_off) != (AllocationUnit.REQUEST, HandOff.NEVER):
+        allocation_unit = _NATIVE_ALLOCATION_UNITS.get((life_cycle.allocation, life_cycle.hand_off))
+        if allocation_unit is None:
             raise ValueError(
                 f"Region {region.name!r} is a {life_cycle.allocation} region handed off at "
-                f"{life_cycle.hand_off}; only request regions that are never handed off are "
-                "supported"
+                f"{life_cycle.hand_off}; only request regions that are never handed off and "
+                "token-block regions handed off at block boundaries are supported"
             )
         buffers = []
         for region_layer in region.layers:
@@ -367,9 +396,10 @@ def lay_out_regions(
             RegionConfig(
                 name=region.name,
                 buffers=buffers,
-                allocation_unit=RegionAllocationUnit.REQUEST,
+                allocation_unit=allocation_unit,
                 reuse_policy=life_cycle.reuse_policy,
                 fixed_slot_count=region.fixed_slot_count,
+                window_size=life_cycle.window,
             )
         )
     return configs, RegionLayout(regions=regions, owners=owners)

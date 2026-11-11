@@ -3596,11 +3596,17 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _log_kv_cache_pool_lifecycle_mapping(self) -> None:
         entries = OrderedDict()
-        for layer in self.kv_cache_manager_py_config.layers:
-            for buffer in layer.buffers:
-                entries.setdefault(
-                    self._format_kv_cache_pool_lifecycle_entry(layer.layer_id, buffer.role), None
-                )
+        config = self.kv_cache_manager_py_config
+        buffers = [
+            *((layer.layer_id, buffer.role) for layer in config.layers for buffer in layer.buffers),
+            *(
+                (region_buffer.layer_id, region_buffer.buffer.role)
+                for region in config.regions
+                for region_buffer in region.buffers
+            ),
+        ]
+        for layer_id, role in buffers:
+            entries.setdefault(self._format_kv_cache_pool_lifecycle_entry(layer_id, role), None)
 
         if not entries:
             return
@@ -4138,12 +4144,19 @@ class KVCacheManagerV2(BaseResourceManager):
             return config
 
         # Inspect the final buffers: a layer with no attention KV heads can
-        # still own recurrent-state or other buffers added by a subclass.
+        # still own recurrent-state or other buffers added by a subclass. A
+        # layer that a declared region covers stays, with no buffers of its own
+        # when the region holds all its state: it places the region's buffers.
+        region_layer_ids = {
+            layer.model_layer
+            for region in (self._region_layout.regions if self._region_layout is not None else ())
+            for layer in region.layers
+        }
         layers: list[AttentionLayerConfig | SsmLayerConfig] = []
         retained_layer_ids = []
         for layer in config.layers:
             buffers = [buffer for buffer in layer.buffers if buffer.size != 0]
-            if buffers:
+            if buffers or int(layer.layer_id) in region_layer_ids:
                 retained_layer_ids.append(int(layer.layer_id))
                 layer_id = LayerId(len(layers))
                 if isinstance(layer, AttentionLayerConfig):

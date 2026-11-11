@@ -2987,36 +2987,69 @@ def test_v2_hybrid_fp4_mla_snapshot_realignment_logs_once(
 
 
 @skip_no_cuda
+@pytest.mark.parametrize(
+    "manager_cls",
+    [MambaHybridCacheManagerV2, KimiK3HybridCacheManager],
+    ids=["layer-configs", "k3-regions"],
+)
+@pytest.mark.parametrize(
+    ("probe_len", "matched_len"),
+    [
+        (2 * FP4_MLA_TOKENS_PER_BLOCK + 1, 2 * FP4_MLA_TOKENS_PER_BLOCK),
+        (2 * FP4_MLA_TOKENS_PER_BLOCK, FP4_MLA_TOKENS_PER_BLOCK),
+    ],
+    ids=["last-reusable-token-on-boundary", "last-reusable-token-mid-block"],
+)
 def test_v2_hybrid_fp4_mla_reuses_prefix_at_aligned_snapshot(
     monkeypatch: pytest.MonkeyPatch,
+    manager_cls: type[MambaHybridCacheManagerV2],
+    probe_len: int,
+    matched_len: int,
 ) -> None:
+    """A probe of the first request's tokens reuses at most its prompt length minus one, and the
+    match ends at a 128-token block boundary: all 256 tokens when it may reuse 256, the first block
+    when it may reuse 255."""
     prompt_len = 2 * FP4_MLA_TOKENS_PER_BLOCK
+    chunk_len = FP4_MLA_TOKENS_PER_BLOCK
     mgr = _build_v2_hybrid_fp4_mla(
         monkeypatch,
         enable_block_reuse=True,
         # 256 and 156; FP4 MLA moves 156 down to its cache block (128).
         additional_snapshot_offsets_from_end=(0, 100),
+        manager_cls=manager_cls,
     )
     request = _make_v2_conversation_request(1, list(range(prompt_len)), "conv-1")
-    probe = _make_v2_conversation_request(2, list(range(prompt_len + 1)), "conv-2")
+    probe = _make_v2_conversation_request(2, list(range(probe_len)), "conv-2")
     try:
         assert mgr.fp4_mla_context_only_cache is False
-        _run_v2_hybrid_context(mgr, request)
+        assert (MLA_HP_RING_REGION in mgr.region_layout) == (
+            manager_cls is KimiK3HybridCacheManager
+        )
+        mgr.prepare_expect_snapshot_points([request])
         assert request.expect_snapshot_points == [FP4_MLA_TOKENS_PER_BLOCK, prompt_len]
+        assert mgr.prepare_context(request)
+        batch = ScheduledRequests()
+        batch.append_context_request(request)
+        # One chunk per snapshot point, so the recurrent state is committed at both.
+        for position in (chunk_len, prompt_len):
+            assert mgr.resize_context(request, num_tokens=chunk_len)
+            mgr.prepare_resources(batch)
+            request.context_current_position = position
+            mgr.update_context_resources(batch)
         state_index = mgr.get_state_indices([request.py_request_id], [False])[0]
         mgr.free_resources(request)
 
         mgr.prepare_expect_snapshot_points([probe])
         assert mgr.prepare_context(probe)
-        batch = ScheduledRequests()
-        batch.append_context_request(probe)
-        mgr.prepare_resources(batch)
+        probe_batch = ScheduledRequests()
+        probe_batch.append_context_request(probe)
+        mgr.prepare_resources(probe_batch)
 
-        # The whole first request is reused: FP4 MLA pages, the HP ring page
-        # of its last block, and the recurrent state committed at token 256.
-        assert probe.prepopulated_prompt_len == prompt_len
-        assert probe.prepopulated_prompt_len % FP4_MLA_TOKENS_PER_BLOCK == 0
-        assert mgr.get_state_indices([probe.py_request_id], [False]) == [state_index]
+        # The FP4 MLA pages, the HP ring page of the endpoint's last block and
+        # the recurrent state committed at the endpoint are reused.
+        assert probe.prepopulated_prompt_len == matched_len
+        if matched_len == prompt_len:
+            assert mgr.get_state_indices([probe.py_request_id], [False]) == [state_index]
         mgr.free_resources(probe)
     finally:
         mgr.shutdown()

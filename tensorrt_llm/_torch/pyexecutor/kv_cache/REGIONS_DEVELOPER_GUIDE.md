@@ -52,6 +52,7 @@ The pool group belongs to the region alone, so this arithmetic is exact.
 | `_lay_out_regions(config)` | Config build, after `_build_cache_config`, zero-size removal and mixed-precision layers | Adds one native `RegionConfig` per region to `config.regions` |
 | `region_layout` | After declaration | The regions and, once laid out, the owner of each buffer |
 | `get_region_group_ids(name)` | After construction | The region's layer group, through `KVCacheManager.get_region_group_id`; empty for an undeclared region |
+| `KVCacheManager.get_group_life_cycle(group)` | After construction | Any layer group's native life cycle: kind, window, sinks, reuse policy and region index. The manager's window readers (KV events, stats, stale masks, the disaggregation extractor, the connector layout) take a group's window from it, so a region's group reports its own window |
 | `get_disagg_ignored_roles()` | Disaggregated transfer | Model and backend managers identify locally rebuilt buffers to exclude |
 
 ## The KDA replay region
@@ -118,7 +119,10 @@ declaration through `Fp4MlaRegionProvider`, ahead of the KDA replay region. The 
 same state in layer configs instead: the FP8 layers' configs carry a window no block reaches, and
 the HP rings sit on virtual layers past the model layers.
 
-The policy finds each group with `get_buffer_group_id(layer, role)`.
+The policy finds each group with `get_buffer_group_id(layer, role)`. A disaggregation transfer ID
+follows the buffer's role: latent planes map to `2 * L` and the HP ring to `2 * L + 1`, where `L` is
+the global model layer, wherever the ring is stored. KV events and iteration stats carry the region
+name of each region group.
 
 ## Adding a region
 

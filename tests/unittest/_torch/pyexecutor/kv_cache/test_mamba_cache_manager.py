@@ -2812,15 +2812,17 @@ def test_v2_hybrid_fp4_disagg_ignores_derived_mla_and_kda_replay_roles(
     )
 
 
+@pytest.mark.parametrize("manager_cls", [MambaHybridCacheManagerV2, KimiK3HybridCacheManager])
 def test_v2_hybrid_fp4_disagg_global_layer_ids_cover_every_layer(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, manager_cls: type[MambaHybridCacheManagerV2]
 ) -> None:
-    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch)
+    mgr = _fp4_mla_hybrid_with_fp8_fallback(monkeypatch, manager_cls)
 
     ids = [mgr.get_disagg_global_layer_ids(group) for group in range(4)]
 
     # SSM layers and MLA latent caches (FP4 and FP8 fallback) map to 2 * L,
-    # and the HP ring of FP4 layer 1 to 2 * 1 + 1.
+    # and the HP ring of FP4 layer 1 to 2 * 1 + 1, whether the ring sits on a
+    # virtual layer or on layer 1 itself.
     assert ids == [[0, 4], [2], [6], [3]]
     all_ids = [gid for group in ids for gid in group]
     assert len(set(all_ids)) == len(all_ids)
@@ -2859,11 +2861,12 @@ def _build_v2_hybrid_fp4_mla(
     enable_block_reuse: bool = False,
     periodic_snapshot_interval: int = 0,
     additional_snapshot_offsets_from_end: tuple[int, ...] = (),
+    manager_cls: type[MambaHybridCacheManagerV2] = MambaHybridCacheManagerV2,
 ) -> MambaHybridCacheManagerV2:
     """A real hybrid V2 manager: KDA layer 0 and FP4 MLA layer 1."""
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
-    return MambaHybridCacheManagerV2(
+    return manager_cls(
         mamba_d_state=8,
         mamba_d_conv=4,
         mamba_num_heads=4,
@@ -2902,10 +2905,15 @@ def _build_v2_hybrid_fp4_mla(
 
 
 @skip_no_cuda
+@pytest.mark.parametrize(
+    "manager_cls",
+    [MambaHybridCacheManagerV2, KimiK3HybridCacheManager],
+    ids=["layer-configs", "k3-regions"],
+)
 def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, manager_cls: type[MambaHybridCacheManagerV2]
 ) -> None:
-    mgr = _build_v2_hybrid_fp4_mla(monkeypatch, is_disagg=True)
+    mgr = _build_v2_hybrid_fp4_mla(monkeypatch, is_disagg=True, manager_cls=manager_cls)
     try:
         assert mgr._attention_cache_layout_policy is Fp4MlaV2CacheLayoutPolicy
         page_table = build_page_table_from_manager(mgr)
@@ -2936,6 +2944,13 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
         }
         paged_ids = sorted(ll.global_layer_id for lg in paged_groups for ll in lg.local_layers)
         assert paged_ids == [2, 3]
+        # The latent keeps every block; the HP ring keeps its ring's window.
+        windows = {
+            ll.global_layer_id: lg.sliding_window_size
+            for lg in paged_groups
+            for ll in lg.local_layers
+        }
+        assert windows == {2: None, 3: mgr.fp4_mla_hp_pool_size}
     finally:
         mgr.shutdown()
 
@@ -4490,10 +4505,10 @@ def test_v2_hybrid_logs_aggregated_recurrent_cache_status_only_on_rank_zero(
     mgr.mapping = SimpleNamespace(rank=rank)
     mgr._stats_life_cycle_metadata = MagicMock(
         return_value={
-            0: (4, 4096, "attention"),
-            1: (6, None, "ssm"),
-            2: (7, None, "ssm"),
-            3: (6, None, "ssm"),
+            0: (4, 4096, "attention", None),
+            1: (6, None, "ssm", None),
+            2: (7, None, "ssm", None),
+            3: (6, None, "ssm", None),
         }
     )
     mgr._recurrent_evicted_blocks_total = 0

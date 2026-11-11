@@ -98,6 +98,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     ReusePolicy,
     ReuseScope,
     SsmLayerConfig,
+    SsmLifeCycle,
     _introspection,
 )
 
@@ -1417,9 +1418,9 @@ def test_layer_group_helpers_describe_split_ssm_layers() -> None:
         assert life_cycles[required].window_size is None
         assert life_cycles[private].window_size is None
         metadata = manager._stats_life_cycle_metadata()
-        assert metadata[attention][1:] == (8, "attention")
-        assert metadata[required][1:] == (None, "ssm")
-        assert metadata[private][1:] == (None, "ssm")
+        assert metadata[attention][1:] == (8, "attention", None)
+        assert metadata[required][1:] == (None, "ssm", None)
+        assert metadata[private][1:] == (None, "ssm", None)
         assert len({metadata[group][0] for group in (attention, required, private)}) == 3
     finally:
         impl.shutdown()
@@ -1432,25 +1433,16 @@ def test_event_window_sizes_filter_attention_without_backend_internals(
 ) -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager.max_seq_len = MAX_SEQ_LEN
-    manager.kv_cache_manager_py_config = SimpleNamespace(
-        layers=[
-            AttentionLayerConfig(
-                layer_id=LayerId(0),
-                buffers=[BufferConfig(role=Role.KEY, size=128)],
-                sliding_window_size=sliding_window_size,
-            ),
-            SsmLayerConfig(
-                layer_id=LayerId(1),
-                buffers=[BufferConfig(role=DataRole("ssm_state"), size=128)],
-            ),
-        ]
-    )
-    # Match the C++ binding surface: layer_grouping is public, while the
-    # Python implementation's private _life_cycles registry is absent.
+    # Match the C++ binding surface: the grouping and each group's native life
+    # cycle are public, while the life-cycle registry itself is not bound.
+    life_cycles = [AttnLifeCycle(sliding_window_size, 0), SsmLifeCycle()]
+    if not attention_first:
+        life_cycles.reverse()
     manager.impl = SimpleNamespace(
         buffer_grouping=[
             [BufferId(LayerId(i), Role.KEY)] for i in ([0, 1] if attention_first else [1, 0])
-        ]
+        ],
+        get_group_life_cycle=lambda group_id: life_cycles[group_id],
     )
 
     attention_group_id = 0 if attention_first else 1
@@ -4286,7 +4278,7 @@ def test_iteration_stats_reports_physical_pool_groups_without_window_metadata(
         get_and_reset_iteration_reused_blocks_by_level=lambda: {},
         get_and_reset_iteration_connector_reused_blocks=lambda: {},
     )
-    manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm")}
+    manager._stats_life_cycle_metadata = lambda: {3: (1, None, "ssm", None)}
     manager._storage_pool_groups_by_window = lambda: {}
     manager._get_and_reset_iteration_peak_block_stats_by_level = lambda num_levels: [
         [None, None] for _ in range(num_levels)
@@ -4472,8 +4464,8 @@ def test_cold_pool_group_iteration_stats_sum_all_cold_levels() -> None:
     manager = object.__new__(KVCacheManagerV2)
     manager._cold_pool_group_membership = lambda: ((0, frozenset({0, 1})),)
     life_cycle_metadata = {
-        0: (0, 32, "attention"),
-        1: (1, 64, "attention"),
+        0: (0, 32, "attention", None),
+        1: (1, 64, "attention", None),
     }
     secondary_stats_by_level = [
         [SimpleNamespace(total=7, available=2, evictable=1, slot_sizes=(4096,))],

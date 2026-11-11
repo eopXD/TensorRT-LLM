@@ -562,19 +562,23 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         """
         layout_policy = self._attention_cache_layout_policy
         result = []
-        # A recurrent layer split by buffer reuse policies is listed once per group.
-        layer_ids = dict.fromkeys(
-            int(buffer.layer_id) for buffer in self.impl.buffer_grouping[layer_group_id]
-        )
-        for internal_layer in layer_ids:
+        # A layer split across groups is listed once per group. Its buffers in
+        # one group are all latent, all HP ring or all recurrent state, so its
+        # first buffer here names its transfer ID.
+        roles_by_layer: Dict[int, DataRole] = {}
+        for buffer in self.impl.buffer_grouping[layer_group_id]:
+            roles_by_layer.setdefault(int(buffer.layer_id), buffer.role)
+        for internal_layer, role in roles_by_layer.items():
             if layout_policy is None:
                 global_layer_id = int(self.pp_layers[internal_layer])
             elif self._is_local_mamba_layer(internal_layer):
                 global_layer_id = 2 * int(self.pp_layers[internal_layer])
             else:
-                global_layer_id = self._fp4_mla_disagg_global_layer_id(internal_layer)
+                global_layer_id = self._fp4_mla_disagg_global_layer_id(internal_layer, role)
                 if global_layer_id is None:
-                    raise ValueError(f"Unknown hybrid FP4 MLA internal layer {internal_layer}.")
+                    raise ValueError(
+                        f"Unknown hybrid FP4 MLA internal layer {internal_layer} ({role})."
+                    )
             result.append(global_layer_id)
         return result
 
@@ -1844,20 +1848,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if report is None:
             return None
 
-        region_groups = {
-            group
-            for region in self.region_layout.regions
-            for group in self.get_region_group_ids(region.name)
-        }
         pool_group_ids = sorted(
             {
                 pool_group_id
-                for life_cycle_id, (
-                    pool_group_id,
-                    _,
-                    kind,
-                ) in self._stats_life_cycle_metadata().items()
-                if kind == "ssm" and life_cycle_id not in region_groups
+                for pool_group_id, _, kind, region in self._stats_life_cycle_metadata().values()
+                if kind == "ssm" and region is None
             }
         )
         if not pool_group_ids:

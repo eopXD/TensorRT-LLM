@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional, Tupl
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
+from tensorrt_llm.runtime.kv_cache_manager_v2 import AttnLifeCycle
 
 if TYPE_CHECKING:
     from ..kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
@@ -246,11 +247,10 @@ def _global_layer_ids(manager: "KVCacheManagerV2", local_layer_ids) -> List[int]
     return [int(pp_layers[int(lid)]) for lid in local_layer_ids]
 
 
-def _window_size(init_config, local_layer_id: int) -> Optional[int]:
-    layers = init_config.layers
-    if local_layer_id >= len(layers):
-        raise ValueError(f"no layer config for internal layer {local_layer_id}")
-    window = getattr(layers[local_layer_id], "window_size", None)
+def _window_size(impl, layer_group_id: int) -> Optional[int]:
+    """Sliding window of a layer group's life cycle; None without one and for a state group."""
+    life_cycle = impl.get_group_life_cycle(layer_group_id)
+    window = life_cycle.window_size if isinstance(life_cycle, AttnLifeCycle) else None
     return None if window is None else int(window)
 
 
@@ -262,11 +262,11 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     rejected while a connector is attached
     (``PyExecutor._reject_non_gpu_cache_tiers``). Reads only the manager's
     public layout API -- ``layer_grouping``, ``all_buffer_ids``,
-    ``get_aggregated_pages``, ``pool_group_descs`` -- so it assumes nothing
+    ``get_aggregated_pages``, ``pool_group_descs``, ``get_group_life_cycle``
+    -- so it assumes nothing
     about dimension order, kv factor, or pool count.
     """
     impl = manager.impl
-    init_config = impl.init_config
 
     # A pool group's slot count applies to every layer group drawn from it.
     # Note LayerGroupId and PoolGroupIndex are distinct index spaces; the
@@ -316,7 +316,7 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
             KvCacheLayerGroupLayout(
                 layer_group_id=layer_group_id,
                 layer_ids=tuple(global_by_local[lid] for lid in local_layer_ids),
-                window_size=_window_size(init_config, local_layer_ids[0]),
+                window_size=_window_size(impl, layer_group_id),
                 regions=tuple(regions),
             )
         )

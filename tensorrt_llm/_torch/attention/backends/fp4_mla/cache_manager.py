@@ -1173,32 +1173,41 @@ class Fp4MlaV2CacheLayoutPolicy:
             [request.prompt_len for request in requests],
         )
 
-    def _fp4_mla_disagg_global_layer_id(self, internal_layer: int) -> Optional[int]:
-        """Collision-free transfer ID of an MLA cache or HP-ring layer.
+    def _fp4_mla_disagg_global_layer_id(self, internal_layer: int, role: DataRole) -> Optional[int]:
+        """Collision-free transfer ID of the MLA buffer ``role`` on an internal layer.
 
         A model layer's latent cache (FP4 or FP8 fallback) maps to ``2 * L``
-        and its HP-ring virtual layer to ``2 * L + 1``, where ``L`` is the
-        global model layer. Returns ``None`` for any other internal layer.
+        and its HP ring (``Role.MLA_HP_TAIL``) to ``2 * L + 1``, where ``L`` is
+        the global model layer. The HP ring sits on a virtual layer or on the
+        FP4 layer itself, depending on how the manager lowers the MLA state.
+        Returns ``None`` for any other buffer.
         """
         internal_layer = int(internal_layer)
+        if role == Role.MLA_HP_TAIL:
+            for compact_layer, layer_id in enumerate(self._hp_manager_layer_ids):
+                if int(layer_id) == internal_layer:
+                    local_layer = self._fp4_mla_compact_to_local[compact_layer]
+                    return 2 * int(self.pp_layers[local_layer]) + 1
+            return None
         for compact_layer, layer_id in enumerate(self._cache_manager_layer_ids):
             if int(layer_id) == internal_layer:
                 local_layer = self._fp4_mla_compact_to_local[compact_layer]
                 return 2 * int(self.pp_layers[local_layer])
         if any(int(layer_id) == internal_layer for layer_id in self._fp8_mla_manager_layer_ids):
             return 2 * int(self.pp_layers[internal_layer])
-        for compact_layer, layer_id in enumerate(self._hp_manager_layer_ids):
-            if int(layer_id) == internal_layer:
-                local_layer = self._fp4_mla_compact_to_local[compact_layer]
-                return 2 * int(self.pp_layers[local_layer]) + 1
         return None
 
     def get_disagg_global_layer_ids(self, layer_group_id: int) -> list[int]:
         result = []
-        for layer_id in self.impl.layer_grouping[layer_group_id]:
-            global_layer_id = self._fp4_mla_disagg_global_layer_id(int(layer_id))
+        # Every buffer of a layer in one group is either latent or HP ring, so
+        # the layer's first buffer names its transfer ID.
+        roles_by_layer: dict[int, DataRole] = {}
+        for buffer in self.impl.buffer_grouping[layer_group_id]:
+            roles_by_layer.setdefault(int(buffer.layer_id), buffer.role)
+        for layer_id, role in roles_by_layer.items():
+            global_layer_id = self._fp4_mla_disagg_global_layer_id(layer_id, role)
             if global_layer_id is None:
-                raise ValueError(f"Unknown FP4 MLA V2 internal layer {int(layer_id)}.")
+                raise ValueError(f"Unknown FP4 MLA V2 internal layer {layer_id} ({role}).")
             result.append(global_layer_id)
         return result
 

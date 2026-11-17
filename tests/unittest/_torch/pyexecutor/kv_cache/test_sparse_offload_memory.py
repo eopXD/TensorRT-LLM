@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from dataclasses import replace
+
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
@@ -70,6 +72,7 @@ V4_FLASH_BATCH = SparseBatchShape(
     selection_widths=(512,),
     layer_counts=(2,),
     flush_capacities=(256,),
+    max_in_flight_units=(1,),
     index_table_entries=2,
 )
 # The Batch and DeepSeek-V4's attention metadata offload state, of which the eager
@@ -455,6 +458,7 @@ def test_the_token_budget_sizes_the_write_back_list() -> None:
         tokens_per_block=TOKENS_PER_BLOCK,
         max_batch_size=256,
         max_blocks_per_seq=8196,
+        max_in_flight_tokens=1,
         max_total_input_tokens=8192,
     )
 
@@ -470,19 +474,62 @@ def test_the_token_budget_sizes_the_write_back_list() -> None:
 
 
 @pytest.mark.cpu_only
-def test_batch_has_a_page_table_per_life_cycle_and_a_fetch_per_sparse_one() -> None:
+def test_the_queries_per_request_widen_the_selection_row() -> None:
+    """A request's row holds a selection for each query token it may feed a step."""
+    shape = dict(
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_batch_size=256,
+        max_blocks_per_seq=8196,
+        max_in_flight_tokens=1,
+    )
+    batch = sparse_batch_shape(_v4_flash_like_layers(), queries_per_request=3, **shape)
+
+    (width,) = V4_FLASH_BATCH.selection_widths
+    assert batch == replace(V4_FLASH_BATCH, selection_widths=(3 * width,))
+    # Each added position is an output entry per row, and three entries per row in the
+    # fetch's work list.
+    assert batch.fetch_scratch_bytes - V4_FLASH_BATCH.fetch_scratch_bytes == (
+        4 * 256 * 2 * width * (1 + 3)
+    )
+
+    with pytest.raises(ValueError, match="queries_per_request"):
+        sparse_batch_shape(_v4_flash_like_layers(), queries_per_request=0, **shape)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("max_in_flight_tokens", "in_flight_units"), [(1, 1), (10, 3)])
+def test_batch_has_a_page_table_per_life_cycle_and_a_fetch_per_sparse_one(
+    max_in_flight_tokens: int, in_flight_units: int
+) -> None:
     layers = _v4_flash_like_layers()
 
-    assert (
-        sparse_batch_shape(
-            layers, tokens_per_block=TOKENS_PER_BLOCK, max_batch_size=256, max_blocks_per_seq=8196
-        )
-        == V4_FLASH_BATCH
+    batch = sparse_batch_shape(
+        layers,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_batch_size=256,
+        max_blocks_per_seq=8196,
+        max_in_flight_tokens=max_in_flight_tokens,
+    )
+    # The tokens in flight span that many four-token rows, rounded up. A decode step
+    # can write back every one of them for every row.
+    assert batch == replace(
+        V4_FLASH_BATCH,
+        max_in_flight_units=(in_flight_units,),
+        flush_capacities=(256 * in_flight_units,),
+    )
+    # Each unit in flight adds an entry per row, and three per row to each of the two
+    # layers' write-back lists.
+    assert batch.fetch_scratch_bytes - V4_FLASH_BATCH.fetch_scratch_bytes == (
+        4 * 256 * (in_flight_units - 1) * (1 + 2 * 3)
     )
     # Layers without a fetch path still get page tables, but no fetch work arrays.
     layers = [_layer(0, ("swa", 4096, False), window=128), _sparse_layer(1, fetched=False)]
     batch = sparse_batch_shape(
-        layers, tokens_per_block=TOKENS_PER_BLOCK, max_batch_size=4, max_blocks_per_seq=8
+        layers,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_batch_size=4,
+        max_blocks_per_seq=8,
+        max_in_flight_tokens=max_in_flight_tokens,
     )
     assert batch.num_life_cycles == 2
     assert batch.selection_widths == ()
@@ -494,65 +541,83 @@ def test_batch_has_a_page_table_per_life_cycle_and_a_fetch_per_sparse_one() -> N
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("cache_factor", "num_selected_blocks", "units_per_cell", "cells"),
+    ("cache_factor", "num_selected_blocks", "units_per_cell", "max_in_flight_units", "cells"),
     [
         # The smallest cache holds 512 selected rows plus the row being written.
-        (1.0, 512, 32, 17),
+        (1.0, 512, 32, 1, 17),
         # The factor scales the selection; the row being written stays one row.
-        (1.5, 512, 32, 25),
-        (2.0, 512, 32, 33),
-        (3.0, 512, 32, 49),
+        (1.5, 512, 32, 1, 25),
+        (2.0, 512, 32, 1, 33),
+        (3.0, 512, 32, 1, 49),
         # A selection that does not fill whole cells rounds up once, at the end.
-        (2.0, 500, 32, 32),
-        (1.0, 512, 64, 9),
-        (1.0, 1, 32, 1),
+        (2.0, 500, 32, 1, 32),
+        (1.0, 512, 64, 1, 9),
+        (1.0, 1, 32, 1, 1),
         # Float error from a computed factor does not add a unit.
-        (0.1 * 3 / 0.3, 512, 32, 17),
+        (0.1 * 3 / 0.3, 512, 32, 1, 17),
+        # Every unit in flight takes a row beside the selection, whatever the factor.
+        (1.0, 500, 32, 12, 16),
+        (1.0, 500, 32, 13, 17),
+        (2.0, 64, 1, 3, 131),
     ],
 )
 def test_sparse_cache_cells_scale_the_selection(
-    cache_factor: float, num_selected_blocks: int, units_per_cell: int, cells: int
+    cache_factor: float,
+    num_selected_blocks: int,
+    units_per_cell: int,
+    max_in_flight_units: int,
+    cells: int,
 ) -> None:
-    assert sparse_cache_cells(cache_factor, num_selected_blocks, units_per_cell) == cells
+    assert (
+        sparse_cache_cells(cache_factor, num_selected_blocks, units_per_cell, max_in_flight_units)
+        == cells
+    )
 
 
 @pytest.mark.cpu_only
 def test_sparse_cache_cells_reject_less_than_one_selection() -> None:
     with pytest.raises(ValueError, match="at least 1"):
-        sparse_cache_cells(0.5, 512, 32)
+        sparse_cache_cells(0.5, 512, 32, 1)
 
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    ("unit_tokens", "num_selected_units", "units_per_page", "cells"),
+    ("unit_tokens", "num_selected_units", "units_per_page", "max_in_flight_tokens", "cells"),
     [
         # Two selections of 512 rows plus the one being written fill 33 cells of 32 rows.
-        (4, 512, 32, 33),
+        (4, 512, 32, 1, 33),
         # Two selections of 2048 tokens plus one fill 33 cells of 128 tokens.
-        (1, 2048, 128, 33),
+        (1, 2048, 128, 1, 33),
         # Two selections of 128 pools of 16 tokens plus one fill 33 cells of 8 pools.
-        (16, 128, 8, 33),
+        (16, 128, 8, 1, 33),
         # Two selections of 64 pages plus one, a unit given as a page or left unset.
-        (TOKENS_PER_BLOCK, 64, 1, 129),
-        (None, 64, 1, 129),
+        (TOKENS_PER_BLOCK, 64, 1, 1, 129),
+        (None, 64, 1, 1, 129),
+        # 130 tokens in flight span nine pools of 16 tokens, which take a 34th cell.
+        (16, 128, 8, 130, 34),
     ],
-    ids=["compressed_row", "token", "token_pool", "page", "unset"],
+    ids=["compressed_row", "token", "token_pool", "page", "unset", "tokens_in_flight"],
 )
 def test_sparse_cache_config_sizes_the_cache_for_any_selection_unit(
-    unit_tokens: int | None, num_selected_units: int, units_per_page: int, cells: int
+    unit_tokens: int | None,
+    num_selected_units: int,
+    units_per_page: int,
+    max_in_flight_tokens: int,
+    cells: int,
 ) -> None:
     cache = sparse_cache_config(
         num_selected_units=num_selected_units,
         unit_tokens=unit_tokens,
         tokens_per_block=TOKENS_PER_BLOCK,
         gpu_cache_factor=2.0,
+        max_in_flight_tokens=max_in_flight_tokens,
     )
 
     assert cache.num_selected_blocks == num_selected_units
     # The config names a definite unit size: a caller passing none means a whole page,
     # and the helper resolves that rather than storing the absence.
     assert cache.unit_tokens == (TOKENS_PER_BLOCK if unit_tokens is None else unit_tokens)
-    # The default cache holds two selections plus the unit being written, in whole cells.
+    # The default cache holds two selections plus the units in flight, in whole cells.
     assert cache.max_cached_units == cells * units_per_page
     (arena,) = sparse_arena_shapes(
         [_layer(0, ("history", 64 * units_per_page, True), ("key", 64, False), sparse_cache=cache)],
@@ -571,6 +636,7 @@ def test_sparse_cache_config_rejects_a_unit_that_does_not_divide_a_page() -> Non
             unit_tokens=48,
             tokens_per_block=TOKENS_PER_BLOCK,
             gpu_cache_factor=1.0,
+            max_in_flight_tokens=1,
         )
 
 

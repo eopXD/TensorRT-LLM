@@ -316,16 +316,17 @@ struct SparseCacheConfig
     //! Maximum cache entries per selection supported by the sparse resolve probe.
     static constexpr int32_t kMaxCacheEntries = static_cast<int32_t>((1U << kProbeSlotBits) - 2U);
 
-    //! Selection width: units a sparse-attention step selects for this layer.
+    //! Units one query selects for this layer. A request's selection row carries this many
+    //! positions for each query it may feed a step.
     int numSelectedBlocks;
 
     //! Cells one buffer gets in a request's GPU cache, counting both populations: the
     //! history it caches and every unit still in flight.
     //!
     //! Two to four times numSelectedBlocks is the usual choice: a cache only as wide as the
-    //! selection retains nothing between steps, so what it holds above the selection is
-    //! what survives to be hit next step. Only one unit of it is ever in flight, because a
-    //! sparse request contributes one query token per step, so the rest is all reuse.
+    //! selection retains nothing between steps, so what it holds above the selection and
+    //! the in-flight units is what survives to be hit next step. It must hold at least a
+    //! full selection beside maxInFlightUnits() units, which are pinned while in flight.
     int maxCachedUnits;
 
     //! Original tokens one selection unit spans. A whole page is `tokensPerBlock`.
@@ -358,7 +359,16 @@ struct SparseCacheConfig
         return tokensPerBlock / unitTokens;
     }
 
-    void validate(int tokensPerBlock) const;
+    //! Units a request can have in flight when its capacity leads its history by at most
+    //! `maxInFlightTokens`. Both watermarks round down to units, so the gap spans the most
+    //! units when history sits one token short of a unit boundary.
+    [[nodiscard]] int maxInFlightUnits(int maxInFlightTokens) const
+    {
+        return (maxInFlightTokens + unitTokens - 1) / unitTokens;
+    }
+
+    //! `maxInFlightTokens` is KVCacheManagerConfig::sparseMaxInFlightTokens.
+    void validate(int tokensPerBlock, int maxInFlightTokens) const;
 };
 
 // ---------------------------------------------------------------------------
@@ -745,6 +755,28 @@ struct KVCacheManagerConfig
     // what gives way between them. They can only conflict if the floors alone exceed this
     // budget, which construction rejects.
     std::optional<size_t> hostSparsePoolQuota;
+
+    // Tokens a request with a sparse fetch path may hold between its history length and its
+    // capacity. Those tokens are in flight: a unit they complete has no host copy until
+    // history passes it, so its GPU cache cell is pinned until then, and every layer's
+    // sparse cache must hold the units this many tokens span beside a full selection.
+    //
+    // One is a step that writes a single token per request and keeps it. A step that writes
+    // several tokens and keeps a prefix of them needs the widest gap a request reaches
+    // between one history advance and the next.
+    int sparseMaxInFlightTokens = 1;
+
+    // Query tokens a request with a sparse fetch path may feed one step. A fetch takes one
+    // selection row per request, this many selections of numSelectedBlocks back to back, and
+    // resolves the row as one list, so every unit the request's queries name is resident
+    // together.
+    //
+    // A cache must hold one query's selection beside the in-flight units, not the whole row:
+    // the queries of a request select overlapping history, and a unit they share takes one
+    // cell. A row whose distinct units outnumber the cells the cache can give them cannot be
+    // resolved, and the step that fetches it is fatal to the process. A cache of this many
+    // selections beside the in-flight units holds every row.
+    int sparseQueriesPerRequest = 1;
 
     // Publish a finalized partial block for reuse when committing stops.
     // Beam search disables this while retaining full-block reuse.

@@ -79,9 +79,6 @@ _HOST_PAGE_BYTES = 4096
 # A host-backed pool rounds its bytes up to this grain (hostMemSizeGranularity in
 # utils/hostMemBacking.cpp: 2 MiB, or the commit alignment where that is larger).
 _HOST_POOL_GRANULARITY = 2 << 20
-# A decode step writes one query token per request, which completes at most one
-# unit, so one unit per layer is in flight (_sparseCacheMaxInFlightUnits).
-_SPARSE_MAX_FLUSH_UNITS = 1
 
 
 def _index_array_bytes(num_entries: int) -> int:
@@ -97,6 +94,20 @@ def sparse_units_per_page(unit_tokens: int | None, tokens_per_block: int) -> int
         tokens_per_block: Tokens per page.
     """
     return tokens_per_block // (unit_tokens or tokens_per_block)
+
+
+def sparse_max_in_flight_units(max_in_flight_tokens: int, unit_tokens: int) -> int:
+    """Return the units of a layer a request can have in flight.
+
+    A request's capacity leads its history by at most ``max_in_flight_tokens``, and
+    both watermarks round down to units, so the gap spans that many tokens' worth of
+    units, rounded up.
+
+    Args:
+        max_in_flight_tokens: The manager config's ``sparse_max_in_flight_tokens``.
+        unit_tokens: Tokens one unit of the layer covers.
+    """
+    return ceil_div(max_in_flight_tokens, unit_tokens)
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,13 +416,15 @@ class SparseBatchShape:
         num_life_cycles: Life cycles of the manager; each has a page table.
         max_batch_size: Rows.
         max_blocks_per_seq: Columns of each page table.
-        selection_widths: Units one step selects, for each life cycle with a sparse
-            fetch path.
+        selection_widths: Positions of a request's selection row, for each life cycle
+            with a sparse fetch path: the units one query token selects, times the query
+            tokens a request may feed a step.
         layer_counts: Layers of each of those life cycles. The write-back keeps a work
             list per layer, so this scales that term; a zero would drop it and under-size
             the allocation, which is why it is required rather than defaulted.
         flush_capacities: Units one step can write back per layer, for each of those life
             cycles, from the step's token budget.
+        max_in_flight_units: Units a row can have in flight, for each of those life cycles.
         index_table_entries: Entries of the converted index tables, summed over the
             tables; each entry is a page table's worth of indices. Required for the same
             reason as ``layer_counts``.
@@ -423,6 +436,7 @@ class SparseBatchShape:
     selection_widths: tuple[int, ...]
     layer_counts: tuple[int, ...]
     flush_capacities: tuple[int, ...]
+    max_in_flight_units: tuple[int, ...]
     index_table_entries: int
 
     @property
@@ -469,18 +483,22 @@ class SparseBatchShape:
     def fetch_scratch_bytes(self) -> int:
         """Device bytes of a step's work arrays, for the fetch and the write-back both.
 
-        Per life cycle and row: one entry per selected unit, a miss count and the unit
-        in flight. Then the two compacted work lists, which carry a row, an ordinal and
-        a slot per entry plus one total per list: one list for the fetch, sized for every
-        row missing its whole selection, and one per layer for the write-back, sized by
-        the step's token budget.
+        Per life cycle and row: one entry per position of the selection row, a miss count
+        and the units in flight. Then the two compacted work lists, which carry a row, an
+        ordinal and a slot per entry plus one total per list: one list for the fetch,
+        sized for every row missing its whole selection row, and one per layer for the
+        write-back, sized by the step's token budget.
         """
         rows = self.max_batch_size
         total = 0
-        for width, num_layers, flush_capacity in zip(
-            self.selection_widths, self.layer_counts, self.flush_capacities, strict=True
+        for width, num_layers, flush_capacity, in_flight_units in zip(
+            self.selection_widths,
+            self.layer_counts,
+            self.flush_capacities,
+            self.max_in_flight_units,
+            strict=True,
         ):
-            total += rows * (width + 1 + _SPARSE_MAX_FLUSH_UNITS)
+            total += rows * (width + 1 + in_flight_units)
             total += 3 * rows * width + 1
             total += num_layers * (3 * flush_capacity + 1)
             total += rows * num_layers
@@ -493,7 +511,9 @@ def sparse_batch_shape(
     tokens_per_block: int,
     max_batch_size: int,
     max_blocks_per_seq: int,
+    max_in_flight_tokens: int,
     max_total_input_tokens: int | None = None,
+    queries_per_request: int = 1,
 ) -> SparseBatchShape:
     """Return the Batch a manager with ``layers`` steps its requests in.
 
@@ -502,18 +522,31 @@ def sparse_batch_shape(
         tokens_per_block: Tokens per page.
         max_batch_size: Rows of the Batch.
         max_blocks_per_seq: Pages the longest request can hold.
+        max_in_flight_tokens: Tokens a request may hold between its history and its
+            capacity, the manager config's ``sparse_max_in_flight_tokens``. It sizes
+            each row's in-flight units.
         max_total_input_tokens: Tokens one step may ingest across every row. It sizes
             the write-back's work lists: a row advancing ``t`` tokens crosses at most
             ``t / unit_tokens + 1`` units. Left unset, a decode step is assumed, where
-            each row advances one token and so crosses at most one unit boundary.
+            a row's history crosses only units that were in flight.
+        queries_per_request: Query tokens a request may feed one step, the manager
+            config's ``sparse_queries_per_request``. A request's selection row holds a
+            selection for each.
     """
+    if queries_per_request <= 0:
+        raise ValueError(f"queries_per_request must be positive, got {queries_per_request}")
     fetch_groups = list(_fetch_path_life_cycles(layers, tokens_per_block))
+
+    def unit_tokens(grouped_layers: Sequence[LayerConfig]) -> int:
+        return grouped_layers[0].sparse_cache.unit_tokens or tokens_per_block
+
+    def in_flight_units(grouped_layers: Sequence[LayerConfig]) -> int:
+        return sparse_max_in_flight_units(max_in_flight_tokens, unit_tokens(grouped_layers))
 
     def flush_capacity(grouped_layers: Sequence[LayerConfig]) -> int:
         if max_total_input_tokens is None:
-            return max_batch_size * _SPARSE_MAX_FLUSH_UNITS
-        unit_tokens = grouped_layers[0].sparse_cache.unit_tokens or tokens_per_block
-        return max_total_input_tokens // unit_tokens + max_batch_size
+            return max_batch_size * in_flight_units(grouped_layers)
+        return max_total_input_tokens // unit_tokens(grouped_layers) + max_batch_size
 
     def index_table_entries(grouped_layers: Sequence[LayerConfig]) -> int:
         # The Batch converts every sparse buffer's indices (sparseIndexTableSpecs, one spec
@@ -531,10 +564,14 @@ def sparse_batch_shape(
         max_batch_size=max_batch_size,
         max_blocks_per_seq=max_blocks_per_seq,
         selection_widths=tuple(
-            grouped_layers[0].sparse_cache.num_selected_blocks for grouped_layers in fetch_groups
+            queries_per_request * grouped_layers[0].sparse_cache.num_selected_blocks
+            for grouped_layers in fetch_groups
         ),
         layer_counts=tuple(len(grouped_layers) for grouped_layers in fetch_groups),
         flush_capacities=tuple(flush_capacity(grouped_layers) for grouped_layers in fetch_groups),
+        max_in_flight_units=tuple(
+            in_flight_units(grouped_layers) for grouped_layers in fetch_groups
+        ),
         index_table_entries=sum(
             index_table_entries(grouped_layers) for grouped_layers in fetch_groups
         ),
@@ -547,29 +584,31 @@ def sparse_batch_shape(
 # ---------------------------------------------------------------------------
 
 
-def sparse_cache_cells(cache_factor: float, num_selected_units: int, units_per_cell: int) -> int:
+def sparse_cache_cells(
+    cache_factor: float, num_selected_units: int, units_per_cell: int, max_in_flight_units: int
+) -> int:
     """Return the cells one sparse buffer gets in each request's device cache.
 
-    The cache holds ``cache_factor`` selections plus the unit being written,
-    rounded up to whole cells. A request has at most one unit in flight, so that
-    unit adds one whatever the factor. A factor of 1 is the smallest cache the
-    native manager accepts.
+    The cache holds ``cache_factor`` selections plus the units in flight, rounded
+    up to whole cells. A factor of 1 is the smallest cache the native manager
+    accepts.
 
     Args:
         cache_factor: Selections the cache holds; at least 1.
         num_selected_units: Units one step selects.
         units_per_cell: Units in one cell, i.e. in one page.
+        max_in_flight_units: Units a request can have in flight.
     """
     if cache_factor < 1:
         raise ValueError(f"cache_factor must be at least 1, got {cache_factor}")
-    if num_selected_units <= 0 or units_per_cell <= 0:
+    if num_selected_units <= 0 or units_per_cell <= 0 or max_in_flight_units <= 0:
         raise ValueError(
-            "num_selected_units and units_per_cell must be positive, got "
-            f"{num_selected_units} and {units_per_cell}"
+            "num_selected_units, units_per_cell and max_in_flight_units must be positive, got "
+            f"{num_selected_units}, {units_per_cell} and {max_in_flight_units}"
         )
     # Round before taking the ceiling so float error cannot add a unit.
     selected_units = math.ceil(round(cache_factor * num_selected_units, 6))
-    return ceil_div(selected_units + 1, units_per_cell)
+    return ceil_div(selected_units + max_in_flight_units, units_per_cell)
 
 
 def sparse_cache_config(
@@ -578,6 +617,7 @@ def sparse_cache_config(
     unit_tokens: int | None,
     tokens_per_block: int,
     gpu_cache_factor: float,
+    max_in_flight_tokens: int,
     selection_id: int | None = None,
 ) -> SparseCacheConfig:
     """Return a layer's sparse fetch path whose cache holds ``gpu_cache_factor`` selections.
@@ -585,15 +625,18 @@ def sparse_cache_config(
     A selection unit is what one selection names: a token, a compressed row or
     pool of tokens, or a whole page. Each request caches selected units in GPU
     cells of one page each. The cache holds ``gpu_cache_factor`` selections plus
-    the unit being written, rounded up to whole cells.
+    the units in flight, rounded up to whole cells.
 
     Args:
-        num_selected_units: Units one decode step selects for one request. When
-            heads select separately, this is the size of their union.
+        num_selected_units: Units one query token selects. When heads select
+            separately, this is the size of their union.
         unit_tokens: Tokens one unit covers, or None when a unit is a whole page.
             Must divide ``tokens_per_block``.
         tokens_per_block: Tokens per page.
         gpu_cache_factor: Selections the cache holds; at least 1.
+        max_in_flight_tokens: Tokens a request may hold between its history and its
+            capacity. Must be the ``sparse_max_in_flight_tokens`` of the manager
+            config the layer goes into: the native manager checks the cache against it.
         selection_id: Names the selection this layer resolves, where several layers
             are handed one. Layers naming the same id share a resident set and
             resolve once between them, so the id must be shared by exactly the
@@ -606,13 +649,19 @@ def sparse_cache_config(
             f"unit_tokens ({unit_tokens}) must divide tokens_per_block ({tokens_per_block})"
         )
     units_per_page = sparse_units_per_page(unit_tokens, tokens_per_block)
-    cells = sparse_cache_cells(gpu_cache_factor, num_selected_units, units_per_page)
+    # Resolved rather than passed through: the config names a unit size, and a whole
+    # page is one of them. None is this helper's convenience, not the config's.
+    resolved_unit_tokens = tokens_per_block // units_per_page
+    cells = sparse_cache_cells(
+        gpu_cache_factor,
+        num_selected_units,
+        units_per_page,
+        sparse_max_in_flight_units(max_in_flight_tokens, resolved_unit_tokens),
+    )
     return SparseCacheConfig(
         num_selected_blocks=num_selected_units,
         max_cached_units=cells * units_per_page,
-        # Resolved rather than passed through: the config names a unit size, and a whole
-        # page is one of them. None is this helper's convenience, not the config's.
-        unit_tokens=tokens_per_block // units_per_page,
+        unit_tokens=resolved_unit_tokens,
         selection_id=selection_id,
     )
 

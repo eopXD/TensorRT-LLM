@@ -271,9 +271,9 @@ int32_t Batch::_flushCapacity(LifeCycleId lifeCycle) const
     {
         return *mMaxTotalInputTokens / unitTokens + mMaxBatchSize;
     }
-    // Without a budget, a step is assumed to advance capacity by the in-flight headroom in
-    // every row at once, which is what a decode step does.
-    return mMaxBatchSize * mManager->_sparseCacheMaxInFlightUnits(lifeCycle);
+    // Without a budget, a step is assumed to advance history across the in-flight headroom in
+    // every row at once, which is the most a decode step can do.
+    return mMaxBatchSize * mManager->sparseCacheMaxInFlightUnits(lifeCycle);
 }
 
 Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
@@ -286,7 +286,7 @@ Batch::LayoutGenerator Batch::_layoutStepScratchForLifecycle(LifeCycleId lcId)
     auto const rows = static_cast<size_t>(mMaxBatchSize);
     auto& scratch = mScratch[lcId];
     scratch.selectionWidth = width;
-    scratch.maxInFlightUnits = mManager->_sparseCacheMaxInFlightUnits(lcId);
+    scratch.maxInFlightUnits = mManager->sparseCacheMaxInFlightUnits(lcId);
     scratch.numLayers = mManager->_sparseCacheLayerCount(lcId);
     auto const layers = static_cast<size_t>(scratch.numLayers);
     // One list for the fetch, holding the worst case of every row missing its whole
@@ -367,6 +367,9 @@ Batch::LayoutGenerator Batch::_layoutStepScratch()
     mHitMiss = allocateDeviceMemory<SparseHitMiss>(1);
     cuCheck(cuMemsetD32Async(
         reinterpret_cast<CUdeviceptr>(mHitMiss.get()), 0U, sizeof(SparseHitMiss) / sizeof(uint32_t), cudaStream()));
+    auto const numLifeCycles = static_cast<size_t>(mManager->numLifeCycles().value());
+    mPeakUse = allocateDeviceMemory<int32_t>(numLifeCycles);
+    cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mPeakUse.get()), 0U, numLifeCycles, cudaStream()));
 
     mCounters = base;
     auto* counter = base;
@@ -383,6 +386,7 @@ Batch::LayoutGenerator Batch::_layoutStepScratch()
         scratch.flushWork.total = counter;
         counter += layers;
         scratch.hitMiss = mHitMiss.get();
+        scratch.peakUse = mPeakUse.get() + lcId.value();
 
         auto const elements = *leaf.value();
         leaf.send(cursor);
@@ -441,6 +445,7 @@ Batch::~Batch()
     mSparseArenas.clear();
     mDeviceArena.reset();
     mHitMiss.reset();
+    mPeakUse.reset();
     mCopyDesc.reset();
     mDeviceStaging.reset();
     mMirror.reset();
@@ -1645,6 +1650,31 @@ void Batch::resetHitMissCounter()
     }
 }
 
+SparseCachePeakUse Batch::peekSparseCachePeakUse(LayerId layerId) const
+{
+    LifeCycleId const lcId = mManager->getLayerGroupId(layerId);
+    if (!mPeakUse || !mManager->hasSparseFetchPath(lcId))
+    {
+        return {};
+    }
+    // A temporary stream, synced alone, so the read does not wait on the step.
+    int32_t peak = 0;
+    TemporaryCudaStream temp{{}};
+    cuCheck(cuMemcpyDtoHAsync(
+        &peak, reinterpret_cast<CUdeviceptr>(mPeakUse.get() + lcId.value()), sizeof(peak), temp.get()));
+    cuCheck(cuStreamSynchronize(temp.get()));
+    return {peak, _sparseArena(lcId).view().entriesPerSelection};
+}
+
+void Batch::resetSparseCachePeakUse()
+{
+    if (mPeakUse)
+    {
+        auto const bytes = sizeof(int32_t) * static_cast<size_t>(mManager->numLifeCycles().value());
+        TLLM_CUDA_CHECK(cudaMemsetAsync(mPeakUse.get(), 0, bytes, reinterpret_cast<cudaStream_t>(cudaStream())));
+    }
+}
+
 size_t Batch::sparseArenaBytes() const
 {
     size_t total = 0;
@@ -1674,7 +1704,7 @@ std::optional<BatchRow> Batch::rowOf(KvCache const& kvCache) const
 }
 
 void Batch::prepareSparseWriteIndices(
-    std::vector<BufferId> const& buffers, int32_t* out, std::optional<CUstream> streamOpt)
+    std::vector<BufferId> const& buffers, int maxInFlightUnits, int32_t* out, std::optional<CUstream> streamOpt)
 {
     CUstream const stream = streamOpt.value_or(cudaStream());
     TLLM_CHECK_WITH_INFO(out != nullptr, "prepareSparseWriteIndices: out must be a device pointer");
@@ -1685,6 +1715,8 @@ void Batch::prepareSparseWriteIndices(
     auto const& scratch = sparseStepScratch(lcId);
     TLLM_CHECK_WITH_INFO(
         scratch.inFlightSlot != nullptr, "prepareSparseWriteIndices: this layer group carries no sparse cache");
+    TLLM_CHECK_WITH_INFO(maxInFlightUnits == scratch.maxInFlightUnits,
+        "prepareSparseWriteIndices: maxInFlightUnits must match the manager's sparseCacheMaxInFlightUnits");
 
     int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
     auto const leases = _leaseMirror();
@@ -1692,8 +1724,8 @@ void Batch::prepareSparseWriteIndices(
     auto const marks = watermarks();
     auto const numRows = maxBatchSize();
 
-    // A resolve with no selection. It makes the in-flight unit resident -- reusing its entry
-    // when a previous step already pinned it -- and does nothing else: an in-flight unit's
+    // A resolve with no selection. It makes every in-flight unit resident -- reusing the entry
+    // of one a previous step already pinned -- and does nothing else: an in-flight unit's
     // host page is not written until the watermark passes it, so there is nothing to copy.
     //
     // The selection and miss arrays are therefore left null, which the resolve tolerates only
@@ -1748,11 +1780,9 @@ void Batch::prepareSparseWriteIndices(
         indices.numRows = numRows;
         indices.selected = nullptr;
         indices.outSlot = scratch.inFlightSlot;
-        // One entry per request: resize() bounds capacity - history to a single token, so at
-        // most one unit is ever in flight. The scratch row is the reservation's headroom,
-        // which is wider, hence the separate stride.
-        indices.selectionWidth = 1;
-        indices.outSlotStride = scratch.maxInFlightUnits;
+        // One entry per unit the reservation can hold in flight, in ordinal order from the
+        // history watermark, which is the scratch row's own shape.
+        indices.selectionWidth = scratch.maxInFlightUnits;
         indices.out = out;
         // The row stride is the caller's: `out` keeps one entry per buffer, and an entry
         // no buffer maps to is never written.
@@ -1881,7 +1911,8 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
     TLLM_CHECK_WITH_INFO(
         scratch.outSlot != nullptr, "resolveSparseSelection: this layer group carries no sparse cache");
     TLLM_CHECK_WITH_INFO(selectionWidth == scratch.selectionWidth,
-        "resolveSparseSelection: selectionWidth must match the configured numSelectedBlocks");
+        "resolveSparseSelection: selectionWidth must be the configured row, numSelectedBlocks for each of "
+        "sparse_queries_per_request queries");
 
     int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
     auto const marks = watermarks();
@@ -1902,8 +1933,9 @@ void Batch::resolveSparseSelection(std::vector<BufferId> const& buffers, int32_t
     resolve.work = _sparseFetchWork(scratch, span.selectionSlot);
     resolve.missCount = scratch.missCount;
     resolve.stepAge = _sparseStepAgeMirror();
-    // Every row adds its own hits and misses as it resolves them.
+    // Every row adds its own hits and misses as it resolves them, and raises the peak.
     resolve.hitMiss = scratch.hitMiss;
+    resolve.peakUse = scratch.peakUse;
     launchSparseResolve(resolve, stream);
 }
 
@@ -1922,7 +1954,8 @@ void Batch::fetchResolvedPages(std::vector<BufferId> const& buffers, int32_t con
     auto const& scratch = sparseStepScratch(lcId);
     TLLM_CHECK_WITH_INFO(scratch.outSlot != nullptr, "fetchResolvedPages: this layer group carries no sparse cache");
     TLLM_CHECK_WITH_INFO(selectionWidth == scratch.selectionWidth,
-        "fetchResolvedPages: selectionWidth must match the configured numSelectedBlocks");
+        "fetchResolvedPages: selectionWidth must be the configured row, numSelectedBlocks for each of "
+        "sparse_queries_per_request queries");
 
     int const unitsPerPage = mManager->sparseCacheUnitsPerPage(lcId);
     auto const leases = _leaseMirror();
@@ -2036,9 +2069,6 @@ void Batch::_buildSparseArenas()
             .cellsPerBuffer = cellsPerBuffer,
             .layerSelection = mManager->_sparseLayerSelection(lcId),
         };
-        (void) checkedSparseResolveSharedBytes(shape.entriesPerSelection, mManager->_sparseCacheSelectionWidth(lcId),
-            mManager->_sparseCacheMaxInFlightUnits(lcId));
-
         // The arena mirrors the hot pool group: one region per pool the life cycle's sparse
         // buffers draw on, sized by that pool's cell and the buffers sharing it.
         size_t numPools = 0;

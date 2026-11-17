@@ -101,19 +101,21 @@ void RegionConfig::validate() const
     }
 }
 
-void SparseCacheConfig::validate(int tokensPerBlock) const
+void SparseCacheConfig::validate(int tokensPerBlock, int maxInFlightTokens) const
 {
     TLLM_CHECK_WITH_INFO(numSelectedBlocks > 0 && maxCachedUnits > 0,
         "SparseCacheConfig: numSelectedBlocks and maxCachedUnits must be positive; omit sparse_cache "
         "entirely for a layer with no fetch path");
-    // Equality leaves no cell for the unit being written, so the request could not take a
-    // single token. The cache holds a full selection plus everything in flight, and those
-    // populations are disjoint: selection is below the watermark, in flight is above it.
-    TLLM_CHECK_WITH_INFO(maxCachedUnits > numSelectedBlocks,
-        "SparseCacheConfig: maxCachedUnits must exceed numSelectedBlocks, to leave room for units in "
-        "flight");
     TLLM_CHECK_WITH_INFO(unitTokens > 0 && tokensPerBlock > 0 && tokensPerBlock % unitTokens == 0,
         "SparseCacheConfig: unitTokens must be a divisor of positive tokensPerBlock");
+    // The cache holds a full selection plus everything in flight, and those populations are
+    // disjoint: selection is below the watermark, in flight is at or above it. A cache any
+    // smaller leaves a step without a cell for a unit it selects or writes.
+    int const inFlightUnits = maxInFlightUnits(maxInFlightTokens);
+    TLLM_CHECK_WITH_INFO(maxCachedUnits >= numSelectedBlocks + inFlightUnits,
+        "SparseCacheConfig: maxCachedUnits=%d must hold numSelectedBlocks=%d beside the %d units that "
+        "sparse_max_in_flight_tokens=%d can leave in flight",
+        maxCachedUnits, numSelectedBlocks, inFlightUnits, maxInFlightTokens);
     // The arena rounds capacity up to whole pages. Bound it by the largest whole-page
     // capacity the probe supports, without rounding an arbitrarily large input upward.
     int const units = unitsPerPage(tokensPerBlock);
@@ -376,6 +378,18 @@ void KVCacheManagerConfig::validate() const
         throw AssertionError("KVCacheManagerConfig: host_sparse_pool_quota must be positive when set");
     }
 
+    // A request takes at least the token a step writes, so a bound below one admits no step.
+    if (sparseMaxInFlightTokens <= 0)
+    {
+        throw AssertionError("KVCacheManagerConfig: sparse_max_in_flight_tokens must be positive");
+    }
+
+    // A request feeds a step at least one query token.
+    if (sparseQueriesPerRequest <= 0)
+    {
+        throw AssertionError("KVCacheManagerConfig: sparse_queries_per_request must be positive");
+    }
+
     // Check for duplicate layer ids.
     std::set<LayerId> seenLayerIds;
     for (auto const& layer : layers)
@@ -402,7 +416,17 @@ void KVCacheManagerConfig::validate() const
                 {
                     if (cfg.sparseCache.has_value())
                     {
-                        cfg.sparseCache->validate(tokensPerBlock);
+                        cfg.sparseCache->validate(tokensPerBlock, sparseMaxInFlightTokens);
+                        // A row longer than the ordinals it can name holds only repeats, and
+                        // bounding it here keeps every size derived from it within int32.
+                        if (static_cast<int64_t>(cfg.sparseCache->numSelectedBlocks) * sparseQueriesPerRequest
+                            > static_cast<int64_t>(SparseCacheConfig::kMaxUnitOrdinal) + 1)
+                        {
+                            throw AssertionError(
+                                "KVCacheManagerConfig: sparse_queries_per_request selections of "
+                                "num_selected_blocks make a row longer than the unit ordinals a sparse "
+                                "cache can name");
+                        }
                         int const unitsPerPage = cfg.sparseCache->unitsPerPage(tokensPerBlock);
                         for (auto const& buf : cfg.buffers)
                         {

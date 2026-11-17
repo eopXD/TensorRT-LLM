@@ -2007,7 +2007,7 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 bool textOnly, bool enablePartialCommit, kv::PoolRebalanceConfig poolRebalance,
                 kv::Priority coldTierOffloadMinPriority, std::optional<size_t> hostSparsePoolQuota,
                 std::vector<kv::RegionConfig> regions, kv::HostMemBackingConfig hostMemBacking,
-                std::optional<kv::BatchDesc> coldTypicalStep)
+                std::optional<kv::BatchDesc> coldTypicalStep, int sparseMaxInFlightTokens, int sparseQueriesPerRequest)
             {
                 new (cfg) kv::KVCacheManagerConfig();
                 cfg->tokensPerBlock = tokensPerBlock;
@@ -2037,6 +2037,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 cfg->regions = std::move(regions);
                 cfg->hostMemBacking = std::move(hostMemBacking);
                 cfg->coldTypicalStep = std::move(coldTypicalStep);
+                cfg->sparseMaxInFlightTokens = sparseMaxInFlightTokens;
+                cfg->sparseQueriesPerRequest = sparseQueriesPerRequest;
                 // Mirror Python's __post_init__: validate at construction. Config-integrity
                 // failures raise AssertionError (translated below).
                 cfg->validate();
@@ -2052,7 +2054,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("host_sparse_pool_quota").none() = std::nullopt,
             nb::arg("regions") = std::vector<kv::RegionConfig>{},
             nb::arg("host_mem_backing") = kv::HostMemBackingConfig{},
-            nb::arg("cold_typical_step").none() = std::nullopt)
+            nb::arg("cold_typical_step").none() = std::nullopt,
+            nb::arg("sparse_max_in_flight_tokens") = kv::KVCacheManagerConfig{}.sparseMaxInFlightTokens,
+            nb::arg("sparse_queries_per_request") = kv::KVCacheManagerConfig{}.sparseQueriesPerRequest)
         .def_rw("tokens_per_block", &kv::KVCacheManagerConfig::tokensPerBlock)
         .def_rw("cache_tiers", &kv::KVCacheManagerConfig::cacheTiers)
         .def_rw("layers", &kv::KVCacheManagerConfig::layers)
@@ -2070,6 +2074,24 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's "
             "per-layer-group slot-count proportions at cold page sizes.")
         .def_rw("constraints", &kv::KVCacheManagerConfig::constraints)
+        .def_rw("sparse_max_in_flight_tokens", &kv::KVCacheManagerConfig::sparseMaxInFlightTokens,
+            "Tokens a request with a sparse fetch path may hold between history_length and capacity.\n\n"
+            "Those tokens are in flight: a unit they complete has no host copy until history passes "
+            "it, so its GPU cache cell is pinned until then, and every layer's sparse cache must hold "
+            "the units this many tokens span beside a full selection.\n\n"
+            "One is a step that writes a single token per request and keeps it. A step that writes "
+            "several tokens and keeps a prefix of them needs the widest gap a request reaches between "
+            "one history advance and the next.")
+        .def_rw("sparse_queries_per_request", &kv::KVCacheManagerConfig::sparseQueriesPerRequest,
+            "Query tokens a request with a sparse fetch path may feed one step.\n\n"
+            "A fetch takes one selection row per request, this many selections of num_selected_blocks "
+            "back to back, and resolves the row as one list, so every unit the request's queries name "
+            "is resident together.\n\n"
+            "A cache must hold one query's selection beside the in-flight units, not the whole row: "
+            "the queries of a request select overlapping history, and a unit they share takes one "
+            "cell. A row whose distinct units outnumber the cells the cache can give them cannot be "
+            "resolved, and the step that fetches it is fatal to the process. A cache of this many "
+            "selections beside the in-flight units holds every row.")
         .def_rw("host_sparse_pool_quota", &kv::KVCacheManagerConfig::hostSparsePoolQuota,
             "Host bytes the GPU tier's host-backed pools may take. None has the storage manager set it "
             "at construction to 80% of the host memory the host tiers' quotas leave, and keep that value.\n\n"
@@ -2155,10 +2177,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "max_input_length", [](kv::KvCache const& self) { return self.maxInputLength(); },
             nb::call_guard<nb::gil_scoped_release>(),
             "Bound on capacity - history_length, or None without a sparse fetch path.\n\n"
-            "One token, and read-only: a sparse request contributes exactly one query token "
-            "per step, because fetch_sparse_pages resolves one selection per request while an "
-            "attention kernel indexes its selection per query token. Prefill and speculative "
-            "decoding give a request several and are out of scope; this is the guard.")
+            "The manager's sparse_max_in_flight_tokens, and read-only: every sparse cache is "
+            "checked at configuration to hold a full selection beside the units that many tokens "
+            "span, so a gap within it always finds a cell for each unit in flight.")
         .def(
             "commit",
             [](kv::KvCache& self, nb::object acceptedInputTokens, nb::object beamSearchIndices, bool isEnd,
@@ -3043,8 +3064,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "between steps, so neither can be grown later. Left unset they are derived from the "
             "manager's constraints, which fails when none were declared.\n\n"
             "max_total_input_tokens is the tokens one step may ingest across every row. It sizes the "
-            "write-back's work list; left unset it assumes a decode step, where each row advances by "
-            "one token and so crosses at most one unit boundary.\n\n"
+            "write-back's work list; left unset it assumes a decode step, where a row's history "
+            "crosses only units that were in flight.\n\n"
             "mode applies to every life cycle. Left unset, each takes the smaller table: SHARED where "
             "KVCacheManager.supports_index_mode says it is always available, PER_LAYER otherwise. Set, "
             "it overrides that answer rather than being checked against it, so SHARED may be named "
@@ -3197,41 +3218,46 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "nothing. Reads the index table as of the last publish.")
         .def(
             "prepare_sparse_write_indices",
-            [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray2D const& out, nb::object stream)
+            [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray3D const& out, nb::object stream)
             {
                 if (static_cast<int>(out.shape(0)) != self.maxBatchSize())
                 {
                     throw std::invalid_argument(
                         "prepare_sparse_write_indices: out must carry one row per batch row, not one per "
-                        "query token. A request has at most one unit in flight; prefill and speculative "
-                        "decoding give it several and are out of scope");
+                        "query token");
                 }
                 if (out.shape(1) != buffers.size())
                 {
-                    throw std::invalid_argument("prepare_sparse_write_indices: out's last extent must be len(buffers)");
+                    throw std::invalid_argument(
+                        "prepare_sparse_write_indices: out's middle extent must be len(buffers)");
                 }
                 auto const handle = stream.is_none()
                     ? std::optional<CUstream>{}
                     : std::optional<CUstream>{reinterpret_cast<CUstream>(nb::cast<intptr_t>(stream))};
                 auto* outPtr = out.data();
+                auto const maxInFlightUnits = static_cast<int>(out.shape(2));
                 nb::gil_scoped_release rel;
-                self.prepareSparseWriteIndices(buffers, outPtr, handle);
+                self.prepareSparseWriteIndices(buffers, maxInFlightUnits, outPtr, handle);
             },
             nb::arg("buffers"), nb::arg("out").noconvert(), nb::arg("stream") = nb::none(),
-            "Give each request's in-flight unit a cell, and report where to write it.\n\n"
-            "The unit between the two watermarks is the one the model is about to produce. It has no "
+            "Give every in-flight unit of each request a cell, and report where to write it.\n\n"
+            "The units between the two watermarks are the ones the model is producing. They have no "
             "host copy yet -- a unit reaches its page only when resize() carries the watermark past "
-            "it -- so nothing is fetched: the call assigns a cell and leaves its bytes to the model.\n\n"
+            "it -- so nothing is fetched: the call assigns cells and leaves their bytes to the model.\n\n"
             "Separate from fetch_sparse_pages because the orders differ. A fetch needs the selection, "
             "which the indexer produces from the previous layer; a write needs only the watermarks, so "
             "it can run first, which is the order the model requires.\n\n"
-            "Idempotent while the watermarks and the reservation hold: a later call, including the "
-            "fetch's own resolve, finds the entry and reuses it. The entry is pinned while its unit is "
-            "in flight, so no fetch can evict it.\n\n"
+            "Idempotent while the reservation holds: a later call, including the fetch's own resolve, "
+            "finds a unit's entry and reuses it. An entry is pinned from the call that assigns it until "
+            "history passes its unit, whether or not capacity still covers the unit in between, so no "
+            "fetch can evict it and a unit that capacity drops and later covers again is reported at "
+            "the same cell.\n\n"
             "buffers is one layer's sparse buffers, exactly as for fetch_sparse_pages. out is "
-            "int32[batch, len(buffers)], written in full, in the same expanded index space "
+            "int32[batch, len(buffers), units], written in full, in the same expanded index space "
             "fetch_sparse_pages produces and relative to the same get_sparse_cache_base_address "
-            "region: BAD_PAGE_INDEX where the row holds no reservation or nothing in flight.\n\n"
+            "region, where units is get_sparse_cache_max_in_flight_units for the layer. Entry i of a "
+            "row is the cell of unit history_units + i, and BAD_PAGE_INDEX where the row holds no "
+            "reservation or that unit is not below capacity_units.\n\n"
             "Device-driven and stream-ordered: enqueues and returns, and every shape is static, so a "
             "CUDA graph can capture it.")
         .def(
@@ -3247,8 +3273,8 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 {
                     throw std::invalid_argument(
                         "fetch_sparse_pages: selected must carry one row per batch row, not one per query "
-                        "token. A request contributes a single selection per step; prefill and speculative "
-                        "decoding give it several and are out of scope");
+                        "token. The queries a request feeds a step share its row, their selections back to "
+                        "back; prefill gives a request more of them than a row holds and is out of scope");
                 }
                 if (out.shape(1) != buffers.size())
                 {
@@ -3279,9 +3305,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "selection together and resolve it once between them: call resolve_sparse_selection "
             "once and fetch_resolved_pages per layer. This rejects them rather than letting the "
             "second resolve count the first's admissions as hits and leave its cells unfilled.\n\n"
-            "selected is int32[batch, topk] unit ordinals, one row per request rather than per "
+            "selected is int32[batch, width] unit ordinals, one row per request rather than per "
             "query token, negative where padded, and must name only units below the history "
-            "watermark. out is int32[batch, len(buffers), topk], "
+            "watermark. width is num_selected_blocks times the config's sparse_queries_per_request: "
+            "a request feeding several query tokens lays their selections back to back, and a unit "
+            "they share is made resident once. out is int32[batch, len(buffers), width], "
             "written in full in the expanded index space: entry k is the index holding "
             "selected[b][k], or BAD_PAGE_INDEX where that slot carries no selection. Compact, in "
             "the selection's own order, because that is the shape sparse attention kernels take.\n\n"
@@ -3463,6 +3491,33 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "stale -- which does not move a ratio. Synchronise the device first for an exact one.")
         .def("reset_hit_miss_counter", &kv::Batch::resetHitMissCounter,
             "Zero the cumulative pair, on the Batch's stream.")
+        .def(
+            "peek_sparse_cache_peak_use",
+            [](kv::Batch const& self, kv::LayerId layerId)
+            {
+                kv::SparseCachePeakUse use{};
+                {
+                    // Copies a device counter and synchronises, which is not work to hold the
+                    // GIL across; make_tuple below needs it again.
+                    nb::gil_scoped_release rel;
+                    use = self.peekSparseCachePeakUse(layerId);
+                }
+                return nb::make_tuple(use.peak, use.cells);
+            },
+            nb::arg("layer_id"),
+            "(peak, cells) for the layer's sparse cache since the Batch was built or the peaks "
+            "were reset.\n\n"
+            "peak is the most cells one request had in use after a fetch: the cells holding units "
+            "its row named, the cells pinned in flight and the cells its misses took. cells is what "
+            "the cache has. A row needing more than cells cannot be resolved and is fatal to the "
+            "process, so the gap between the two is the room the fetches so far have left. A cache "
+            "narrower than sparse_queries_per_request selections is judged by it, since whether a "
+            "row fits there depends on how far the request's queries overlap.\n\n"
+            "Shared by the layers of one layer group, whose caches are one size. (0, 0) when the "
+            "layer has no sparse fetch path. Reads on a temporary stream and syncs only that, so "
+            "the peak may be a few launches stale.")
+        .def("reset_sparse_cache_peak_use", &kv::Batch::resetSparseCachePeakUse,
+            "Zero every layer group's peak, on the Batch's stream.")
         .def_prop_ro("sparse_arena_bytes", &kv::Batch::sparseArenaBytes,
             "Device bytes every life cycle's sparse arena holds, 0 without sparse offload.\n\n"
             "The arenas sit outside the cache tiers' quota, so a caller budgeting device memory "
@@ -3890,8 +3945,16 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             nb::arg("layer_id"),
             "Cells a request's sparse cache holds per buffer of this layer, in selection units, "
             "counting both the cached history and everything in flight. The lease follows from "
-            "this alone. Only one unit is ever in flight, so the surplus above the selection "
-            "width is retention rather than headroom.")
+            "this alone. What it holds above the selection width and "
+            "get_sparse_cache_max_in_flight_units is retention.")
+        .def(
+            "get_sparse_cache_max_in_flight_units",
+            [](kv::KvCacheManager const& self, kv::LayerId layerId)
+            { return self.sparseCacheMaxInFlightUnits(self.getLayerGroupId(layerId)); },
+            nb::arg("layer_id"),
+            "Units of this layer a request can have in flight: what sparse_max_in_flight_tokens can "
+            "span, since both watermarks round down to units. Zero when the layer has no sparse "
+            "fetch path. It is the last extent of prepare_sparse_write_indices' output.")
         .def(
             "get_sparse_cache_units_per_page",
             [](kv::KvCacheManager const& self, kv::LayerId layerId)

@@ -155,6 +155,18 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     cuCheck(cuCtxGetDevice(&device));
     mSmCount = sparseCopyMultiprocessors(device);
 
+    // A resolve block carves its probe index and a request's resident set out of shared
+    // memory, so a cache, a selection or an in-flight span too wide for this device is
+    // refused here, before any request is admitted.
+    for (LifeCycleId lcId{0}; lcId < numLifeCycles(); ++lcId)
+    {
+        if (hasSparseFetchPath(lcId))
+        {
+            (void) checkedSparseResolveSharedBytes(_sparseCacheSubSlotsPerBuffer(lcId) * sparseCacheUnitsPerPage(lcId),
+                _sparseCacheSelectionWidth(lcId), sparseCacheMaxInFlightUnits(lcId));
+        }
+    }
+
     mTargetRatioListHot = _currentHotRatio();
     mTargetRatioListCold = _currentColdRatios();
     _resetIterationPeakNumBlocks();
@@ -334,17 +346,19 @@ int KvCacheManager::_sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const n
     return divUp(maxUnits, sparseCacheUnitsPerPage(lifeCycle));
 }
 
-int KvCacheManager::_sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept
+int KvCacheManager::sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept
 {
-    int const cells = _sparseCacheSubSlotsPerBuffer(lifeCycle) * sparseCacheUnitsPerPage(lifeCycle);
+    int const unitsPerPage = sparseCacheUnitsPerPage(lifeCycle);
+    int const cells = _sparseCacheSubSlotsPerBuffer(lifeCycle) * unitsPerPage;
     if (cells <= 0)
     {
         return 0;
     }
-    // A step advances capacity one token past history, and one token straddles at most one
-    // unit boundary, so at most one unit is ever in flight. That is the whole of the
+    // Capacity leads history by at most sparseMaxInFlightTokens, and both round down to
+    // units, so this is the most units that gap can span. That is the whole of the
     // headroom: everything else the reservation holds is available to the selection.
-    return 1;
+    int const unitTokens = mConfig.tokensPerBlock / unitsPerPage;
+    return divUp(mConfig.sparseMaxInFlightTokens, unitTokens);
 }
 
 std::vector<SparseBufferPlan> KvCacheManager::_sparseBufferPlan(LifeCycleId lifeCycle) const

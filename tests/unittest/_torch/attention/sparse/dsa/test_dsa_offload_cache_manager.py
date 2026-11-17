@@ -40,6 +40,8 @@ FULL_INDEXER_LAYERS = (0, 1, 2, 6)
 TOPK = 64
 TOKENS_PER_BLOCK = 64
 MAX_BATCH_SIZE = 4
+# A decode step holds one token in flight, and a DSA selection unit is one token.
+MAX_IN_FLIGHT_UNITS = 1
 HEAD_DIM = 576
 INDEXER_BYTES_PER_TOKEN = 132
 # An NVFP4 latent token: 576 values and a 64-value RoPE residual, two values per
@@ -189,7 +191,11 @@ def test_nvfp4_offload_puts_block_scales_in_host_memory_beside_the_latent():
             manager.kv_cache_manager_py_config
         )
         assert state_bytes == SPARSE_OFFLOAD_STATE_COPIES * SparseOffloadState.device_bytes(
-            max_batch_size=MAX_BATCH_SIZE, topk=TOPK, buffer_counts={2}, nvfp4_head_dim=HEAD_DIM
+            max_batch_size=MAX_BATCH_SIZE,
+            topk=TOPK,
+            max_in_flight_units=MAX_IN_FLIGHT_UNITS,
+            buffer_counts={2},
+            nvfp4_head_dim=HEAD_DIM,
         )
     finally:
         manager.shutdown()
@@ -255,6 +261,7 @@ def test_decode_step_writes_fetches_and_advances_history(manager):
         descriptors,
         max_batch_size=MAX_BATCH_SIZE,
         topk=TOPK,
+        max_in_flight_units=MAX_IN_FLIGHT_UNITS,
     )
     manager.prepare_sparse_batch([request.py_request_id])
     manager.prepare_sparse_offload(state, [request.py_request_id], beam_width=1)
@@ -271,7 +278,7 @@ def test_decode_step_writes_fetches_and_advances_history(manager):
     assert state.batch_rows.tolist() == [0] + [-1] * (MAX_BATCH_SIZE - 1)
     for layer in range(NUM_LAYERS):
         writes = manager.prepare_sparse_write_indices(state, layer)
-        assert writes[0, 0].item() >= 0
+        assert writes[0, 0, 0].item() >= 0
         assert (writes[1:, 0] == -1).all()
         fetched = manager.fetch_sparse_indices(state, layer, topk, request_indices, kv_lengths)
         merge_sparse_arena_indices(
@@ -282,7 +289,7 @@ def test_decode_step_writes_fetches_and_advances_history(manager):
             kv_lengths,
             state.history_lengths,
             fetched[:, 0, :],
-            writes[:, 0],
+            writes[:, 0, 0],
             out,
             unit_tokens=1,
         )
@@ -290,7 +297,7 @@ def test_decode_step_writes_fetches_and_advances_history(manager):
         assert all(index >= 0 for index in merged)
         # Every selected token has its own arena row, the written one included.
         assert len(set(merged)) == TOPK
-        assert merged[-1] == writes[0, 0].item()
+        assert merged[-1] == writes[0, 0, 0].item()
         assert fetched[0, 0, -1].item() == -1
         rows_in_arena = descriptors[layer].arena_row_counts[0]
         assert max(merged) < rows_in_arena
@@ -380,6 +387,7 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
             descriptors,
             max_batch_size=MAX_BATCH_SIZE,
             topk=TOPK,
+            max_in_flight_units=MAX_IN_FLIGHT_UNITS,
         )
         active: list[LlmRequest] = []
         permuted = False
@@ -420,7 +428,7 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
                 # coincide share one, and the slices no buffer maps to are never written.
                 data = state.out_slots[layer][data]
                 for row, rid, history in zip(batch_rows, request_ids, histories):
-                    write_row = writes[row, data].item()
+                    write_row = writes[row, data, 0].item()
                     assert write_row >= 0, (rid, history, layer)
                     # The token's row: its position, its layer, its request.
                     for arena in arenas[layer]:
@@ -444,7 +452,7 @@ def test_fetched_rows_hold_written_history_across_evictions(seed, num_layers, nu
                     kv_lengths,
                     state.history_lengths,
                     fetched[:, data, :],
-                    writes[:, data],
+                    writes[:, data, 0],
                     out,
                     unit_tokens=1,
                 )
@@ -511,6 +519,7 @@ def test_suspended_request_keeps_its_history_through_demotion():
             descriptors,
             max_batch_size=max_batch_size,
             topk=TOPK,
+            max_in_flight_units=MAX_IN_FLIGHT_UNITS,
         )
         first = _request(1, prompt_len)
         rid = first.py_request_id
@@ -526,7 +535,7 @@ def test_suspended_request_keeps_its_history_through_demotion():
                 row = state.batch_rows[0].item()
                 writes = manager.prepare_sparse_write_indices(state, 0)
                 data = state.out_slots[0][descriptor.data_buffer_index]
-                write_row = writes[row, data].item()
+                write_row = writes[row, data, 0].item()
                 assert write_row >= 0
                 arena[write_row, :3] = torch.tensor(
                     [history, 0, rid], dtype=torch.int32, device="cuda"
@@ -547,7 +556,7 @@ def test_suspended_request_keeps_its_history_through_demotion():
                     kv_lengths,
                     state.history_lengths,
                     fetched[:, data, :],
-                    writes[:, data],
+                    writes[:, data, 0],
                     out,
                     unit_tokens=1,
                 )
@@ -621,6 +630,7 @@ def test_received_prompt_is_reused_from_host_pages():
             descriptors,
             max_batch_size=MAX_BATCH_SIZE,
             topk=TOPK,
+            max_in_flight_units=MAX_IN_FLIGHT_UNITS,
         )
 
         def receive(request: LlmRequest, start: int) -> None:
@@ -660,7 +670,7 @@ def test_received_prompt_is_reused_from_host_pages():
             for layer in range(NUM_LAYERS):
                 writes = manager.prepare_sparse_write_indices(state, layer)
                 data = state.out_slots[layer][descriptors[layer].data_buffer_index]
-                write_row = writes[batch_row, data].item()
+                write_row = writes[batch_row, data, 0].item()
                 assert write_row >= 0
                 arenas[layer][write_row, :3] = torch.tensor(
                     [history, layer, rid], dtype=torch.int32, device="cuda"
@@ -676,7 +686,7 @@ def test_received_prompt_is_reused_from_host_pages():
                     kv_lengths,
                     state.history_lengths,
                     fetched[:, data, :],
-                    writes[:, data],
+                    writes[:, data, 0],
                     out,
                     unit_tokens=1,
                 )
@@ -748,6 +758,7 @@ def test_nvfp4_attention_reads_the_selected_rows_dequantized():
             manager.get_sparse_offload_descriptors(),
             max_batch_size=MAX_BATCH_SIZE,
             topk=TOPK,
+            max_in_flight_units=MAX_IN_FLIGHT_UNITS,
             nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
         )
         manager.prepare_sparse_batch([request.py_request_id])
@@ -801,13 +812,13 @@ def test_nvfp4_attention_reads_the_selected_rows_dequantized():
             metadata.kv_lens_cuda,
             state.history_lengths,
             state.fetched_indices[2][:, data, :],
-            writes[:, data],
+            writes[:, data, 0],
             rows,
             unit_tokens=1,
         )
         valid = rows[0] >= 0
         assert valid.sum().item() == TOPK - 6
-        assert rows[0, -1].item() == writes[0, data].item()
+        assert rows[0, -1].item() == writes[0, data, 0].item()
         flat = rows.view(-1).clamp(min=0).long()
         reference = torch.empty((1, TOPK, HEAD_DIM), dtype=torch.float8_e4m3fn, device="cuda")
         compact = torch.where(valid, torch.arange(TOPK, device="cuda"), -1).to(torch.int32)[None]
@@ -852,6 +863,7 @@ def test_overlapped_write_mapping_tracks_reordered_requests(monkeypatch, dtype, 
         descriptors,
         max_batch_size=MAX_BATCH_SIZE,
         topk=TOPK,
+        max_in_flight_units=MAX_IN_FLIGHT_UNITS,
     )
     metadata = SimpleNamespace(
         kv_cache_manager=manager,
@@ -939,7 +951,7 @@ def test_overlapped_write_mapping_tracks_reordered_requests(monkeypatch, dtype, 
                 writes = manager.prepare_sparse_write_indices(state, layer)
                 data = descriptors[layer].data_buffer_index
                 expected = torch.full_like(observed[layer], -1)
-                expected[: len(requests)] = writes[state.batch_rows[: len(requests)], data]
+                expected[: len(requests)] = writes[state.batch_rows[: len(requests)], data, 0]
                 torch.testing.assert_close(observed[layer], expected)
                 torch.testing.assert_close(
                     observed_slots[layer], (expected >= 0).to(torch.int32) - 1

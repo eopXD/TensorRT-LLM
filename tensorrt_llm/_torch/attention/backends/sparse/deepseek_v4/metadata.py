@@ -401,6 +401,9 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             layers,
             max_batch_size=manager.max_batch_size,
             topk=self.sparse_mla_topk,
+            max_in_flight_units=manager._sparse_offload_max_in_flight_units(
+                manager.impl.init_config
+            ),
             # The hook the device reservation counts the scratch by.
             nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
         )

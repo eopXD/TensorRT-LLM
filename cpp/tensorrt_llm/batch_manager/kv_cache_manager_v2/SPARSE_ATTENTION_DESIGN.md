@@ -8,18 +8,16 @@ SPDX-License-Identifier: Apache-2.0
 Target: the **decode instance of a disaggregated deployment**.
 
 **Implemented**: the resolve, copy, index and flush-list kernels; `Batch`; the per-request
-reservation and device state; the batch-wide write-back as `Batch::flushSparseUnits()`,
-which `resize()` checks has run rather than performing itself; `fetch_sparse_pages` and
-`prepare_sparse_write_indices`; sparse buffers across more than one pool; sparsity as a pool
+reservation and device state; batch-wide write-back through `Batch::flushSparseUnits()`;
+`fetch_sparse_pages` and `prepare_sparse_write_indices`; sparse buffers across more than one pool; sparsity as a pool
 attribute, so one layer may hold both sparse and dense buffers.
 
-**Pending**: nothing. Compression is a separate feature, configured through
+Compression is a separate feature, configured through
 `KvCacheCompressionConfig` rather than through anything here, and needs nothing
 sparse-specific -- see *Compression*.
 
-Out of scope, by decision rather than by omission: prefill, which a separate instance serves,
-and speculative decoding — see *Supported scope*; and per-KV-head selection, which no
-per-`(request, layer)` resident set can express — see *Device-side cache*. Kernel fusion
+A separate instance serves prefill. The GPU cache holds one resident set per
+`(request, layer)`, which excludes per-KV-head selection. See *Device-side cache*. Kernel fusion
 remains future work; so do multi-beam requests. `ISparseUnitGather` is retired — see
 *Extraction interface*.
 
@@ -53,9 +51,9 @@ Two existing properties make this cheap:
 | page | the KVCM2 allocation, locking and migration unit: `tokens_per_block` tokens |
 | buffer | one layer's slice of a page; several coalesce into one page |
 | selection unit | what the backend selects; a factor of `tokens_per_block`, never larger |
-| in-flight | blocks above the watermark: written but not yet flushed |
+| in-flight | units in the published span from history (inclusive) to capacity (exclusive), both rounded down to units |
 | units per page | selection units a page holds, `tokens_per_block / sparse_selection_unit_tokens` |
-| pure history | a block whose ordinal is below the history watermark set by `resize()` |
+| pure history | a unit whose ordinal is below the row's published history length divided by `unit_tokens` (rounded down) |
 
 ## Scope
 
@@ -94,11 +92,9 @@ entry and the selection unit is already a page.
    storage tier. A sparse buffer has no separately managed GPU pages: both the block being
    written and the history a step selects occupy cache cells, drawn from the same lease and
    replaced by the same eviction.
-5. **The host page is authoritative once the watermark passes the block.** A block reaches
-   its host page through `Batch::flushSparseUnits()`, which the caller runs before the
-   `resize()` that raises `history_length` past it; `resize()` checks that flush has
-   happened rather than performing it. After it the cache entry is evictable. Before it the
-   entry holds the only copy and is pinned.
+5. **A completed unit can be fetched from its host page.** The batch queues write-back
+   of units crossed by a history advance before the next fetch. Until published history
+   passes a unit, its GPU cell holds the request's live KV and stays pinned.
 6. **Extraction is pluggable**, because KVCM2 buffers are opaque bytes and a sub-page unit
    cannot be located without layout knowledge.
 
@@ -118,44 +114,18 @@ for a dense buffer. Nothing resolves against the cache arena, and no caller has 
 which rule applies to which ordinal.
 
 A block's data reaches its host page by a **flush**: a copy on the Batch's stream that does
-**not** evict the GPU entry, which stays cached and merely stops being pinned.
-
-The governing rule is that **a block must be flushed before it can be selected**. Selectable
-means below the watermark, so the watermark move is the deadline: everything it passes must
-already be in its host page.
+**not** evict the GPU entry, which stays cached and becomes evictable once published history passes its unit.
 
 ### Who flushes
 
-`Batch::flushSparseUnits(newHistoryLengths)`, given the per-row history the caller is about
-to set. The Batch records it; `resize()` then *checks* against that record rather than
-flushing anything itself.
+The caller passes the new per-row history lengths to `Batch::flushSparseUnits()` before
+`resize()`. The batch uses the page indices from the last `publish()` to queue write-back
+of newly completed units. When a seated row crosses a unit boundary, `resize()` checks
+that the recorded flush covers the requested history (`newHistory <= recorded`). Several
+resizes can use the same flush, including a retry that advances history by fewer tokens.
 
-The flush is a call of its own rather than a step inside `resize()`, for two reasons.
+**Related page operations**
 
-It carries an ordering requirement that only a caller can satisfy: the write-back reads
-converted page indices, and only a publish produces those. A flush reached through
-`resize()` would depend on when the last publish happened without saying so; a named call
-makes it a stated precondition.
-
-It is also what lets the write-back be **batch-wide**. Per request it would be one scan and
-one copy launch per pool *per row*, plus two synchronous host-to-device copies to tell the
-kernel which units moved. Driven from the Batch it is one scan over `(layers, rows)` and one
-copy launch per pool for the whole step, with a single small upload of per-row ranges.
-
-The check `resize()` performs is `newHistory <= recorded`, not equality: a step may resize a
-row more than once, and a row whose growth failed rolls back to a history below the one that
-was flushed for it. Flushing early is always safe — a flush is a copy, and a block flushed
-before a failed resize stays correctly flushed. Only flushing late is not.
-
-`history_length` therefore keeps two jobs: it defines selection eligibility, and it is the
-flush deadline.
-
-**The neighbouring hooks are not flush sites, and each would be wrong as one.**
-
-- `resize()` is where the watermark moves, and it is the only such place: `setHistoryLength`
-  is `resize(nullopt, hist)` and `setCapacity()` is `resize(cap, nullopt)`, and one call may
-  move capacity and history together. A check placed anywhere else would see only half the
-  moves.
 - `_unlockStaleBlocks` exists for SWA blocks outside the window, whose content is *dead*;
   sparse history is live and will be read again. The trigger and the range arithmetic match,
   the disposition does not — routing sparse layers through it would drop the data rather
@@ -165,34 +135,20 @@ flush deadline.
   full-attention layer `windowSize.has_value()` is false, so nothing is ever reported as
   moved: it assigns `mHistoryLength`, returns true, and `resize()` returns before reaching
   its body. Work placed in that body does not run for a sparse layer.
-- `commit()` needs no flush site: the manager maintains
-  `num_committed_tokens <= history_length <= capacity`, so a committed block is already at or
-  below the watermark and was flushed by the `resize()` that passed it. Where `commit()`
-  advances the watermark it does so by calling `resize()`.
+- `commit()` can share a completed page because `num_committed_tokens <= history_length`.
+  When it raises the member's history length, it does so through `resize()`.
 
 ### How much a step may cross
 
-The write-back's work list is sized by `maxTotalInputTokens`, the tokens one step may ingest
-across every row, which the runtime already bounds for its own batching. A row advancing `t`
-tokens crosses at most `t / unitTokens + 1` units -- the `+1` for the partial unit its
-watermark starts inside -- so one layer's list needs
+Each row supplies a range of completed units. Each layer has one compact write-back list
+shared by all batch rows. A row advancing `t` tokens can cross at most
+`floor(t / unitTokens) + 1` unit boundaries, including a unit partly filled in the
+previous step. With a batch token budget, the list capacity is therefore
+`floor(maxTotalInputTokens / unitTokens) + maxBatchSize`. Without that budget the batch
+reserves `maxBatchSize * maxInFlightUnits` entries per layer.
 
-```
-maxTotalInputTokens / unitTokens + maxBatchSize
-```
-
-entries, and `flushSparseUnits` rejects a move whose units exceed that, summed over rows.
-
-The bound is an **aggregate** one, and it is usable only because the list is compacted. Were
-it indexed by row, each row's slice would have to allow for that row consuming the entire
-token budget, and the product over rows would be hundreds of times larger. The same property
-is what makes the guard right for in-flight batching: one prefilling row may cross the whole
-step's worth of units while every other row crosses none, which a per-row limit would refuse
-no matter how idle the rest of the batch was.
-
-Left unset, the bound falls back to `maxBatchSize * maxInFlightUnits`. That is today's decode
-behaviour -- a step advances capacity one token per row, so a row crosses at most one unit
-boundary -- and it is what the sparse path currently supports; see "Supported scope".
+`flushSparseUnits()` checks the total units crossed across all rows against the list
+capacity.
 
 ### Ordering
 
@@ -228,37 +184,23 @@ were allocated by an earlier resize and published then.
 
 ### Unflushed entries carry no state
 
-An entry holds either a fetched copy of a history page or the live, still-growing block.
-The first is read-only by construction — fetch only ever targets ordinals below the
-watermark — and the second is written by definition. So the two populations are
-distinguished by the ordinal alone:
+The resolve kernel derives pinning from a resident entry's ordinal and the row's
+published history.
 
 ```
-unflushed  <=>  entry_ordinal >= history_length / unit_tokens
+pinned  <=>  entry_ordinal >= floor(published_history / unit_tokens)
 ```
 
-Nothing records this. History is monotonic (`resize()` rejects a decrease), so an ordinal
-that was history stays history and a resident ordinal at or above the watermark cannot be a
-stale fetched copy. The flush recorded for a `resize()` covers exactly
-`[old_history, new_history)`, so
-the flushed prefix always equals the watermark and there is no second high-water mark to
-keep. A per-entry dirty bitmap would be derived state that can only ever disagree with the
-ordinal it was derived from.
+A pinned cell holds this request's KV until published history passes the unit. A history
+advance queues write-back for each newly completed unit, so a subsequent fetch can evict
+its cell and later refill it from the host page. Only finalized pages enter the radix tree,
+so the request owns its unflushed units exclusively.
 
-Prefill and decode share one manager under in-flight batching, so the unflushed set is not
-one entry: it is every in-flight block, which during prefill is the whole chunk. Two facts
-keep this from being a general write-back cache:
-
-- **Unflushed entries are private.** Only finalized pages enter the radix tree, so an
-  unflushed block has exactly one owner: no aliasing, no cross-request coherence, no
-  concurrent writers.
-- **The unflushed set is at most one unit**, bounded by `max_input_length` below rather
-  than observed at runtime. Reservation covers it, so a fetch never meets a cache with
-  nothing to evict.
-
-Eviction eligibility is therefore one comparison against the watermark. There is no
-evict-an-unflushed-entry path to implement: such an entry is simply not a candidate, and
-the reservation guarantees enough candidates remain.
+If verification accepts only a prefix, capacity can shrink below a unit the model already
+wrote. Its cell stays pinned even while the write-index output omits it. When capacity
+covers that ordinal again, the model overwrites the same cell. These cells count toward
+the in-flight bound. Each was allocated within `max_input_length` tokens of history, and
+history only advances.
 
 ## Per-request reservation
 
@@ -276,36 +218,19 @@ cells = max_cached_units                          one buffer's cells
 lease = num_buffers * divUp(cells, expansion)     contiguous cells a request takes
 ```
 
-The two populations are disjoint — the selection is below the watermark, everything in
-flight is above it — so the cache must hold a full selection *plus* every in-flight unit at
-once. That is the only constraint, and it is what makes the second population derivable
-rather than declared.
-
-An in-flight unit's data lives only in its cache cell until the watermark passes it, so the
-cache must hold every unit above the watermark. Within the supported scope that is **at most
-one**: a step advances capacity one token past history, and one token straddles at most one
-unit boundary.
-
-*Sizing*: two to four times the selection width is the usual starting point. A cache only as
-wide as the selection retains nothing between steps, so what it holds above the selection is
-what survives to be hit next step — it is all reuse, not headroom.
+Each selected history unit and each pinned write occupy a cell. The minimum reservation
+covers one query's selection and all pinned writes. See [Sizing](#sizing) for the
+multi-query bound.
 
 ### `max_input_length`
 
-A bound on `capacity - history_length`, i.e. on how far capacity may outrun the watermark.
-**One token**, and read-only.
+`KVCacheManagerConfig.sparse_max_in_flight_tokens` sets a sparse request's read-only
+`max_input_length`. `resize()` rejects a capacity more than this many tokens ahead of
+`history_length`. Size it for the largest gap a decode step can reserve before history
+advances. The batch publishes the request's history and capacity for fetch and write-index
+preparation.
 
-It is a property of the supported shape rather than of how wide a cache is. A sparse request
-contributes exactly one query token per step, because the fetch resolves one selection per
-request while an attention kernel indexes its selection per query token; the two agree only
-at one token each. This is the guard that keeps prefill and speculative decoding out — see
-*Supported scope* below.
-
-It is one token rather than anything derived from the reservation's width. What the cache
-*could* pin says nothing about what a step produces: the fetch cannot serve a multi-token
-step at any width.
-
-The lease therefore depends on configuration alone. It is taken when the cache is seated in
+The lease size depends on configuration alone. It is taken when the cache is seated in
 a `Batch` and returned when it leaves, so a request holds cells exactly while it is being
 stepped: one still receiving its disaggregated history, or sitting a step out, holds none.
 Seating cannot fail for want of a cell, because the arena is sized from the same
@@ -314,13 +239,8 @@ the fetch path never has to handle exhaustion. Because every request of a life c
 exactly the same number of cells, the arena is a fixed-size-block free list rather than a
 general allocator.
 
-Leaving returns the lease with every entry free, so it discards whatever the GPU cache held.
-`flushSparseUnits()` is what preserves anything worth keeping, and a Batch that churns its
-membership every step cold-starts every request's cache.
-
-`resize()` still checks the gap against this bound. It is the host-side counterpart of the
-resolve kernel's in-flight overflow report: one catches a request outgrowing its cache
-before the step, the other if it somehow reaches the device.
+Leaving returns the lease with every entry free. Write-back preserves completed units in
+their host pages, so a request that rejoins starts with an empty GPU cache.
 
 ### Why the cache is a flat array of cells
 
@@ -487,10 +407,10 @@ What keying by the selection costs, and what it buys:
 On DSA at the geometry above, the resolve kernel takes 0.833 ms per decode step summed
 across 21 sparse layers, against 1.468 ms for the resident-keyed form.
 
-A reservation-only call -- `prepare_sparse_write_indices`, which has no selection -- skips
-the table entirely and runs a separate kernel that scans the entry words for its single
-in-flight ordinal, reusing it where a previous step already pinned it and taking the stalest
-candidate otherwise. See "Writing the in-flight unit".
+When the configured in-flight span is one unit, `prepare_sparse_write_indices` scans the
+entries for that ordinal and reuses its cell or takes the stalest eligible entry. For a
+wider span it runs the resolve with an empty selection. See
+[Writing in-flight units](#writing-in-flight-units).
 
 ## Extraction interface
 
@@ -712,67 +632,34 @@ first, then the selection. An in-flight unit differs in exactly one way — a mi
 its cell but never joins the copy list, because its host page holds nothing to fetch until
 the watermark passes it.
 
-### Writing the in-flight unit
+### Writing in-flight units
 
-The unit between the two watermarks is the one the model is about to produce. `fetch_sparse_pages`
-makes it resident and pins it, but never reported *where*, so nothing could write it.
-`prepare_sparse_write_indices` closes that: it runs the resolve with no selection and converts
-the in-flight slot into the same index space the fetch produces.
+`prepare_sparse_write_indices` gives the model a destination for each in-flight unit.
+It can run before the indexer produces its selections because it needs only the row's
+published capacity and history. A later fetch reuses these cells. Only misses
+below the published watermark read from host pages.
 
-It is a separate call because the orders differ. A fetch needs the selection, which the
-indexer computes from the previous layer's output; a write needs only the watermarks, so it
-can run first — which is the order the model requires. Idempotent while the watermarks hold:
-the resolve probes residency before taking a victim, so the fetch's own resolve finds the
-entry and reuses it.
+The output shape is `[batch, buffers, max_in_flight_units]`. Set
+`history_units = floor(published_history / unit_tokens)` and
+`capacity_units = floor(published_capacity / unit_tokens)`. For each request and buffer,
+slot `i` holds the arena index for unit `history_units + i` if that ordinal is below
+`capacity_units`. All remaining slots hold `BAD_PAGE_INDEX`. With four-token units and
+a one-token step, a new unit becomes writable once every four steps.
 
-Nothing is fetched for it. An in-flight unit's host page is not written until the watermark
-passes it, so the resolve excludes in-flight ordinals from the copy list (`ordinal <
-historyUnits`) — copying would read stale bytes over what the model just wrote.
+### One fetch row per request, one selection per query
 
-`out` is `[batch][buffers]`, one entry per request: `resize` bounds `capacity - history_length`
-to a token, so at most one unit is in flight. `BAD_PAGE_INDEX` is an ordinary outcome rather
-than an error — with 4-token units a unit completes one step in four, which is also the only
-step on which a ratio-4 compressor has produced anything to write.
+Each decode query selects up to `num_selected_blocks` history units. `fetch_sparse_pages`
+takes one row per request. Lay out the queries' selections in query order and pad unused
+positions with `-1`. The row width is `sparse_queries_per_request * num_selected_blocks`.
 
-### Supported scope: one query token per request
+The manager resolves the whole row together so every index stays valid while attention
+reads it. If two queries select `[3, 7]` and `[7, 9]`, pass `[3, 7, 7, 9]`.
+The four output positions reference three cells per buffer. Both occurrences of unit 7
+return the same index, and a miss for that unit requires one copy per buffer.
 
-The fetch is a decode-phase call. It resolves **one selection per request**, while a sparse
-attention kernel indexes its selection **per query token** — trtllm-gen's
-`ptrSparseMlaTopKLens` is `[numTokensQ]`, "where each tokenQ has a corresponding topK
-length". The two agree only when a request contributes one query token per step, so that is
-the supported shape, enforced by `max_input_length` and by `fetch_sparse_pages` requiring one
-selection row per batch row.
-
-Excluded, deliberately:
-
-- **Prefill.** Served by a separate prefill instance under disaggregated serving, which needs
-  no sparsity here: it computes the prompt and hands over the KV cache.
-- **Speculative decoding and MTP.** Generation, but several query tokens per request per
-  step.
-
-Both are excluded for the same reason, and it is not the row count. The resolve makes units
-*resident* in a request's cache, which holds `max_cached_units`; residency is a property of
-the request, not of a query token. N query tokens each choosing their own units have a union
-of up to N times the selection width, so the reservation could no longer cover a call, and a
-unit evicted to make room for a later query token would invalidate an index already returned
-for an earlier one. Taking one row per token would make that reachable, not fix it.
-
-**What else is sized by this, and would need revisiting.** The restriction reaches further
-than the fetch. `maxInputLength()` returns one token, which makes
-`_sparseCacheMaxInFlightUnits` one, which in turn sizes the write-back's per-row flush list
-and bounds how far one watermark move may travel. Those adapt on their own if the constant
-rises -- `flushSparseUnits()` refuses a span wider than the headroom, and the scan asserts
-the list cannot overrun. What does *not* adapt is throughput: the write-back is tuned on the
-assumption that a row has at most one unit to move, so it is given a single warp per
-request. Correct for any count, but once a flush list is long that warp is the long pole and
-wants the same treatment as the fetch.
-
-This is a difference in kind from the sparse implementations in this repository, not a gap in
-degree. Their sparse prefill is real — the context path reuses the generation kernel with
-per-token indices — but their indices point straight at a GPU-resident KV pool, and the
-in-chunk tokens are reached by writing K/V to the cache before attention and forcing a local
-window in as ordinary indices. There is nothing to stage, so no per-request cache is needed.
-Here history is on host, which is exactly what makes prefill hard.
+The native fetch serves the decode instance in a disaggregated deployment. The prefill
+instance computes the prompt and hands over its KV cache. The Python sparse-offload
+manager currently rejects speculative decoding at construction.
 
 ### Arriving with a history: the bulk watermark jump
 
@@ -800,21 +687,16 @@ there is nothing to write back and no converted table is needed yet.
 
 ### Capacity and eviction
 
-Capacity is guaranteed by reservation, not back-pressure: a fetch can always satisfy its
-own layer, because the reservation covers a full selection width. Within a step a fetch may
-evict entries of layers already processed but never one a later kernel still needs, which
-the step clock delivers — layer N's entries are at age zero when layer N+1 fetches.
-
-An entry is evictable only when its unit ordinal is **below the watermark**. That is what
-protects the block being written, and it is a correctness predicate rather than a policy
-hint — but it is derived, not stored: see *Unflushed entries carry no state*.
+A row fits when its distinct misses fit in the free or evictable cells. A selected unit
+already resident needs no additional cell. The resolve protects every cell the row names
+and every cell pinned by published history. It uses free cells and evicts the stalest
+eligible entries to satisfy misses. If too few cells are available, the kernel traps
+and the process cannot continue. See [Sizing](#sizing) for the guaranteed capacity.
 
 ### Preconditions the caller owns
 
 Selections must name only pure-history units; `num_blocks` carries each request's eligible
 count.
-
-A step's order is the caller's too, and it is now explicit rather than implied:
 
 1. `flushSparseUnits(newHistory)` — writes back what the watermark is about to pass. It
    reads the index table as of the last publish, which covers the blocks in range.
@@ -822,11 +704,6 @@ A step's order is the caller's too, and it is now explicit rather than implied:
    was flushed.
 3. `publish()` — converts this step's indices for the fetch to read.
 4. the fetch, inside the captured graph.
-
-Steps 1 and 3 both read or write Batch-owned device state, so neither may be skipped on a
-step whose watermark moves. A history advance with no flush before it is refused; a flush
-with no publish behind it would write through indices for blocks that did not exist yet,
-which is why a history past the row's capacity is refused at step 1.
 
 `publish()` uploads the staged rows asynchronously, so anything that writes what it staged
 has to be separated from it by `waitPublished()` — a direct `resize()` on a member, a
@@ -895,6 +772,18 @@ races a running fetch and the counters are separate atomics, a copy can land bet
 the result is clamped rather than checked, since a diagnostic must not be able to fail the
 cache. Per-row detail is already available separately in `missCount`.
 
+### Measuring how full the cache gets
+
+`peek_sparse_cache_peak_use(layer_id)` returns the peak number of cells required by one
+fetch row in the layer's life cycle and the number of cells available per row. The peak
+covers fetches since batch construction or the last `reset_sparse_cache_peak_use()`.
+
+The resolve kernel computes `entries - evictable + distinct_misses` for each row and
+updates the peak with an atomic maximum. The first term (`entries - evictable`) counts
+cells already occupied by selected or pinned units. Each distinct miss requires one
+additional cell. Compare the observed peak with capacity when sizing for workloads
+whose queries select overlapping history.
+
 ## One arena, one index space
 
 The cache arena holds nothing but cells — selected history and the unit being written alike.
@@ -950,7 +839,8 @@ It also owns three things the sparse path depends on:
   records its events on the stream the flush is launched on.
 - **the converted index tables** (`INDEX_CONVERSION_DESIGN.md`), which both the fetch and
   the write-back read.
-- **the write-back**, as `flushSparseUnits()` — see "Locking and flush".
+- **the write-back** through `flushSparseUnits()`. See
+  [Who flushes](#who-flushes).
 
 **The upload is whole-table by decision.** `publish()` stages every row and sends the table
 in one `cuMemcpyHtoDAsync` on the upload stream, which overlaps compute. Sending only the
@@ -994,25 +884,22 @@ never run.
 
 ## Sizing
 
-Per sparse cache (`SparseCacheConfig`): **`num_selected_blocks`** (the selection width
-`k`) and **N**, `max_cached_units` (the reservation upper bound, in the same units).
+`N = max_cached_units` is the per-request cache capacity for a sparse selection. Let `k` be
+`num_selected_blocks` per query, `S` be `sparse_queries_per_request`, and
+`H = ceil(sparse_max_in_flight_tokens / unit_tokens)` be the maximum pinned units.
+Both manager settings, `sparse_queries_per_request` and `sparse_max_in_flight_tokens`,
+default to one.
 
-N should be `2k`–`4k`, not `k`. `k` is the correctness floor — it guarantees a fetch can
-satisfy its layer — but it leaves no room for retention, and retention across steps is
-where the hit rate comes from. That range is the one HiSparse measures as useful.
+- **Configuration minimum** — `k + H` cells guarantee room for one full query and every
+  pinned write.
+- **Worst-case multi-query row** — `S * k + H` cells guarantee room even when all `S`
+  queries select disjoint history. A smaller cache can serve a row when its distinct
+  misses fit the free or evictable cells.
+- **Retention** — extra cells can retain history for later steps. For single-query decode,
+  `2k`–`4k` is the starting range reported by HiSparse, subject to the configuration minimum.
 
-There is no separate budget for in-flight blocks. The sparse pool's GPU tier holds nothing
-but cache cells, and an in-flight block occupies one of the same cells the selection draws
-on, so `max_cached_units` covers both:
-
-```
-cache reservation = max_batch_size * N             (N in [2k, 4k])
-in-flight headroom = 1 unit                        one query token per step
-```
-
-with `max_batch_size` from `constraints`. The surplus above `k` is retention, not headroom,
-so `N` is sized by one demand rather than two: retention wants
-`2k`–`4k`, and a prefill chunk wants enough cells to pin the whole chunk at once.
+The batch reserves `max_batch_size` leases of `N` units per buffer. For measured demand,
+see [Measuring how full the cache gets](#measuring-how-full-the-cache-gets).
 
 ## Python surface
 
@@ -1023,12 +910,18 @@ Declared in `tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi`:
 - `AttentionLayerConfig.sparse_cache: SparseCacheConfig | None` — the layer's fetch path:
   `num_selected_blocks` (the selection width `k`), `max_cached_units` (the reservation
   bound), `unit_tokens` and `selection_id`; construction-time, per layer.
+- `KVCacheManagerConfig.sparse_max_in_flight_tokens: int` — maximum gap in tokens between
+  reserved capacity and the request's history length.
+- `KVCacheManagerConfig.sparse_queries_per_request: int` — query tokens a request may feed
+  one step; a fetch's row is that many selections wide.
 - `KVCacheManager.is_sparse(layer_id, data_role) -> bool`.
 - `Batch` — membership, row order, device arrays, `resize()` and `publish()`, which
   transfers the whole table; dirty-row tracking is planned, not declared.
 - `Batch.fetch_sparse_pages(buffers, selected, out, stream)`.
 - `Batch.sparse_out_slots(buffers) -> list[int]` — the slice of `out` each buffer's
   indices land in, for both the fetch and the write.
+- `Batch.flush_sparse_units(new_history_lengths)` — queues write-back before the caller
+  advances request history.
 
 Publishing the page table is `Batch`'s job. It must not reuse the dense path's block
 offsets: those are scaled and fold `BAD_PAGE_INDEX` to slot zero, whereas a sparse table
@@ -1445,14 +1338,8 @@ span, which is the span a selection would otherwise have to discover.
 
 Properties the rest of the design is entitled to assume.
 
-- **Decode only.** One manager cannot serve prefill and decode together: a sparse kernel
-  indexes its selection per query token, and a multi-token step's selections cannot all be
-  resident in one per-request cache at once. The decode instance of a disaggregated
-  deployment is the supported target — see *Supported scope*.
-- **History never moves backwards.** `resize()` rejects any decrease outright
-  (`kvCache.cpp`: "History length cannot be decreased"), and the only other assignment
-  initialises a fresh request from a prefix match. A flushed block therefore cannot be
-  rewound into, and no further rule is needed to guarantee it.
+- **Decode only.** A separate prefill instance computes and transfers the prompt KV.
+- **History is monotonic for a request.** `resize()` rejects a decrease in history.
 - **A selection unit never exceeds `tokens_per_block`.** Sub-page units are supported
   through `expansion`; a unit spanning several pages is rejected, which is what keeps slot
   contiguity and k-at-a-time eviction out of the design.
@@ -1462,9 +1349,10 @@ Properties the rest of the design is entitled to assume.
   would produce a host value the kernel cannot use, costing an H2D per layer.
 - **Eviction never copies.** An entry is evictable only once flushed, so evicting is a
   free-list push. Flushes are triggered by the watermark alone, never by eviction pressure.
-- **Pinning covers the in-flight unit only.** That unit is private because unflushed blocks
-  are not in the radix tree, and bounded to one by `max_input_length`. Ordering among the
-  rest comes from staleness alone.
+- **Pinning covers unflushed units only.** They are private because unflushed blocks are
+  not in the radix tree, and bounded by `max_input_length`. A unit stays pinned until
+  published history passes it, including while capacity does not cover it. Staleness orders
+  the eligible entries.
 - **No stale-key invalidation.** Per-request cache scope makes it impossible.
 - **`tokens_per_block_override` is not the sparse granularity lever**, and is rejected on a
   sparse buffer. `sparse_selection_unit_tokens` is — see *Extraction interface*.

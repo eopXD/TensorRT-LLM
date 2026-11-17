@@ -92,6 +92,18 @@ struct SparseHitMiss
     }
 };
 
+//! How full a request's sparse cache has been, for one life cycle.
+//!
+//! `peak` is the most entries one row had in use after a fetch's resolve: the entries
+//! holding units the row named, the entries pinned in flight, and the entries its misses
+//! took. A row needing more than `cells` cannot be resolved, so the gap between the two is
+//! the room the fetches so far have left.
+struct SparseCachePeakUse
+{
+    int32_t peak;
+    int32_t cells;
+};
+
 //! One selection's resolve across a batch: turn each row's selection of unit ordinals into
 //! cache entry indices, allocating entries for the units that are not resident.
 //!
@@ -118,10 +130,12 @@ struct SparseResolveArgs
     int32_t selectionSlot;
 
     //! [numRows][selectionWidth] unit ordinals, negative where the selection is padded.
-    //! Ordinals must be unique within a row; duplicates would be resolved as separate
-    //! misses and waste an entry each.
+    //! An ordinal may repeat within a row: every position naming a unit resolves to the one
+    //! entry holding it, and a unit that is not resident is given one entry and copied once.
     int32_t const* selected;
-    //! Selected units per row, uniform across requests so shapes stay static.
+    //! Positions per row, uniform across requests so shapes stay static. A row carries a
+    //! selection for each query its request feeds, so it may be wider than the cache has
+    //! entries; what has to fit is the row's distinct units.
     int32_t selectionWidth;
 
     //! [numRows] history length and capacity, in tokens, as Batch::watermarks() publishes
@@ -185,6 +199,13 @@ struct SparseResolveArgs
     //! step's counters are cleared once per publish, not per fetch, so a reader downstream
     //! would count two fetches of one layer twice.
     SparseHitMiss* hitMiss = nullptr;
+
+    //! [1] the most entries a row has had in use after a resolve, which each row raises to
+    //! its own count. Null skips it.
+    //!
+    //! Counted in the resolve for the reason the statistics are: a row's use is its distinct
+    //! units, and a unit named twice or a padded position looks to the host like any other.
+    int32_t* peakUse = nullptr;
 };
 
 //! Shared memory one CTA needs for `entriesPerSelection` entries and `selectionWidth`
@@ -392,15 +413,12 @@ struct SparseOutIndexArgs
 
     //! [numRows][selectionWidth] the ordinals selected, and the entries the resolve gave
     //! them. Negative in either array means the slot carried no selection.
+    //!
+    //! The write-index path passes no `selected`: its slots are the resolve's in-flight
+    //! array, a row of `selectionWidth` units per request, which names its own live span.
     int32_t const* selected;
     int32_t const* outSlot;
     int32_t selectionWidth;
-
-    //! Row stride of `outSlot`, when it is wider than the part this call reads. Zero means
-    //! `selectionWidth`. The write-index path needs it: its slots come from the resolve's
-    //! in-flight array, whose row is the reservation's headroom, while only the units
-    //! actually in flight -- at most one -- are read out.
-    int32_t outSlotStride = 0;
 
     //! [numRows][outBuffers][selectionWidth] written in full: entry `k` is the index
     //! holding `selected[row][k]` for the buffer, and kBadPageIndex where the selection is

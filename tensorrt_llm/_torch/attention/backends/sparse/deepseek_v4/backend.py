@@ -351,9 +351,11 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     data_slot = sparse_state.out_slots[layer_idx][data_index]
                     sparse_index_kwargs = dict(
                         compressed_fetched_indices=fetched[:, data_slot, :],
+                        # Entry 0 is the unit at the history watermark, the one this
+                        # step writes.
                         compressed_write_indices=sparse_state.write_indices[
                             len(descriptor.buffer_ids)
-                        ][:, data_slot],
+                        ][:, data_slot, 0],
                         compressed_history_lengths=sparse_state.history_lengths,
                         compressed_lengths=compressed_lengths,
                         compressed_batch_rows=sparse_state.batch_rows,

@@ -138,6 +138,7 @@ class _SparseRuntime:
                 SimpleNamespace(kv_caches=[None] * 2),
                 SimpleNamespace(kv_caches=[None] * 6),
             ],
+            sparse_max_in_flight_tokens=1,
         )
 
     @property
@@ -4120,7 +4121,7 @@ def test_offload_scratch_counts_both_attention_metadata_copies() -> None:
     # A copy holds 64 MiB of FP8 rows dequantized from NVFP4, [256, 512, 512], with a
     # zeroed tail of one FMHA KV tile (128 rows of 512), and int32 indices: the
     # selections [256, 512], the fetch outputs [256, 2, 512] and write destinations
-    # [256, 2] of the data and scale buffers, the scatter start positions [256], the
+    # [256, 2, 1] of the data and scale buffers, the scatter start positions [256], the
     # Batch row map [256] and the active count.
     per_copy = (256 * 512 + 128) * 512 + 4 * (256 * 512 + 256 * 2 * 512 + 256 * 2 + 256 + 256 + 1)
     assert per_copy == 68_751_364

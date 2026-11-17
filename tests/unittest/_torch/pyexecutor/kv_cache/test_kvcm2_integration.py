@@ -419,6 +419,7 @@ def _make_cache_config_for_test(
     cache_manager = object.__new__(KVCacheManagerV2)
     cache_manager.layer_specs = None
     cache_manager._sparse_kv_offload = sparse_kv_offload
+    cache_manager._sparse_max_in_flight_tokens = 1
     cache_manager.max_beam_width = 1
     cache_manager.kv_cache_type = kv_cache_type
     cache_manager.dtype = dtype
@@ -6248,7 +6249,11 @@ def test_sparse_batch_buffers_come_from_a_provisional_config(offload: bool) -> N
         return
     # 17 tokens of 16 and the decode step's one span five pages, padded to eight.
     batch = sparse_batch_shape(
-        config.layers, tokens_per_block=TOKENS_PER_BLOCK, max_batch_size=2, max_blocks_per_seq=8
+        config.layers,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_batch_size=2,
+        max_blocks_per_seq=8,
+        max_in_flight_tokens=1,
     )
     assert batch.num_life_cycles == 2
     assert batch.selection_widths == (1,)

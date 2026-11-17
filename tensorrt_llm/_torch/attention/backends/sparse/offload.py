@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Callable, Collection, Iterable
 import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_max_in_flight_units
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -116,11 +117,11 @@ class SparseOffloadState:
     """Fixed-capacity storage owned by one serial attention metadata instance.
 
     Index and count tensors are int32. Selections are [B, K], fetch outputs are
-    [B, F, K], write destinations are [B, F], the active count is [1] and the
+    [B, F, K], write destinations are [B, F, U], the active count is [1] and the
     Batch row map is [B]. B is the native Batch capacity, including when an
-    attention graph uses fewer query rows. Storage is shared by layers with the
-    same buffer count F. Reuse must follow the previous layer's attention on the
-    consuming stream.
+    attention graph uses fewer query rows, and U is the units a request can have
+    in flight. Storage is shared by layers with the same buffer count F. Reuse
+    must follow the previous layer's attention on the consuming stream.
 
     NVFP4 additionally uses persistent FP8 scratch [B, K, head_dim] for the
     dequantized rows consumed by attention. Arena allocations remain owned by
@@ -177,6 +178,7 @@ class SparseOffloadState:
         *,
         max_batch_size: int,
         topk: int,
+        max_in_flight_units: int,
         buffer_counts: Collection[int],
         nvfp4_head_dim: int | None,
     ) -> int:
@@ -187,6 +189,7 @@ class SparseOffloadState:
         Args:
             max_batch_size: Rows B, the native Batch capacity.
             topk: Units one row selects, K.
+            max_in_flight_units: Units a request can have in flight, U.
             buffer_counts: The distinct sparse buffer counts F of the layers.
             nvfp4_head_dim: Head dim of the dequantized rows with NVFP4, else None.
         """
@@ -195,7 +198,9 @@ class SparseOffloadState:
         # destinations of each buffer count.
         index_entries = 1 + max_batch_size * topk + 2 * max_batch_size
         index_entries += int(SPARSE_OFFLOAD_DEBUG_ASSERT)
-        index_entries += sum(max_batch_size * count * (topk + 1) for count in buffer_counts)
+        index_entries += sum(
+            max_batch_size * count * (topk + max_in_flight_units) for count in buffer_counts
+        )
         nvfp4_bytes = 0
         if nvfp4_head_dim is not None:
             nvfp4_rows = max_batch_size * topk + NVFP4_SCRATCH_TAIL_ROWS
@@ -209,6 +214,7 @@ def allocate_sparse_offload_state(
     *,
     max_batch_size: int,
     topk: int,
+    max_in_flight_units: int,
     nvfp4_head_dim: int | None = None,
 ) -> SparseOffloadState:
     """Allocate an attention metadata's persistent offload state.
@@ -219,6 +225,8 @@ def allocate_sparse_offload_state(
         layers: The manager's descriptor of each offloaded local layer.
         max_batch_size: Rows B, the native Batch capacity.
         topk: Units one row selects.
+        max_in_flight_units: Units a request can have in flight; the last extent of
+            the write destinations.
         nvfp4_head_dim: Head dim of the NVFP4 gather's dequantized rows, else None.
     """
 
@@ -250,7 +258,11 @@ def allocate_sparse_offload_state(
             for count in buffer_counts
         },
         write_indices={
-            count: index_tensor(f"write_indices_{count}", (max_batch_size, count), BAD_PAGE_INDEX)
+            count: index_tensor(
+                f"write_indices_{count}",
+                (max_batch_size, count, max_in_flight_units),
+                BAD_PAGE_INDEX,
+            )
             for count in buffer_counts
         },
         scatter_start_positions=index_tensor("scatter_start_positions", (max_batch_size,), 0),
@@ -352,6 +364,32 @@ class SparseOffloadCacheMixin:
         """
         return None
 
+    def _sparse_offload_max_in_flight_units(self, config: KVCacheManagerConfig) -> int:
+        """Return the units a request can have in flight in each offloaded layer of ``config``.
+
+        Derived from the config alone, so the config offload is sized from, which is
+        built before the native manager exists, and that manager's ``init_config``
+        give the same value. Zero when no layer offloads.
+
+        Raises:
+            ValueError: The offloaded layers differ. Offload state shares its
+                write-destination storage between layers.
+        """
+        units = {
+            sparse_max_in_flight_units(
+                config.sparse_max_in_flight_tokens, layer.sparse_cache.unit_tokens
+            )
+            for layer in config.layers
+            if getattr(layer, "sparse_cache", None) is not None
+            and any(buffer.is_sparse for buffer in layer.buffers)
+        }
+        if len(units) > 1:
+            raise ValueError(
+                "Offloaded layers share their write-destination storage and must have the "
+                f"same number of units in flight; got {sorted(units)}"
+            )
+        return max(units, default=0)
+
     def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfig) -> int:
         """Return the device bytes of the attention metadata's sparse offload state.
 
@@ -367,6 +405,7 @@ class SparseOffloadCacheMixin:
         return SPARSE_OFFLOAD_STATE_COPIES * SparseOffloadState.device_bytes(
             max_batch_size=self.max_batch_size,
             topk=self._sparse_offload_topk,
+            max_in_flight_units=self._sparse_offload_max_in_flight_units(config),
             buffer_counts=buffer_counts,
             nvfp4_head_dim=self._sparse_offload_nvfp4_head_dim(),
         )
@@ -677,9 +716,9 @@ class SparseOffloadCacheMixin:
         With offload, history advances right after each forward, so at scheduling
         time a cache holding capacity beyond its history has already reserved this
         step. Attention-DP padding dummies are created that way. Growing such a
-        cache again would exceed the sparse cache's one-token bound between
-        capacity and history. No growth is recorded, so a skipped step reverts
-        nothing.
+        cache again would exceed the manager config's ``sparse_max_in_flight_tokens``,
+        the bound on the tokens between capacity and history. No growth is recorded,
+        so a skipped step reverts nothing.
         """
         if self._enable_kv_cache_offload:
             if self._sparse_batch is not None:
@@ -1008,16 +1047,17 @@ class SparseOffloadCacheMixin:
     ) -> torch.Tensor:
         """Reserve this layer's in-flight arena rows on the current stream.
 
-        Return int32[B, F] in Batch row order, with columns assigned by
+        Return int32[B, F, U] in Batch row order, with columns assigned by
         ``Batch.sparse_out_slots`` and cached in ``state.out_slots[layer_idx]``.
         Buffers with matching arena indices share a column; unused columns are
-        untouched. A used column gets -1 when its row has no unit in flight.
+        untouched. Entry ``i`` of a used column is the arena row of unit
+        ``history_units + i``, and -1 where that unit is not in flight.
         A writer addressing requests by input position
         reads request i's entries at Batch row ``state.batch_rows[i]``, for example
         through ``gather_sparse_batch_rows``. The caller must join Batch publication
         before this call. Reservation must finish before either the writer or
         the history fetch; they may run concurrently because fetch excludes the
-        protected in-flight row. Both must finish before attention or a history
+        protected in-flight rows. Both must finish before attention or a history
         update. No KV is fetched here.
 
         Data and scale buffers use the same column when their arena indices coincide;

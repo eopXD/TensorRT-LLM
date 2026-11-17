@@ -132,6 +132,7 @@ def test_sparse_metadata_uses_native_capacity_and_configured_width():
     state = metadata.sparse_offload_state
     assert state.selected_history_units.shape == (4, 8)
     assert state.fetched_indices[1].shape == (4, 1, 8)
+    assert state.write_indices[1].shape == (4, 1, 1)
     assert state.scatter_start_positions.shape == (4,)
     assert (state.scatter_start_positions == 0).all()
     assert state.batch_rows.shape == (4,) and (state.batch_rows == -1).all()
@@ -140,7 +141,8 @@ def test_sparse_metadata_uses_native_capacity_and_configured_width():
 
 
 @pytest.mark.cpu_only
-def test_nvfp4_scratch_keeps_a_zeroed_tail_past_its_rows():
+@pytest.mark.parametrize("max_in_flight_units", [1, 3])
+def test_nvfp4_scratch_keeps_a_zeroed_tail_past_its_rows(max_in_flight_units):
     """The sparse MLA FMHA can read one KV tile past the last row its indices name."""
     allocated = {}
 
@@ -154,7 +156,12 @@ def test_nvfp4_scratch_keeps_a_zeroed_tail_past_its_rows():
 
     layers = {2: SimpleNamespace(buffer_ids=(None, None))}
     state = allocate_sparse_offload_state(
-        allocate, layers, max_batch_size=4, topk=8, nvfp4_head_dim=512
+        allocate,
+        layers,
+        max_batch_size=4,
+        topk=8,
+        max_in_flight_units=max_in_flight_units,
+        nvfp4_head_dim=512,
     )
     rows = 4 * 8
     flat = allocated["nvfp4_scratch"]
@@ -163,8 +170,13 @@ def test_nvfp4_scratch_keeps_a_zeroed_tail_past_its_rows():
     assert state.nvfp4_scratch.data_ptr() == flat.data_ptr()
     assert (flat[:rows].view(torch.uint8) == 0x7F).all()
     assert (flat[rows:].view(torch.uint8) == 0).all()
+    assert state.write_indices[2].shape == (4, 2, max_in_flight_units)
     assert SparseOffloadState.device_bytes(
-        max_batch_size=4, topk=8, buffer_counts={2}, nvfp4_head_dim=512
+        max_batch_size=4,
+        topk=8,
+        max_in_flight_units=max_in_flight_units,
+        buffer_counts={2},
+        nvfp4_head_dim=512,
     ) == sum(tensor.numel() * tensor.element_size() for tensor in allocated.values())
 
 
@@ -450,13 +462,13 @@ def test_prepare_writes_and_attention_merge_on_ordered_streams(rows):
     seen = []
 
     def prepare(*, buffers, out, stream):
-        assert out.shape == (4, 1) and out.is_contiguous()
+        assert out.shape == (4, 1, 1) and out.is_contiguous()
         assert stream == producer.cuda_stream
         assert buffers == case.state.layers[2].buffer_ids
         seen.append(out.data_ptr())
         out.fill_(-1)
         # Request 20 has history 7 and capacity 8, so its unit 1 is newly complete.
-        out[row_20, 0] = 77
+        out[row_20, 0, 0] = 77
 
     case.manager._sparse_batch.prepare_sparse_write_indices = prepare
     producer.wait_stream(torch.cuda.current_stream())
@@ -480,7 +492,7 @@ def test_prepare_writes_and_attention_merge_on_ordered_streams(rows):
             num_compressed_indices=8,
             compressed_local_indices=case.topk,
             compressed_fetched_indices=fetched[:, 0],
-            compressed_write_indices=writes[:, 0],
+            compressed_write_indices=writes[:, 0, 0],
             compressed_history_lengths=case.state.history_lengths,
             compressed_lengths=case.lengths,
             compressed_batch_rows=case.state.batch_rows,
@@ -612,7 +624,7 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
         converted["compressed_fetched_indices"], physical[:, descriptor.data_buffer_index]
     )
     torch.testing.assert_close(
-        converted["compressed_write_indices"], writes[:, descriptor.data_buffer_index]
+        converted["compressed_write_indices"], writes[:, descriptor.data_buffer_index, 0]
     )
     assert converted["compressed_history_lengths"] is state.history_lengths
     assert converted["compressed_batch_rows"] is state.batch_rows

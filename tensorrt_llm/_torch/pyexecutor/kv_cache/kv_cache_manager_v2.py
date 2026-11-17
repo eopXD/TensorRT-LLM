@@ -2718,6 +2718,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 shared_draft_block_width=self._shared_draft_block_width,
             )
         )
+        # Tokens a request may hold between its history and its capacity under sparse KV
+        # cache offload: a decode step reserves and writes one token per request.
+        self._sparse_max_in_flight_tokens = 1
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.enable_stats = enable_stats
@@ -4769,6 +4772,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     )
                 )
 
+        sparse_offload_kwargs = {}
+        if self._sparse_kv_offload is not None:
+            # _build_cache_config sizes each layer's sparse_cache from this bound, and the
+            # native manager checks the two against each other.
+            sparse_offload_kwargs["sparse_max_in_flight_tokens"] = self._sparse_max_in_flight_tokens
+
         rebalance_cfg = kv_cache_config.kv_pool_rebalance_config
         return KVCacheManagerConfigPy(
             # Used by the backend only for token<->block arithmetic and
@@ -4816,6 +4825,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 if kv_cache_config.cold_tier_offload_min_priority is None
                 else kv_cache_config.cold_tier_offload_min_priority
             ),
+            **sparse_offload_kwargs,
         )
 
     def _get_external_cache_bytes(self, cache: KVCacheManagerPy) -> int:
@@ -5011,6 +5021,7 @@ class KVCacheManagerV2(BaseResourceManager):
             tokens_per_block=config.tokens_per_block,
             max_batch_size=self.max_batch_size,
             max_blocks_per_seq=self._get_max_blocks_per_seq(self.max_seq_len),
+            max_in_flight_tokens=config.sparse_max_in_flight_tokens,
         )
         device_bytes = batch.device_bytes + self.get_sparse_offload_scratch_bytes(config)
         return device_bytes, batch.staging_bytes

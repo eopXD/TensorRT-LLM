@@ -21,6 +21,7 @@ import itertools
 import math
 import os
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -838,22 +839,6 @@ class TestSparseBufferConfig(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no sparse buffer to serve"):
             self._make_config(layer)
 
-    def test_rejects_cache_narrower_than_selection(self):
-        layer = AttentionLayerConfig(
-            0,
-            [
-                BufferConfig("key", 4096, is_sparse=True),
-                # A pool group sizes its slots from its device-backed pools, so a sparse
-                # layer carries one -- which is also the shape a model uses.
-                BufferConfig("index", 256),
-            ],
-            sparse_cache=SparseCacheConfig(
-                num_selected_blocks=16, max_cached_units=8, unit_tokens=128
-            ),
-        )
-        with self.assertRaisesRegex(RuntimeError, "maxCachedUnits"):
-            self._make_config(layer)
-
     def test_rejects_a_page_its_units_do_not_divide(self):
         layer = AttentionLayerConfig(
             0,
@@ -1109,11 +1094,17 @@ class TestSparseCacheReservation(unittest.TestCase):
 
     @staticmethod
     def _manager(
-        max_cached_units: int, *, num_selected_blocks: int = 2, unit_tokens: int = 128
+        max_cached_units: int,
+        *,
+        num_selected_blocks: int = 2,
+        unit_tokens: int = 128,
+        sparse_max_in_flight_tokens: int = 1,
+        sparse_queries_per_request: int = 1,
     ) -> KVCacheManager:
         # sparse_cache is absent when the fetch path is unconfigured: the buffer still gets
         # sparse storage and locking, it simply has no GPU cache to read through.
-        # The cache must exceed the selection, since the surplus is the in-flight headroom.
+        # The cache must hold a full selection beside the units sparse_max_in_flight_tokens
+        # can span, since an in-flight unit's cell is pinned.
         sparse_cache = (
             SparseCacheConfig(
                 num_selected_blocks=num_selected_blocks,
@@ -1151,6 +1142,8 @@ class TestSparseCacheReservation(unittest.TestCase):
                         sparse_cache=sparse_cache,
                     )
                 ],
+                sparse_max_in_flight_tokens=sparse_max_in_flight_tokens,
+                sparse_queries_per_request=sparse_queries_per_request,
             )
         )
 
@@ -1158,22 +1151,46 @@ class TestSparseCacheReservation(unittest.TestCase):
     def _free(manager: KVCacheManager) -> int:
         return sum(stats.free for stats in manager.get_storage_statistics())
 
-    def test_batch_rejects_resolve_shared_memory_overflow_before_fetch(self) -> None:
+    def test_manager_rejects_resolve_shared_memory_overflow(self) -> None:
         # Token-sized units keep the arena small. The widest cache the probe index can name,
         # 16256 units at 128 per page, needs about 80 KiB for its residency metadata, so the
         # selection's probe table and miss lists are what exceed a device's per-block limit.
-        manager = self._manager(16256, num_selected_blocks=16255, unit_tokens=1)
-        try:
-            with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
-                Batch(
-                    manager,
-                    NULL_STREAM,
-                    max_batch_size=1,
-                    max_blocks_per_seq=4,
-                    index_tables=manager.sparse_index_table_specs(),
-                )
-        finally:
-            manager.shutdown()
+        # The manager refuses the shape itself, before any Batch or request exists.
+        with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
+            self._manager(16256, num_selected_blocks=16255, unit_tokens=1)
+
+    def test_manager_rejects_a_row_too_wide_for_resolve_shared_memory(self) -> None:
+        # The probe index and the miss lists follow the row a fetch takes, not the cache, so
+        # the queries per request widen them on their own. Sixteen selections of 2048 units
+        # need over 700 KiB for those two, against a cache one selection wide.
+        with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
+            self._manager(
+                2049, num_selected_blocks=2048, unit_tokens=1, sparse_queries_per_request=16
+            )
+
+    def test_the_cache_floor_is_one_querys_selection_however_wide_the_row(self) -> None:
+        """sparse_queries_per_request widens the row a fetch takes and leaves the floor alone.
+
+        The floor is one selection beside the units in flight. A request feeding more query
+        tokens hands over a wider row, and that row fits or not by how many distinct units
+        it names, which the configuration cannot know.
+        """
+        selected = 2
+        floor = selected + 1  # one token in flight spans one whole-page unit
+        for queries in (1, 2, 8):
+            with self.subTest(queries=queries):
+                config = dict(num_selected_blocks=selected, sparse_queries_per_request=queries)
+                with self.assertRaisesRegex(RuntimeError, "must hold numSelectedBlocks"):
+                    self._manager(floor - 1, **config)
+                self._manager(floor, **config).shutdown()
+
+        # A request feeds a step at least one query token.
+        with self.assertRaisesRegex(AssertionError, "sparse_queries_per_request"):
+            self._manager(floor, num_selected_blocks=selected, sparse_queries_per_request=0)
+        # Every position names a unit ordinal, so a row longer than the ordinals there are
+        # could hold nothing but repeats.
+        with self.assertRaisesRegex(AssertionError, "longer than the unit ordinals"):
+            self._manager(floor, num_selected_blocks=selected, sparse_queries_per_request=1 << 18)
 
     def test_a_cache_wider_than_the_probe_index_fails_with_the_config(self) -> None:
         # The probe index names at most 16382 entries, which round down to 16256 token-sized
@@ -1203,6 +1220,22 @@ class TestSparseCacheReservation(unittest.TestCase):
             del batch
             manager.shutdown()
 
+    def test_a_layer_without_a_fetch_path_reports_no_peak_use(self) -> None:
+        manager = self._manager(max_cached_units=0)
+        batch = None
+        try:
+            batch = Batch(
+                manager,
+                NULL_STREAM,
+                max_batch_size=1,
+                max_blocks_per_seq=4,
+                index_tables=manager.sparse_index_table_specs(),
+            )
+            self.assertEqual(batch.peek_sparse_cache_peak_use(LayerId(0)), (0, 0))
+        finally:
+            del batch
+            manager.shutdown()
+
     def _free_delta_across_resume(self, max_cached_units: int) -> int:
         """GPU slots a single resume consumes, for the given cache width."""
         manager = self._manager(max_cached_units)
@@ -1218,28 +1251,55 @@ class TestSparseCacheReservation(unittest.TestCase):
         finally:
             manager.shutdown()
 
-    def test_the_input_bound_is_one_token_whatever_the_cache_width(self):
-        """A sparse request contributes one query token per step, so the gap is one token.
+    def test_the_in_flight_bound_is_the_configured_one(self):
+        """sparse_max_in_flight_tokens is the gap resize() allows and the span a cache must hold.
 
-        The bound follows from the supported shape, not from how much spare room the
-        reservation has: widening the cache buys reuse, not a longer input.
+        Both watermarks round down to units, so that many tokens span their count over
+        unit_tokens, rounded up. Each manager is built on the narrowest cache the config
+        accepts, a full selection beside those units, so the bound is read where the
+        reservation has no spare width it could be derived from.
         """
-        for width in (4, 6):
-            manager = self._manager(max_cached_units=width)
-            try:
-                cache = manager.create_kv_cache()
-                try:
-                    self.assertEqual(cache.max_input_length, 1)
-                finally:
-                    cache.close()
-            finally:
-                manager.shutdown()
+        selected = 2
+        for unit_tokens, in_flight_tokens in ((128, 1), (1, 6), (4, 10)):
+            with self.subTest(unit_tokens=unit_tokens, in_flight_tokens=in_flight_tokens):
+                in_flight_units = div_up(in_flight_tokens, unit_tokens)
+                floor = selected + in_flight_units
+                config = dict(
+                    num_selected_blocks=selected,
+                    unit_tokens=unit_tokens,
+                    sparse_max_in_flight_tokens=in_flight_tokens,
+                )
+                with self.assertRaisesRegex(RuntimeError, "must hold numSelectedBlocks"):
+                    self._manager(floor - 1, **config)
 
+                manager = self._manager(floor, **config)
+                try:
+                    self.assertEqual(
+                        manager.get_sparse_cache_max_in_flight_units(LayerId(0)), in_flight_units
+                    )
+                    cache = manager.create_kv_cache()
+                    try:
+                        self.assertEqual(cache.max_input_length, in_flight_tokens)
+                        with TemporaryCudaStream([]) as stream:
+                            self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
+                            self.assertTrue(cache.resize(in_flight_tokens, 0))
+                            with self.assertRaisesRegex(RuntimeError, "can hold in flight"):
+                                cache.resize(in_flight_tokens + 1, 0)
+                    finally:
+                        cache.close()
+                finally:
+                    manager.shutdown()
+
+        # A bound below one token would admit no step at all.
+        with self.assertRaisesRegex(AssertionError, "sparse_max_in_flight_tokens"):
+            self._manager(max_cached_units=4, sparse_max_in_flight_tokens=0)
+
+        # Without a fetch path nothing is held in flight, so there is no bound to report.
         dense = self._manager(max_cached_units=0)
         try:
+            self.assertEqual(dense.get_sparse_cache_max_in_flight_units(LayerId(0)), 0)
             cache = dense.create_kv_cache()
             try:
-                # None: without a cache to hold in-flight blocks the bound describes nothing.
                 self.assertIsNone(cache.max_input_length)
             finally:
                 cache.close()
@@ -1273,29 +1333,6 @@ class TestSparseCacheReservation(unittest.TestCase):
         manager = self._manager(max_cached_units=0)
         try:
             self.assertEqual(manager.get_sparse_cache_max_units(0), 0)
-        finally:
-            manager.shutdown()
-
-    def test_resize_rejects_more_than_one_token_in_flight(self):
-        """The guard that keeps prefill and speculative decoding out.
-
-        Either would give a request several query tokens in one step, which the fetch
-        cannot serve: it resolves one selection per request, and the units a whole step's
-        worth of query tokens wanted could not all be made resident at once.
-        """
-        manager = self._manager(max_cached_units=4)
-        try:
-            cache = manager.create_kv_cache()
-            try:
-                with TemporaryCudaStream([]) as stream:
-                    self.assertTrue(cache.resume(cast(CudaStream, stream.handle)))
-                    # One token ahead of the watermark: an ordinary decode step.
-                    self.assertTrue(cache.resize(1, 0))
-                    # Two is already a step that writes two tokens.
-                    with self.assertRaisesRegex(RuntimeError, "can hold in flight"):
-                        cache.resize(3, 1)
-            finally:
-                cache.close()
         finally:
             manager.shutdown()
 
@@ -1823,6 +1860,22 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.miss_count, [1])
         self.assertEqual(result.out_slot[1:], [-1, -1])
 
+    def test_a_unit_named_twice_gets_one_entry_and_one_copy(self):
+        """Positions of one selection may name the same unit.
+
+        The selections of several query tokens do, when they are resolved together.
+        """
+        # Unit 11 is resident; units 5 and 7 are not. Every unit is named twice.
+        resident = [11] + self._free(3)
+        selected = [5, 11, 7, 5, 7, 11]
+        result = self._resolve(resident, selected)
+        self.assertEqual(result.miss_count, [2], "each missing unit is copied once")
+        self.assertEqual(result.miss_total, [2])
+        for position, ordinal in enumerate(selected):
+            self.assertEqual(result.resident_ordinal[result.out_slot[position]], ordinal)
+        # Three units in a four-entry cache. An entry per position would need five.
+        self.assertEqual(sorted(result.resident_ordinal), sorted([5, 7, 11, BAD_PAGE_INDEX]))
+
     def test_hits_outrank_units_fetched_this_step(self):
         """Both entries are used this step, and the history flag is what separates them."""
         # Entry 0 holds unit 10 and is selected; unit 99 is new.
@@ -2277,6 +2330,8 @@ class TestSparseFetch(unittest.TestCase):
     TOKENS_PER_BLOCK = 128
     SELECTED = 2
     CACHED_UNITS = 4
+    # A bound of two whole units, which beside a full selection fill CACHED_UNITS exactly.
+    IN_FLIGHT_TOKENS = 2 * TOKENS_PER_BLOCK
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -2290,6 +2345,7 @@ class TestSparseFetch(unittest.TestCase):
         cls,
         roles: tuple[str, ...] = ("key", "value"),
         sizes: dict[str, int] | None = None,
+        sparse_max_in_flight_tokens: int = 1,
     ) -> KVCacheManager:
         return KVCacheManager(
             KVCacheManagerConfig(
@@ -2323,6 +2379,7 @@ class TestSparseFetch(unittest.TestCase):
                         ),
                     )
                 ],
+                sparse_max_in_flight_tokens=sparse_max_in_flight_tokens,
             )
         )
 
@@ -2344,10 +2401,12 @@ class TestSparseFetch(unittest.TestCase):
         rows: int = 2,
         blocks: int = 4,
         sizes: dict[str, int] | None = None,
+        history_blocks: int = 2,
+        sparse_max_in_flight_tokens: int = 1,
     ):
         """A resumed member in row 0 of a two-row batch, with history to select from."""
         torch = self._torch()
-        manager = self._manager(roles, sizes)
+        manager = self._manager(roles, sizes, sparse_max_in_flight_tokens)
         cache = None
         batch = None
         try:
@@ -2362,8 +2421,8 @@ class TestSparseFetch(unittest.TestCase):
                 )
                 cache = manager.create_kv_cache()
                 self.assertTrue(cache.resume(handle))
-                # Two whole blocks of history, so ordinals 0 and 1 are eligible.
-                tokens = 2 * self.TOKENS_PER_BLOCK
+                # Whole blocks of history, so the ordinals below history_blocks are eligible.
+                tokens = history_blocks * self.TOKENS_PER_BLOCK
                 # Seeded before joining: a Batch only accepts a history its row already had
                 # the capacity for, and this one is jumping straight past both.
                 self.assertTrue(cache.resize(tokens, tokens))
@@ -2639,6 +2698,72 @@ class TestSparseFetch(unittest.TestCase):
             after = _introspection.sparse_cache_resident_ordinals(cache, lg_id)
             self.assertIn(0, after, "the selected units are resident afterwards")
             self.assertIn(1, after)
+
+    def test_a_full_selection_at_the_cache_floor_leaves_the_in_flight_cells_alone(self):
+        """A cache of exactly a selection beside the in-flight units serves both in full.
+
+        Every in-flight unit holds a cell, which leaves a full-width selection only the
+        other entries to resolve into. The second selection shares no unit with the first
+        and comes a step later, so it replaces every history entry the first admitted; even
+        then no index it reports may be a cell the model is writing.
+        """
+        roles = ("key", "value")
+        units = list(range(2 * self.SELECTED))
+        with self._fixture(
+            roles,
+            blocks=8,
+            history_blocks=len(units),
+            sparse_max_in_flight_tokens=self.IN_FLIGHT_TOKENS,
+        ) as (torch, manager, batch, _cache, handle):
+            buffers = self._buffers(roles)
+            in_flight_units = manager.get_sparse_cache_max_in_flight_units(LayerId(0))
+            self.assertEqual(
+                self.CACHED_UNITS, self.SELECTED + in_flight_units, "the cache is not at its floor"
+            )
+
+            # Capacity the whole bound ahead of history, so every in-flight unit is present.
+            history = len(units) * self.TOKENS_PER_BLOCK
+            self.assertEqual(
+                batch.resize([history + self.IN_FLIGHT_TOKENS, None], [history, None]),
+                [True, False],
+            )
+            write_shape = (2, len(roles), in_flight_units)
+            write = torch.full(write_shape, 12345, dtype=torch.int32, device="cuda")
+            batch.prepare_sparse_write_indices(buffers, write, handle)
+            torch.cuda.synchronize()
+            held = write[0].tolist()
+            self.assertNotIn(
+                BAD_PAGE_INDEX,
+                [cell for cells in held for cell in cells],
+                f"a unit in flight was given no cell: {held}",
+            )
+
+            for selection in (units[: self.SELECTED], units[self.SELECTED :]):
+                # The list of units to copy is reset by publish, so a selection that misses
+                # in full takes a step of its own.
+                batch.wait_published()
+                batch.publish()
+                selected = torch.tensor(
+                    [selection, [-1] * self.SELECTED], dtype=torch.int32, device="cuda"
+                )
+                out = self._out(torch, 2, len(roles))
+                again = torch.full(write_shape, 12345, dtype=torch.int32, device="cuda")
+                batch.fetch_sparse_pages(buffers, selected, out, handle)
+                batch.prepare_sparse_write_indices(buffers, again, handle)
+                torch.cuda.synchronize()
+
+                for cells, fetched in zip(held, out[0].tolist()):
+                    self.assertNotIn(BAD_PAGE_INDEX, fetched, f"{selection} did not resolve")
+                    self.assertEqual(
+                        len(set(fetched)), self.SELECTED, f"{selection} shares a cell: {fetched}"
+                    )
+                    self.assertTrue(
+                        set(fetched).isdisjoint(cells),
+                        f"{selection} resolved onto an in-flight cell: {fetched} against {cells}",
+                    )
+                self.assertEqual(
+                    again[0].tolist(), held, f"fetching {selection} moved an in-flight cell"
+                )
 
     def test_buffers_must_be_one_whole_layer(self):
         roles = ("key", "value")
@@ -3879,6 +4004,313 @@ class TestSelectionId(unittest.TestCase):
         self._config([0, None])
 
 
+class TestSparseMultiQueryFetch(unittest.TestCase):
+    """A request feeding a step several query tokens: one row, a selection per query.
+
+    The cache sits at its floor throughout, one query's selection beside the units in
+    flight, so every row here is wider than the cache has cells.
+    """
+
+    # Eight tokens to a page, so that eight cached units are whole pages at both unit sizes
+    # used here and the arena holds exactly the cells the configuration names.
+    TOKENS_PER_BLOCK = 8
+    SELECTED = 6
+    IN_FLIGHT_UNITS = 2
+    CACHED_UNITS = SELECTED + IN_FLIGHT_UNITS
+    HISTORY_BLOCKS = 6
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @classmethod
+    @contextlib.contextmanager
+    def _fixture(cls, unit_tokens: int, queries: int):
+        """A request in row 0 of a two-row Batch, with every in-flight unit present.
+
+        Twelve units of history at the coarser unit size and more at the finer, so ordinals
+        below twelve are selectable at both.
+        """
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to pass device arrays")
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=cls.TOKENS_PER_BLOCK,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=256, history_length=0)] * 4)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [BufferConfig("key", 4096, is_sparse=True), BufferConfig("index", 256)],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=cls.SELECTED,
+                            max_cached_units=cls.CACHED_UNITS,
+                            unit_tokens=unit_tokens,
+                        ),
+                    )
+                ],
+                sparse_max_in_flight_tokens=cls.IN_FLIGHT_UNITS * unit_tokens,
+                sparse_queries_per_request=queries,
+            )
+        )
+        cache = None
+        batch = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=2,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_specs(),
+                )
+                cache = manager.create_kv_cache()
+                assert cache.resume(handle)
+                history = cls.HISTORY_BLOCKS * cls.TOKENS_PER_BLOCK
+                assert cache.resize(history, history)
+                batch.add_kv_cache(cache)
+                assert batch.resize([history, None], [history, None]) == [True, False]
+                # Capacity the whole bound ahead of history, so every in-flight unit holds
+                # a cell and the selection has only the rest.
+                capacity = history + cls.IN_FLIGHT_UNITS * unit_tokens
+                assert batch.resize([capacity, None], [history, None]) == [True, False]
+                yield torch, manager, batch, [BufferId(0, "key")], handle
+        finally:
+            if cache is not None:
+                if batch is not None and batch.row_of(cache) is not None:
+                    batch.remove_kv_cache(cache)
+                cache.close()
+            manager.shutdown()
+
+    def test_overlapping_queries_resolve_in_a_cache_narrower_than_their_row(self):
+        """Queries naming the same units share their cells, so the row fits the floor.
+
+        Every position of the row is real, and the queries name one set of units between
+        them, each starting at a different place. A cell per position would take the row's
+        width; the cache has one query's selection beside the units in flight.
+
+        The second row keeps four of the first row's units and names two new ones. Only the
+        two units it dropped can give up a cell, so the new ones must land exactly there.
+        """
+        for unit_tokens, queries in itertools.product((1, 4), (2, 4)):
+            with (
+                self.subTest(unit_tokens=unit_tokens, queries=queries),
+                self._fixture(unit_tokens, queries) as (torch, manager, batch, buffers, handle),
+            ):
+                width = queries * self.SELECTED
+                self.assertEqual(
+                    manager.get_sparse_cache_max_units(LayerId(0)),
+                    self.CACHED_UNITS,
+                    "the cache is not at its floor",
+                )
+                self.assertGreater(width, self.CACHED_UNITS, "the row fits a cell per position")
+
+                write_shape = (2, len(buffers), self.IN_FLIGHT_UNITS)
+                write = torch.full(write_shape, 12345, dtype=torch.int32, device="cuda")
+                batch.prepare_sparse_write_indices(buffers, write, handle)
+                torch.cuda.synchronize()
+                held = write[0, 0].tolist()
+                self.assertNotIn(
+                    BAD_PAGE_INDEX, held, f"a unit in flight was given no cell: {held}"
+                )
+
+                cell_of: dict[int, int] = {}
+                positions = copies = 0
+                for first in (0, 2):
+                    # Query q names units first .. first + SELECTED - 1, starting q places in.
+                    row = [
+                        first + (q + i) % self.SELECTED
+                        for q in range(queries)
+                        for i in range(self.SELECTED)
+                    ]
+                    batch.wait_published()
+                    batch.publish()
+                    selected = torch.tensor([row, [-1] * width], dtype=torch.int32, device="cuda")
+                    out = torch.full(
+                        (2, len(buffers), width), 12345, dtype=torch.int32, device="cuda"
+                    )
+                    again = torch.full(write_shape, 12345, dtype=torch.int32, device="cuda")
+                    batch.fetch_sparse_pages(buffers, selected, out, handle)
+                    batch.prepare_sparse_write_indices(buffers, again, handle)
+                    torch.cuda.synchronize()
+
+                    cells = out[0, 0].tolist()
+                    self.assertNotIn(BAD_PAGE_INDEX, cells, f"{row} did not resolve: {cells}")
+                    resolved = dict(zip(row, cells))
+                    self.assertEqual(
+                        [resolved[unit] for unit in row], cells, "a unit named twice read two cells"
+                    )
+                    self.assertEqual(
+                        len(set(resolved.values())),
+                        self.SELECTED,
+                        f"two units share a cell: {resolved}",
+                    )
+                    self.assertTrue(
+                        set(cells).isdisjoint(held), f"{row} resolved onto an in-flight cell"
+                    )
+                    self.assertEqual(
+                        again[0, 0].tolist(), held, f"fetching {row} moved an in-flight cell"
+                    )
+
+                    kept = set(resolved) & set(cell_of)
+                    self.assertEqual(
+                        {unit: resolved[unit] for unit in kept},
+                        {unit: cell_of[unit] for unit in kept},
+                        "a unit the row still names moved",
+                    )
+                    if cell_of:
+                        self.assertEqual(
+                            {resolved[unit] for unit in set(resolved) - kept},
+                            {cell_of[unit] for unit in set(cell_of) - kept},
+                            "the new units did not take the cells of the dropped ones",
+                        )
+
+                    positions += width
+                    copies += len(set(resolved) - kept)
+                    cell_of = resolved
+                    self.assertEqual(
+                        batch.peek_hit_miss_counter(),
+                        (positions - copies, copies),
+                        "each distinct missing unit is copied once",
+                    )
+
+    def test_a_fetch_takes_the_configured_row_and_no_other_width(self):
+        """The row is one selection for each configured query, whatever the caller holds."""
+        for queries in (1, 2):
+            with (
+                self.subTest(queries=queries),
+                self._fixture(1, queries) as (torch, _manager, batch, buffers, handle),
+            ):
+                for width in (self.SELECTED, 2 * self.SELECTED, 3 * self.SELECTED):
+                    selected = torch.full((2, width), -1, dtype=torch.int32, device="cuda")
+                    out = torch.full(
+                        (2, len(buffers), width), 12345, dtype=torch.int32, device="cuda"
+                    )
+                    if width == queries * self.SELECTED:
+                        batch.fetch_sparse_pages(buffers, selected, out, handle)
+                        continue
+                    with self.assertRaisesRegex(
+                        RuntimeError, "selectionWidth must be the configured row"
+                    ):
+                        batch.fetch_sparse_pages(buffers, selected, out, handle)
+                torch.cuda.synchronize()
+
+    def test_the_peak_use_is_a_rows_distinct_units_beside_the_units_in_flight(self):
+        """A row has in use the units it names, once each, and the units in flight.
+
+        Not its positions: every row here is twenty-four of them. The peak is what tells a
+        cache narrower than the row how close the fetches so far have come to not fitting.
+        """
+        queries = 4
+        width = queries * self.SELECTED
+        layer = LayerId(0)
+        with self._fixture(1, queries) as (torch, _manager, batch, buffers, handle):
+
+            def fetch(*units: int) -> tuple[int, int]:
+                """Fetch a row whose every query names `units`, and read the peak back."""
+                row = [unit for _ in range(queries) for unit in units]
+                row += [-1] * (width - len(row))
+                batch.wait_published()
+                batch.publish()
+                selected = torch.tensor([row, [-1] * width], dtype=torch.int32, device="cuda")
+                out = torch.full((2, len(buffers), width), 12345, dtype=torch.int32, device="cuda")
+                batch.fetch_sparse_pages(buffers, selected, out, handle)
+                torch.cuda.synchronize()
+                return batch.peek_sparse_cache_peak_use(layer)
+
+            self.assertEqual(batch.peek_sparse_cache_peak_use(layer), (0, self.CACHED_UNITS))
+            # Three units, each named by all four queries: twelve positions, three cells.
+            in_use = 3 + self.IN_FLIGHT_UNITS
+            self.assertEqual(fetch(0, 1, 2), (in_use, self.CACHED_UNITS))
+            # The same units again, now resident: a hit takes no further cell.
+            self.assertEqual(fetch(2, 1, 0), (in_use, self.CACHED_UNITS))
+            # Six units fill the cache exactly: the widest row that fits.
+            self.assertEqual(fetch(*range(self.SELECTED)), (self.CACHED_UNITS, self.CACHED_UNITS))
+
+            batch.reset_sparse_cache_peak_use()
+            torch.cuda.synchronize()
+            self.assertEqual(batch.peek_sparse_cache_peak_use(layer), (0, self.CACHED_UNITS))
+            # A peak is of the fetches since the reset, not of what the cache still holds:
+            # the other five units stay resident, and this row names one.
+            self.assertEqual(fetch(0), (1 + self.IN_FLIGHT_UNITS, self.CACHED_UNITS))
+
+    def test_a_row_naming_more_units_than_the_cache_holds_stops_the_process(self):
+        """Queries that share no unit need a cell per position, which the floor does not have.
+
+        No assignment keeps every unit of such a row resident, so the resolve stops the
+        device instead of returning an index nothing backs. That leaves the device unusable
+        to the process, so the fetch runs in one of its own.
+        """
+        try:
+            import torch  # noqa: F401
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to pass device arrays")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import runpy, sys; runpy.run_path(sys.argv[1])['_fetch_a_row_that_does_not_fit']()",
+                os.path.abspath(__file__),
+            ],
+            env=_env_outside_the_mpi_job(),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        output = result.stdout + result.stderr
+        self.assertIn(_FETCH_STOPPED, result.stdout, output)
+        self.assertNotIn(_FETCH_RETURNED, result.stdout, output)
+
+
+_FETCH_STOPPED = "SPARSE_FETCH_STOPPED"
+_FETCH_RETURNED = "SPARSE_FETCH_RETURNED"
+
+
+def _env_outside_the_mpi_job() -> dict[str, str]:
+    """This process's environment without what would join a child to its MPI job.
+
+    Importing the bindings through tensorrt_llm initialises MPI. Under a launcher that makes
+    the child a member of the launcher's job, and a member that exits without finalising
+    takes the job down with it. Without these variables the child initialises alone.
+    """
+    launcher = ("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_", "I_MPI_", "HYDRA_", "MPI_")
+    return {key: value for key, value in os.environ.items() if not key.startswith(launcher)}
+
+
+def _fetch_a_row_that_does_not_fit() -> None:
+    """Fetch two queries that share no unit against a cache at its floor, and say what happened.
+
+    Twelve distinct units against the six cells the units in flight leave. The entry point of
+    a process of its own: once the resolve stops the device nothing here can use it again, so
+    the process leaves without running the destructors that would try.
+    """
+    init_cuda_once()
+    cls = TestSparseMultiQueryFetch
+    queries = 2
+    width = queries * cls.SELECTED
+    with cls._fixture(1, queries) as (torch, _manager, batch, buffers, handle):
+        selected = torch.tensor(
+            [list(range(width)), [-1] * width], dtype=torch.int32, device="cuda"
+        )
+        out = torch.full((2, len(buffers), width), 12345, dtype=torch.int32, device="cuda")
+        try:
+            batch.wait_published()
+            batch.publish()
+            batch.fetch_sparse_pages(buffers, selected, out, handle)
+            torch.cuda.synchronize()
+            cells = out[0, 0].tolist()
+        except RuntimeError as error:
+            print(f"{_FETCH_STOPPED}: {error}", flush=True)
+        else:
+            print(f"{_FETCH_RETURNED}: {cells}", flush=True)
+        os._exit(0)
+
+
 class TestSparseSelectionSharing(unittest.TestCase):
     """What two layers given one selection resolve to.
 
@@ -4255,24 +4687,29 @@ class TestSparseDataPath(unittest.TestCase):
 
 
 class TestSparseWriteIndices(unittest.TestCase):
-    """prepare_sparse_write_indices: the cell the model writes its new unit into.
+    """prepare_sparse_write_indices: the cells the model writes its in-flight units into.
 
-    The unit between the two watermarks has no host page yet, so nothing can be fetched for
-    it; what the model needs is only where to put it. These cover that the reported cell is
-    the one the write-back later reads, that asking twice does not move it, and that a fetch
-    running afterwards leaves it alone.
+    A unit between the two watermarks has no host page yet, so nothing can be fetched for
+    it; what the model needs is only where to put it. These cover that every such unit is
+    given a cell, that the reported cell is the one the write-back later reads, that asking
+    twice does not move it, and that a fetch running afterwards leaves it alone.
     """
 
     TPB = 128
     BUF = 4096
     SELECTED = 2
     CELLS = 4
+    # The bound where a test holds several units in flight. Not a multiple of four, so with
+    # four-token units it spans one unit more than a unit-aligned history can fill.
+    IN_FLIGHT_TOKENS = 10
 
     def setUp(self) -> None:
         init_cuda_once()
 
     @classmethod
-    def _manager(cls) -> KVCacheManager:
+    def _manager(
+        cls, unit_tokens: int = TPB, sparse_max_in_flight_tokens: int = 1
+    ) -> KVCacheManager:
         return KVCacheManager(
             KVCacheManagerConfig(
                 tokens_per_block=cls.TPB,
@@ -4296,11 +4733,13 @@ class TestSparseWriteIndices(unittest.TestCase):
                         ],
                         sparse_cache=SparseCacheConfig(
                             num_selected_blocks=cls.SELECTED,
-                            max_cached_units=cls.CELLS,
-                            unit_tokens=cls.TPB,
+                            # CELLS whole cells per buffer, each a page's worth of units.
+                            max_cached_units=cls.CELLS * (cls.TPB // unit_tokens),
+                            unit_tokens=unit_tokens,
                         ),
                     )
                 ],
+                sparse_max_in_flight_tokens=sparse_max_in_flight_tokens,
             )
         )
 
@@ -4345,10 +4784,10 @@ class TestSparseWriteIndices(unittest.TestCase):
                 self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
                 batch.publish()
 
-                out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                out = torch.full((1, 1, 1), 12345, dtype=torch.int32, device="cuda")
                 batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
                 torch.cuda.synchronize()
-                index = int(out[0][0])
+                index = int(out[0][0][0])
                 self.assertNotEqual(index, BAD_PAGE_INDEX, "a unit is in flight")
 
                 pattern = self._pattern(self.BUF, 41)
@@ -4378,6 +4817,117 @@ class TestSparseWriteIndices(unittest.TestCase):
                 cache.close()
             manager.shutdown()
 
+    def test_every_in_flight_unit_gets_a_cell_written_back_only_once_history_passes_it(self):
+        """Several units in flight: a cell each, and a write-back that stops at the new history.
+
+        The in-flight span starts four tokens short of a block boundary, so at either unit
+        size it reaches into a second host page, and history then advances over only part of
+        it. Every unit's host bytes start as a sentinel, so a write-back that ran to capacity
+        instead of to the new history shows in the units still in flight.
+        """
+        ctypes, cudart, torch = self._deps()
+        history = self.TPB - 4
+        capacity = history + self.IN_FLIGHT_TOKENS
+        advanced = self.TPB + 1
+        for unit_tokens in (1, 4):
+            with self.subTest(unit_tokens=unit_tokens):
+                units_per_page = self.TPB // unit_tokens
+                unit_bytes = self.BUF // units_per_page
+                in_flight = range(history // unit_tokens, capacity // unit_tokens)
+                passed = range(history // unit_tokens, advanced // unit_tokens)
+                self.assertTrue(
+                    0 < len(passed) < len(in_flight), "the advance must split the in-flight span"
+                )
+                manager = self._manager(
+                    unit_tokens=unit_tokens, sparse_max_in_flight_tokens=self.IN_FLIGHT_TOKENS
+                )
+                cache = None
+                try:
+                    lg = manager.get_layer_group_id(0)
+                    pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+                    stride = manager.get_page_stride(LayerId(0), "key")
+                    width = manager.get_sparse_cache_max_in_flight_units(LayerId(0))
+                    cache = manager.create_kv_cache()
+                    with TemporaryCudaStream([]) as stream:
+                        handle = cast(CudaStream, stream.handle)
+                        batch = Batch(
+                            manager,
+                            handle,
+                            max_batch_size=1,
+                            max_blocks_per_seq=8,
+                            index_tables=manager.sparse_index_table_specs(),
+                        )
+                        arena = int(batch.get_sparse_cache_base_address(LayerId(0), "key"))
+                        self.assertTrue(cache.resume(handle))
+                        batch.add_kv_cache(cache)
+                        self.assertTrue(cache.resize(capacity, history))
+                        batch.publish()
+
+                        out = torch.full((1, 1, width), 12345, dtype=torch.int32, device="cuda")
+                        batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
+                        torch.cuda.synchronize()
+                        cells = out[0][0].tolist()
+                        live = cells[: len(in_flight)]
+                        self.assertNotIn(
+                            BAD_PAGE_INDEX, live, f"a unit in flight has no cell: {cells}"
+                        )
+                        self.assertEqual(len(set(live)), len(live), f"units share a cell: {cells}")
+                        # Entry i is unit history_units + i, so the entries past the span name
+                        # units capacity does not reach.
+                        self.assertEqual(
+                            cells[len(in_flight) :],
+                            [BAD_PAGE_INDEX] * (width - len(in_flight)),
+                            f"an entry past the in-flight span names a cell: {cells}",
+                        )
+
+                        # Units are contiguous in a page and in a cell alike, so a unit is
+                        # unit_bytes at its index in either.
+                        pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                        sentinel = b"\xa5" * unit_bytes
+                        host = {}
+                        written = {}
+                        for unit, cell in zip(in_flight, live):
+                            page, unit_in_page = divmod(unit, units_per_page)
+                            host[unit] = pool + pages[page] * stride + unit_in_page * unit_bytes
+                            ctypes.memmove(host[unit], sentinel, unit_bytes)
+                            written[unit] = self._pattern(unit_bytes, unit)
+                            source = (ctypes.c_ubyte * unit_bytes).from_buffer(
+                                bytearray(written[unit])
+                            )
+                            (err,) = cudart.cudaMemcpy(
+                                arena + cell * unit_bytes,
+                                ctypes.addressof(source),
+                                unit_bytes,
+                                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                            )
+                            self.assertEqual(int(err), 0)
+
+                        batch.wait_published()
+                        # The flush is given the history about to be set, and covers the units
+                        # below it. It runs before the move, since a unit must reach its host
+                        # page before it becomes selectable.
+                        batch.flush_sparse_units([advanced])
+                        self.assertTrue(cache.resize(capacity, advanced))
+                        torch.cuda.synchronize()
+
+                        for unit in in_flight:
+                            landed = ctypes.string_at(host[unit], unit_bytes)
+                            if unit in passed:
+                                self.assertEqual(
+                                    landed, written[unit], f"unit {unit} was not written back"
+                                )
+                            else:
+                                self.assertEqual(
+                                    landed,
+                                    sentinel,
+                                    f"unit {unit} is in flight but was written back",
+                                )
+                        batch.remove_kv_cache(cache)
+                finally:
+                    if cache is not None:
+                        cache.close()
+                    manager.shutdown()
+
     def test_preparing_twice_reports_the_same_cell(self):
         """Idempotent while the watermarks hold: the second call must not move the unit."""
         _, _, torch = self._deps()
@@ -4401,10 +4951,10 @@ class TestSparseWriteIndices(unittest.TestCase):
 
                 seen = []
                 for _ in range(3):
-                    out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                    out = torch.full((1, 1, 1), 12345, dtype=torch.int32, device="cuda")
                     batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
                     torch.cuda.synchronize()
-                    seen.append(int(out[0][0]))
+                    seen.append(int(out[0][0][0]))
                 self.assertNotEqual(seen[0], BAD_PAGE_INDEX)
                 self.assertEqual(len(set(seen)), 1, f"the cell moved between calls: {seen}")
                 # Removal returns the lease and discards the GPU cache, so the
@@ -4437,15 +4987,15 @@ class TestSparseWriteIndices(unittest.TestCase):
                 self.assertTrue(cache.resize(self.TPB, self.TPB))
                 batch.publish()
 
-                out = torch.full((2, 1), 12345, dtype=torch.int32, device="cuda")
+                out = torch.full((2, 1, 1), 12345, dtype=torch.int32, device="cuda")
                 batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
                 torch.cuda.synchronize()
                 self.assertEqual(
-                    int(out[0][0]), BAD_PAGE_INDEX, "capacity holds no unit above history"
+                    int(out[0][0][0]), BAD_PAGE_INDEX, "capacity holds no unit above history"
                 )
                 # Written in full: the unoccupied row must be overwritten, not left at 12345.
                 self.assertEqual(
-                    int(out[1][0]), BAD_PAGE_INDEX, "a free row carries no reservation"
+                    int(out[1][0][0]), BAD_PAGE_INDEX, "a free row carries no reservation"
                 )
                 # Removal returns the lease and discards the GPU cache, so the
                 # write-back record has to match the history being given up.
@@ -4457,14 +5007,16 @@ class TestSparseWriteIndices(unittest.TestCase):
             manager.shutdown()
 
     def test_every_buffer_of_a_layer_gets_its_own_cell(self):
-        """Two buffers, and a headroom wider than what is actually in flight.
+        """Two buffers and two units in flight: every unit has its own cell in each buffer.
 
-        The resolve's in-flight array is a row per request of max_cached_units minus the
-        selection width, while at most one unit is ever in flight. Reading it with the wrong
-        row stride writes one buffer's slots over the next buffer's output, which this sees
-        as the second buffer losing its index.
+        A layer's buffers share the entry a unit resolves to but not their cells, so ``out``
+        keeps one row of in-flight units per buffer. Written with the wrong stride between
+        those rows, one buffer's indices would land in the other's row, which this sees as a
+        cell outside the run its buffer owns.
         """
         _, _, torch = self._deps()
+        # A unit is a whole block here, so a bound of two blocks holds two units in flight.
+        in_flight_tokens = 2 * self.TPB
         manager = KVCacheManager(
             KVCacheManagerConfig(
                 tokens_per_block=self.TPB,
@@ -4480,8 +5032,6 @@ class TestSparseWriteIndices(unittest.TestCase):
                                 role,
                                 self.BUF,
                                 is_sparse=True,
-                                # Headroom of CELLS - SELECTED = 2, wider than the one unit
-                                # that can be in flight.
                             )
                             for role in ("key", "value")
                         ]
@@ -4496,6 +5046,7 @@ class TestSparseWriteIndices(unittest.TestCase):
                         ),
                     )
                 ],
+                sparse_max_in_flight_tokens=in_flight_tokens,
             )
         )
         cache = None
@@ -4512,22 +5063,30 @@ class TestSparseWriteIndices(unittest.TestCase):
                 )
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
-                self.assertTrue(cache.resize(self.TPB, self.TPB - 1))
+                # Capacity the whole bound ahead of an empty history: units 0 and 1 in flight.
+                self.assertTrue(cache.resize(in_flight_tokens, 0))
                 batch.publish()
 
-                out = torch.full((1, 2), 12345, dtype=torch.int32, device="cuda")
+                in_flight_units = manager.get_sparse_cache_max_in_flight_units(LayerId(0))
+                out = torch.full((1, 2, in_flight_units), 12345, dtype=torch.int32, device="cuda")
                 batch.prepare_sparse_write_indices(
                     [BufferId(0, "key"), BufferId(0, "value")], out, handle
                 )
                 torch.cuda.synchronize()
-                got = [int(out[0][0]), int(out[0][1])]
-                self.assertNotIn(
-                    BAD_PAGE_INDEX, got, f"both buffers hold the in-flight unit: {got}"
-                )
-                self.assertEqual(len(set(got)), 2, f"buffers must not share a cell: {got}")
+                for buffer, cells in enumerate(out[0].tolist()):
+                    self.assertEqual(
+                        len(set(cells)), in_flight_units, f"units must not share a cell: {cells}"
+                    )
+                    # The two buffers share a pool, where each owns an adjacent run of CELLS
+                    # cells.
+                    self.assertEqual(
+                        [cell // self.CELLS for cell in cells],
+                        [buffer] * in_flight_units,
+                        f"buffer {buffer} reports cells outside its own run: {cells}",
+                    )
                 # Removal returns the lease and discards the GPU cache, so the
                 # write-back record has to match the history being given up.
-                batch.flush_sparse_units([self.TPB - 1])
+                batch.flush_sparse_units([0])
                 batch.remove_kv_cache(cache)
         finally:
             if cache is not None:
@@ -4594,12 +5153,12 @@ class TestSparseWriteIndices(unittest.TestCase):
 
                 indices = []
                 for layer in range(layers):
-                    out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                    out = torch.full((1, 1, 1), 12345, dtype=torch.int32, device="cuda")
                     batch.prepare_sparse_write_indices(
                         [BufferId(LayerId(layer), "key")], out, handle
                     )
                     torch.cuda.synchronize()
-                    indices.append(int(out[0][0]))
+                    indices.append(int(out[0][0][0]))
 
                 self.assertNotIn(BAD_PAGE_INDEX, indices, "every layer has the same unit in flight")
                 self.assertEqual(
@@ -4629,11 +5188,10 @@ class TestSparseWriteIndices(unittest.TestCase):
         that treated its entry as an ordinary miss would copy stale bytes over what the model
         wrote. Removing that guard fails this.
 
-        It does not cover the separate held-entry term in the victim test. Every in-flight
-        ordinal is probed in the resolve's required prefix, so its entry is always classified
-        as matched and never as evictable -- which the victim test already excludes. Dropping
-        the held term leaves every test here passing, so it appears to be redundant with that
-        classification rather than load-bearing.
+        It does not cover the held-entry term in the victim test. The unit here stays between
+        the watermarks, so it is probed in the resolve's required prefix and its entry is
+        classified as matched, which the victim test already excludes. The held term is what
+        keeps an entry whose unit capacity no longer covers, and that unit is not probed.
         """
         ctypes, cudart, torch = self._deps()
         manager = self._manager()
@@ -4655,16 +5213,16 @@ class TestSparseWriteIndices(unittest.TestCase):
                 arena = int(batch.get_sparse_cache_base_address(LayerId(0), "key"))
                 self.assertTrue(cache.resume(handle))
                 batch.add_kv_cache(cache)
-                # resize() bounds capacity - history to one token, so a unit is in flight
-                # only as history reaches a unit boundary: two units of history behind the
+                # This manager bounds capacity - history to one token, so a unit is in flight
+                # only once capacity reaches its end: two units of history behind the
                 # watermark, and unit 2 in flight.
                 self.assertTrue(cache.resize(3 * self.TPB, 3 * self.TPB - 1))
                 batch.publish()
 
-                out = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                out = torch.full((1, 1, 1), 12345, dtype=torch.int32, device="cuda")
                 batch.prepare_sparse_write_indices([BufferId(0, "key")], out, handle)
                 torch.cuda.synchronize()
-                index = int(out[0][0])
+                index = int(out[0][0][0])
                 self.assertNotEqual(index, BAD_PAGE_INDEX)
 
                 written = self._pattern(self.BUF, 53)
@@ -4694,10 +5252,10 @@ class TestSparseWriteIndices(unittest.TestCase):
                 batch.fetch_sparse_pages([BufferId(0, "key")], selected, fetched, handle)
                 torch.cuda.synchronize()
 
-                after = torch.full((1, 1), 12345, dtype=torch.int32, device="cuda")
+                after = torch.full((1, 1, 1), 12345, dtype=torch.int32, device="cuda")
                 batch.prepare_sparse_write_indices([BufferId(0, "key")], after, handle)
                 torch.cuda.synchronize()
-                self.assertEqual(int(after[0][0]), index, "the fetch moved the in-flight cell")
+                self.assertEqual(int(after[0][0][0]), index, "the fetch moved the in-flight cell")
 
                 got = bytearray(self.BUF)
                 sink = (ctypes.c_ubyte * self.BUF).from_buffer(got)
@@ -4934,6 +5492,13 @@ class TestSparseQuantisedDataPath(unittest.TestCase):
 class TestSparseFlush(unittest.TestCase):
     """Writing a unit back to its host page once the watermark passes it."""
 
+    # The shape of the test that drives a Batch. Its units are whole blocks, so the bound
+    # holds two of them in flight.
+    TPB = 128
+    BUF = 4096
+    SELECTED = 2
+    IN_FLIGHT_TOKENS = 2 * TPB
+
     def setUp(self) -> None:
         init_cuda_once()
 
@@ -5040,6 +5605,149 @@ class TestSparseFlush(unittest.TestCase):
         )
         self.assertEqual(result[unit:], [0] * unit, "unit 1 was overwritten from the entry")
         self.assertEqual(result[:unit], cold[:unit], "unit 0 was untouched")
+
+    def test_a_unit_capacity_dropped_keeps_its_cell_and_is_overwritten_in_place(self):
+        """A written unit keeps its cell while capacity does not cover it, and is rewritten there.
+
+        The model writes a unit, capacity then shrinks below it, and once capacity covers it
+        again the model writes it a second time. The second write has to land in the cell the
+        write-back reads, so the unit's entry must neither be given away nor be assigned anew.
+
+        The cache holds exactly a selection beside the in-flight units, and two selections
+        sharing no unit are fetched a step apart while the unit is uncovered. The second has
+        only the first one's entries to evict, each used more recently than the uncovered
+        unit's, so an entry that had become evictable would be the first one taken.
+        """
+        try:
+            import ctypes
+
+            import cuda.bindings.runtime as cudart
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch and the CUDA bindings are needed to address raw memory")
+
+        in_flight_units = self.IN_FLIGHT_TOKENS // self.TPB
+        # History for the two selections, and the whole bound in flight above it.
+        units = list(range(2 * self.SELECTED))
+        history = len(units) * self.TPB
+        full = history + self.IN_FLIGHT_TOKENS
+        dropped = full // self.TPB - 1
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=self.TPB,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 2)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig("key", self.BUF, is_sparse=True),
+                            # A pool group sizes its slots from its device-backed pools.
+                            BufferConfig("index", 256),
+                        ],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=self.SELECTED,
+                            # No entry to spare, so a selection that misses has to evict.
+                            max_cached_units=self.SELECTED + in_flight_units,
+                            unit_tokens=self.TPB,
+                        ),
+                    )
+                ],
+                sparse_max_in_flight_tokens=self.IN_FLIGHT_TOKENS,
+            )
+        )
+        cache = None
+        try:
+            lg = manager.get_layer_group_id(0)
+            pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+            stride = manager.get_page_stride(LayerId(0), "key")
+            buffers = [BufferId(0, "key")]
+            cache = manager.create_kv_cache()
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=1,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_specs(),
+                )
+                arena = int(batch.get_sparse_cache_base_address(LayerId(0), "key"))
+                self.assertTrue(cache.resume(handle))
+                batch.add_kv_cache(cache)
+                self.assertTrue(cache.resize(full, history))
+                batch.publish()
+
+                first = torch.full((1, 1, in_flight_units), 12345, dtype=torch.int32, device="cuda")
+                batch.prepare_sparse_write_indices(buffers, first, handle)
+                torch.cuda.synchronize()
+                cell = int(first[0][0][dropped - history // self.TPB])
+                self.assertNotEqual(cell, BAD_PAGE_INDEX, "the unit is in flight")
+
+                def write(payload: bytes) -> None:
+                    source = (ctypes.c_ubyte * self.BUF).from_buffer(bytearray(payload))
+                    (err,) = cudart.cudaMemcpy(
+                        arena + cell * self.BUF,
+                        ctypes.addressof(source),
+                        self.BUF,
+                        cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                    )
+                    self.assertEqual(int(err), 0)
+
+                stale, fresh = b"\x11" * self.BUF, b"\x22" * self.BUF
+                write(stale)
+
+                # One token short of the unit's end no longer covers it, and history stays
+                # below it.
+                self.assertEqual(list(batch.resize([full - 1], [history])), [1])
+                for selection in (units[: self.SELECTED], units[self.SELECTED :]):
+                    # The list of units to copy is reset by publish, so a selection that
+                    # misses in full takes a step of its own.
+                    batch.wait_published()
+                    batch.publish()
+                    selected = torch.tensor([selection], dtype=torch.int32, device="cuda")
+                    fetched = torch.full(
+                        (1, 1, self.SELECTED), 12345, dtype=torch.int32, device="cuda"
+                    )
+                    batch.fetch_sparse_pages(buffers, selected, fetched, handle)
+                    torch.cuda.synchronize()
+                    self.assertEqual(
+                        _introspection.sparse_cache_resident_ordinals(cache, lg).count(dropped),
+                        1,
+                        f"fetching {selection} took the entry of the unit capacity dropped",
+                    )
+
+                self.assertEqual(list(batch.resize([full], [history])), [1])
+                again = torch.full((1, 1, in_flight_units), 12345, dtype=torch.int32, device="cuda")
+                batch.prepare_sparse_write_indices(buffers, again, handle)
+                torch.cuda.synchronize()
+                self.assertEqual(
+                    again.tolist(), first.tolist(), "a unit covered again must return to its cell"
+                )
+                self.assertEqual(
+                    _introspection.sparse_cache_resident_ordinals(cache, lg).count(dropped),
+                    1,
+                    "covering the unit again gave it a second entry",
+                )
+                write(fresh)
+
+                batch.wait_published()
+                # History passes the unit, so its cell is written back. The flush runs before
+                # the move, since a unit must reach its host page before it becomes selectable.
+                batch.flush_sparse_units([full])
+                self.assertTrue(cache.resize(full, full))
+                torch.cuda.synchronize()
+
+                pages = [int(x) for x in cache.get_base_page_indices(lg)]
+                landed = ctypes.string_at(pool + pages[dropped] * stride, self.BUF)
+                self.assertEqual(landed, fresh, "the page did not receive the rewritten bytes")
+                batch.remove_kv_cache(cache)
+        finally:
+            if cache is not None:
+                cache.close()
+            manager.shutdown()
 
 
 class TestBatch(unittest.TestCase):

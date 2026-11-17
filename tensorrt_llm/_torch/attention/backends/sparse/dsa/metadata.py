@@ -456,6 +456,9 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             layers,
             max_batch_size=batch,
             topk=self.sparse_mla_topk,
+            max_in_flight_units=manager._sparse_offload_max_in_flight_units(
+                manager.impl.init_config
+            ),
             nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
         )
         self.sparse_latent_block_offsets = allocate(

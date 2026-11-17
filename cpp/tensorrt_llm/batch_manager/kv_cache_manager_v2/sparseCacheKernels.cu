@@ -40,7 +40,8 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 namespace
 {
 
-//! Enforce a precondition that correct use cannot violate. A debug build names the condition.
+//! Stop the device when a condition a kernel cannot proceed without does not hold. A debug
+//! build names the condition.
 #define KVCM2_SPARSE_REQUIRE(cond)                                                                                     \
     do                                                                                                                 \
     {                                                                                                                  \
@@ -99,7 +100,7 @@ struct SmemLayout
     size_t table = 0;
     size_t entry = 0;
     size_t flag = 0;
-    size_t missIdx = 0;
+    size_t missPosition = 0;
     size_t missOrd = 0;
     size_t hist = 0;
     size_t total = 0;
@@ -117,7 +118,7 @@ __host__ __device__ inline SmemLayout smemLayout(int32_t tableSize, int32_t entr
     offset = alignUp16(offset + sizeof(uint32_t) * static_cast<size_t>(entries));
     layout.flag = offset;
     offset = alignUp16(offset + sizeof(uint8_t) * static_cast<size_t>(entries));
-    layout.missIdx = offset;
+    layout.missPosition = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
     layout.missOrd = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
@@ -171,9 +172,14 @@ __device__ inline uint32_t slotOf(int32_t key, uint32_t mask) noexcept
 //! neither field reaches its own maximum.
 constexpr uint32_t kTableSlotBits = SparseCacheConfig::kProbeSlotBits;
 constexpr uint32_t kTableSlotMask = (1U << kTableSlotBits) - 1U;
+//! The slot of a keyed ordinal that is not resident and whose miss one thread has taken on.
+//! The largest entry index is two below kTableSlotMask, so no entry is named by it.
+constexpr uint32_t kTableSlotClaimed = kTableSlotMask - 1U;
 constexpr uint32_t kTableEmpty = 0xFFFFFFFFU;
 constexpr int32_t kMaxTableOrdinal = SparseCacheConfig::kMaxUnitOrdinal;
 constexpr int32_t kMaxTableSlot = SparseCacheConfig::kMaxCacheEntries;
+static_assert(static_cast<uint32_t>(kMaxTableSlot) <= kTableSlotClaimed,
+    "An entry index must stay below the slot values the probe index reserves");
 
 //! The resolve's open-addressed probe index, one word per position.
 //!
@@ -181,9 +187,11 @@ constexpr int32_t kMaxTableSlot = SparseCacheConfig::kMaxCacheEntries;
 //! per probe step, and the publish pass walks the whole resident set: halving the bytes a
 //! position takes halves the traffic and leaves twice the index in one cache line.
 //!
-//! Insert races; publish and lookup do not, because they run between syncs that separate
-//! them from the inserts. A position is written once by insert and at most once by publish,
-//! each by the single thread owning the ordinal.
+//! Insert races, and so does claimMiss, which is why both are compare-and-swaps. publish,
+//! setSlot and lookup run between syncs that separate them from the inserts; a lookup may
+//! run beside claimMiss, which only moves a position between two values that both read as
+//! "not resident". A position is written once by insert, and its slot at most once by
+//! publish or setSlot, each by the single thread owning the entry.
 struct QueryTable
 {
     uint32_t* word;
@@ -246,7 +254,28 @@ struct QueryTable
             return kNoSparseSlot;
         }
         uint32_t const slot = current & kTableSlotMask;
-        return slot == kTableSlotMask ? kNoSparseSlot : static_cast<int32_t>(slot);
+        return slot >= kTableSlotClaimed ? kNoSparseSlot : static_cast<int32_t>(slot);
+    }
+
+    //! Take on the miss of `ordinal`, which must be keyed. True for the one caller that gets
+    //! it, when no entry holds the ordinal; `position` is then where setSlot() names the
+    //! entry given to it. False when an entry holds the ordinal or another caller took the
+    //! miss, so however many positions of a selection name a unit, one of them resolves it.
+    __device__ bool claimMiss(int32_t ordinal, uint32_t mask, uint32_t& position) const
+    {
+        uint32_t const keyed = static_cast<uint32_t>(ordinal) << kTableSlotBits;
+        if (find(ordinal, mask, position) != (keyed | kTableSlotMask))
+        {
+            return false;
+        }
+        return atomicCAS(&word[position], keyed | kTableSlotMask, keyed | kTableSlotClaimed)
+            == (keyed | kTableSlotMask);
+    }
+
+    //! Name `slot` as the entry holding `ordinal`, at the position claimMiss() returned.
+    __device__ void setSlot(uint32_t position, int32_t ordinal, int32_t slot) const
+    {
+        word[position] = (static_cast<uint32_t>(ordinal) << kTableSlotBits) | static_cast<uint32_t>(slot);
     }
 };
 
@@ -381,7 +410,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     QueryTable const table(smem + layout.table);
     auto* entryCache = reinterpret_cast<uint32_t*>(smem + layout.entry);
     auto* flag = reinterpret_cast<uint8_t*>(smem + layout.flag);
-    auto* missIdx = reinterpret_cast<int32_t*>(smem + layout.missIdx);
+    auto* missPosition = reinterpret_cast<int32_t*>(smem + layout.missPosition);
     auto* missOrd = reinterpret_cast<int32_t*>(smem + layout.missOrd);
     auto* hist = reinterpret_cast<int32_t*>(smem + layout.hist);
 
@@ -481,8 +510,10 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     }
     __syncthreads();
 
-    // Probe once per required unit. A hit resolves immediately; a miss is recorded against
-    // its position in the virtual list and resolved once a victim is chosen.
+    // Probe once per required unit. A hit resolves immediately. A miss is taken on by one of
+    // the positions naming the unit, recorded against the unit's place in the index, and
+    // resolved once a victim is chosen; every position that missed reads the entry back from
+    // the index afterwards. So a unit named by several positions gets one entry and one copy.
     int32_t resolvedMine = 0;
     for (int32_t i = tid; i < required; i += kResolveThreads)
     {
@@ -494,15 +525,13 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         }
         resolvedMine += i < inFlight ? 0 : 1;
         int32_t const slot = table.lookup(ord, mask);
-        if (slot != kNoSparseSlot)
-        {
-            (i < inFlight ? inFlightSlot[i] : outSlot[i - inFlight]) = slot;
-        }
-        else
+        (i < inFlight ? inFlightSlot[i] : outSlot[i - inFlight]) = slot;
+        uint32_t position = 0;
+        if (slot == kNoSparseSlot && table.claimMiss(ord, mask, position))
         {
             int32_t const j = atomicAdd(&numMiss, 1);
             missOrd[j] = ord;
-            missIdx[j] = i;
+            missPosition[j] = static_cast<int32_t>(position);
         }
     }
     if (resolvedMine > 0)
@@ -551,10 +580,19 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
             thresholdStaleness = kStalest - tid;
             neededAtThreshold = numMiss - before;
         }
+        // The last bucket's running total is every entry the step may give away. The row
+        // has the rest of the cache in use, and the entries its misses take.
+        if (tid == kAgeBuckets - 1 && args.peakUse != nullptr)
+        {
+            atomicMax(args.peakUse, entries - inclusive + numMiss);
+        }
     }
     __syncthreads();
-    // The reservation covers a full selection plus every in-flight unit, and the in-flight
-    // ones are resolved first, so there is always a cell for each remaining miss.
+    // A row may name more distinct units than the cache has cells to give them. The
+    // reservation covers one query's selection beside every in-flight unit, and how far the
+    // queries of a request overlap is the request's content. With more misses than entries
+    // to evict, no assignment keeps every named unit resident, so the step stops here
+    // instead of returning a slot nothing backs.
     KVCM2_SPARSE_REQUIRE(numMiss == 0 || thresholdStaleness < kAgeBuckets);
 
     // Give the misses the stalest entries. Everything staler than the threshold goes; the
@@ -585,9 +623,8 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         }
         int32_t const j = atomicAdd(&victimCounter, 1);
         int32_t const ordinal = missOrd[j];
-        int32_t const position = missIdx[j];
         entry[s] = SparseEntry::pack(SparseEntry::usedByte(stepAge, false), static_cast<uint32_t>(ordinal));
-        (position < inFlight ? inFlightSlot[position] : outSlot[position - inFlight]) = s;
+        table.setSlot(static_cast<uint32_t>(missPosition[j]), ordinal, s);
         // Only history has anything to fetch. An in-flight unit's host page is not
         // written until the watermark passes it, so copying from it would read stale
         // bytes over the data the model is about to write.
@@ -601,8 +638,28 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     }
     __syncthreads();
 
-    // The work list and the entry indices are final, so a copy may start.
+    // The work list is final, so a copy may start.
     gridDependencyRelease();
+
+    // Every missed unit now has its entry named in the index. The positions that missed
+    // read it back, which is all of them that name the unit, not only the one that took
+    // the miss on.
+    if (numMiss > 0)
+    {
+        for (int32_t i = tid; i < required; i += kResolveThreads)
+        {
+            int32_t const ord = i < inFlight ? historyUnits + i : selected[i - inFlight];
+            if (ord < 0)
+            {
+                continue;
+            }
+            int32_t& slot = i < inFlight ? inFlightSlot[i] : outSlot[i - inFlight];
+            if (slot == kNoSparseSlot)
+            {
+                slot = table.lookup(ord, mask);
+            }
+        }
+    }
 
     if (tid == 0)
     {
@@ -744,15 +801,13 @@ __global__ __launch_bounds__(kThreads) void sparseOutIndexKernel(SparseOutIndexA
     SparseLeaseIndex const lease = args.leases[row];
     bool const reserved = lease != kNoSparseLease;
     auto const base = static_cast<ptrdiff_t>(row) * args.selectionWidth;
-    int32_t const slotStride = args.outSlotStride > 0 ? args.outSlotStride : args.selectionWidth;
-    auto const slotBase = static_cast<ptrdiff_t>(row) * slotStride;
 
     // Every slot is written, so a stale index from a previous step can never be read back.
     // One pass does it, because the output is the selection's own shape: a padded slot and
     // an unreserved row both just take the sentinel here rather than needing a prior fill.
     for (int32_t i = static_cast<int32_t>(threadIdx.x); i < args.selectionWidth; i += kThreads)
     {
-        int32_t const slot = reserved ? args.outSlot[slotBase + i] : kNoSparseSlot;
+        int32_t const slot = reserved ? args.outSlot[base + i] : kNoSparseSlot;
         // Without a selection array the slot alone says whether the entry is live, which is
         // what the write-index path passes: its in-flight list is already self-describing.
         if ((args.selected != nullptr && args.selected[base + i] < 0) || slot < 0)
@@ -887,9 +942,6 @@ void launchSparseOutIndices(SparseOutIndexArgs const& args, CUstream stream)
         "launchSparseOutIndices: the cell geometry must be positive");
     TLLM_CHECK_WITH_INFO(args.outBase >= 0 && args.outBase + args.numBuffers <= args.outBuffers,
         "launchSparseOutIndices: this call's buffers must fit the output row");
-    TLLM_CHECK_WITH_INFO(
-        args.outSlotStride >= 0 && (args.outSlotStride == 0 || args.outSlotStride >= args.selectionWidth),
-        "launchSparseOutIndices: the slot stride must cover what this call reads");
 
     dim3 const grid(static_cast<unsigned>(args.numBuffers), static_cast<unsigned>(args.numRows));
     sparseOutIndexKernel<<<grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
@@ -1086,7 +1138,8 @@ size_t checkedSparseResolveSharedBytes(int32_t entriesPerSelection, int32_t sele
     TLLM_CHECK_WITH_INFO(shared <= static_cast<size_t>(limit),
         "Sparse resolve: the cache needs " + std::to_string(shared)
             + " bytes of shared memory, above this device's limit of " + std::to_string(limit)
-            + "; reduce max_cached_units or num_selected_blocks, or raise the selection unit size");
+            + "; reduce max_cached_units, num_selected_blocks or sparse_queries_per_request, or raise the "
+              "selection unit size");
     return shared;
 }
 

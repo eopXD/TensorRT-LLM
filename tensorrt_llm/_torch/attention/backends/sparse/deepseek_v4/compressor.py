@@ -208,9 +208,10 @@ class Compressor(nn.Module):
             # Native write rows are by Batch row; the scatter addresses requests
             # by input position.
             # At the slot: coinciding buffers are resolved once into one slice.
+            # Entry 0 is the unit at the history watermark, the one this step writes.
             data_slot = sparse_state.out_slots[self.layer_idx][descriptor.data_buffer_index]
             sparse_write_indices = gather_sparse_batch_rows(
-                writes[:, data_slot], sparse_state.batch_rows[:bsz]
+                writes[:, data_slot, 0], sparse_state.batch_rows[:bsz]
             )
             kv_cache, kv_cache_scale = metadata.kv_cache_manager.get_sparse_compress_buffers(
                 self.layer_idx

@@ -16,6 +16,7 @@
  */
 
 #include "kvCacheManagerV2TestUtils.h"
+#include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/lifeCycleRegistry.h"
 #include "kv_cache_manager_v2/storage/config.h"
 
@@ -37,6 +38,9 @@ using namespace tensorrt_llm::batch_manager::kv_cache_manager_v2;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeReplayRegionConfig;
 using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeTieredConfig;
+
+//! The in-flight bound of a step that writes one token per request and keeps it.
+constexpr int kMaxInFlightTokens = 1;
 
 AttentionLayerConfig makeAttentionLayer(LayerId layerId, bool isSparse, size_t bufferSize = 4096)
 {
@@ -73,10 +77,72 @@ TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityRespectsProbeLimitAfterPageR
         SCOPED_TRACE(boundary.unitTokens);
         SparseCacheConfig cache{
             .numSelectedBlocks = 2, .maxCachedUnits = boundary.maxCachedUnits, .unitTokens = boundary.unitTokens};
-        EXPECT_NO_THROW(cache.validate(kTokensPerBlock));
+        EXPECT_NO_THROW(cache.validate(kTokensPerBlock, kMaxInFlightTokens));
         ++cache.maxCachedUnits;
-        EXPECT_THROW(cache.validate(kTokensPerBlock), std::runtime_error);
+        EXPECT_THROW(cache.validate(kTokensPerBlock, kMaxInFlightTokens), std::runtime_error);
     }
+}
+
+TEST(KvCacheManagerV2ConfigTest, SparseCacheHoldsASelectionBesideTheInFlightUnits)
+{
+    constexpr int kTokensPerBlock = 128;
+    constexpr int kSelected = 2;
+
+    struct Bound
+    {
+        int unitTokens;
+        int maxInFlightTokens;
+        int inFlightUnits;
+    };
+
+    // Both watermarks round down to units, so a gap of t tokens spans ceil(t / unitTokens).
+    constexpr Bound kBounds[] = {{1, 1, 1}, {1, 6, 6}, {4, 1, 1}, {4, 4, 1}, {4, 5, 2}, {4, 10, 3}, {128, 10, 1}};
+    for (auto const& bound : kBounds)
+    {
+        SCOPED_TRACE(bound.unitTokens);
+        SCOPED_TRACE(bound.maxInFlightTokens);
+        SparseCacheConfig cache{.numSelectedBlocks = kSelected,
+            .maxCachedUnits = kSelected + bound.inFlightUnits,
+            .unitTokens = bound.unitTokens};
+        EXPECT_EQ(cache.maxInFlightUnits(bound.maxInFlightTokens), bound.inFlightUnits);
+        EXPECT_NO_THROW(cache.validate(kTokensPerBlock, bound.maxInFlightTokens));
+        --cache.maxCachedUnits;
+        EXPECT_THROW(cache.validate(kTokensPerBlock, bound.maxInFlightTokens), std::runtime_error);
+    }
+
+    auto config = makeConfig();
+    config.sparseMaxInFlightTokens = 0;
+    EXPECT_THROW(config.validate(), AssertionError);
+}
+
+TEST(KvCacheManagerV2ConfigTest, SparseCacheFloorIsOneQuerysSelectionHoweverWideTheRow)
+{
+    auto config = makeConfig();
+    config.tokensPerBlock = 128;
+    auto layer = makeAttentionLayer(0, true);
+    layer.buffers.push_back(BufferConfig{.role = "index", .size = 256});
+    // Two selected units beside the one unit a token in flight spans: the floor for one query.
+    layer.sparseCache = SparseCacheConfig{.numSelectedBlocks = 2, .maxCachedUnits = 3, .unitTokens = 128};
+    config.layers = {layer};
+    for (int const queries : {1, 2, 8})
+    {
+        SCOPED_TRACE(queries);
+        config.sparseQueriesPerRequest = queries;
+        EXPECT_NO_THROW(config.validate());
+    }
+
+    // A request feeds a step at least one query token.
+    config.sparseQueriesPerRequest = 0;
+    EXPECT_THROW(config.validate(), AssertionError);
+
+    // Every position names a unit ordinal, so a row longer than the ordinals there are could
+    // hold nothing but repeats.
+    config.sparseQueriesPerRequest = (SparseCacheConfig::kMaxUnitOrdinal + 1) / 2;
+    EXPECT_NO_THROW(config.validate());
+    ++config.sparseQueriesPerRequest;
+    EXPECT_THROW(config.validate(), AssertionError);
+    config.sparseQueriesPerRequest = std::numeric_limits<int>::max();
+    EXPECT_THROW(config.validate(), AssertionError);
 }
 
 TEST(KvCacheManagerV2ConfigTest, OversizedSparseCacheFailsManagerConfigValidation)
@@ -107,14 +173,14 @@ TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityValidationHandlesLargeInputs
     constexpr int kTokensPerBlock = 128;
     SparseCacheConfig const cache{
         .numSelectedBlocks = 2, .maxCachedUnits = std::numeric_limits<int>::max(), .unitTokens = 1};
-    EXPECT_THROW(cache.validate(kTokensPerBlock), std::runtime_error);
+    EXPECT_THROW(cache.validate(kTokensPerBlock, kMaxInFlightTokens), std::runtime_error);
 }
 
 TEST(KvCacheManagerV2ConfigTest, SparseCacheCapacityValidationRejectsNonPositivePageSize)
 {
     SparseCacheConfig const cache{.numSelectedBlocks = 2, .maxCachedUnits = 4, .unitTokens = 1};
-    EXPECT_THROW(cache.validate(0), std::runtime_error);
-    EXPECT_THROW(cache.validate(-1), std::runtime_error);
+    EXPECT_THROW(cache.validate(0, kMaxInFlightTokens), std::runtime_error);
+    EXPECT_THROW(cache.validate(-1, kMaxInFlightTokens), std::runtime_error);
 }
 
 TEST(KvCacheManagerV2ConfigTest, OneLayerMayMixSparseAndDenseBuffers)

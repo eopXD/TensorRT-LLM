@@ -836,6 +836,7 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
                 unit_tokens=DSA_SPARSE_UNIT_TOKENS,
                 tokens_per_block=self.tokens_per_block,
                 gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
+                max_in_flight_tokens=config.sparse_max_in_flight_tokens,
                 selection_id=selection_id(local_layer_idx),
             )
 

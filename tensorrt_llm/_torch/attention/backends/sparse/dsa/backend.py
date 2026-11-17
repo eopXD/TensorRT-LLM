@@ -365,7 +365,8 @@ class DSATrtllmAttention(TrtllmAttention):
             kv_lengths,
             state.history_lengths,
             fetched[:, data_slot, :],
-            state.write_indices[len(descriptor.buffer_ids)][:, data_slot],
+            # Entry 0 is the unit at the history watermark, the one this step writes.
+            state.write_indices[len(descriptor.buffer_ids)][:, data_slot, 0],
             metadata.sparse_offload_attn_indices[:num_tokens],
             unit_tokens=descriptor.unit_tokens,
             coverage=state.coverage,
@@ -457,9 +458,10 @@ class DSATrtllmAttention(TrtllmAttention):
         write_indices = manager.prepare_sparse_write_indices(state, layer_idx)
         descriptor = state.layers[layer_idx]
         # At the slot: the write resolves coinciding buffers once, as the fetch does.
+        # Entry 0 is the unit at the history watermark, the one this step writes.
         data_slot = state.out_slots[layer_idx][descriptor.data_buffer_index]
         write_rows = gather_sparse_batch_rows(
-            write_indices[:, data_slot],
+            write_indices[:, data_slot, 0],
             state.batch_rows,
             out=metadata.sparse_latent_block_offsets[0, :, 0, 0],
         )

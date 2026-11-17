@@ -472,12 +472,10 @@ SharedPtr<Page> KvCache::_page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycl
 
 std::optional<int> KvCache::maxInputLength() const
 {
-    // One token, not the reservation's spare width. A sparse request contributes exactly one
-    // query token per step, because the fetch resolves one selection per request while an
-    // attention kernel indexes its selection per query token; the two agree only at one
-    // token each. Prefill and speculative decoding break that and are out of scope, so the
-    // bound is a property of the supported shape rather than of how wide a cache is.
-    return mManager->hasSparseCache() ? std::optional<int>{1} : std::nullopt;
+    // The configured bound, not the reservation's spare width. Every sparse cache is checked
+    // at configuration to hold a full selection beside the units this many tokens span, so a
+    // gap within it always finds a cell for each unit in flight, however wide a cache is.
+    return mManager->hasSparseCache() ? std::optional<int>{mManager->config().sparseMaxInFlightTokens} : std::nullopt;
 }
 
 void KvCache::activate()

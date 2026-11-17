@@ -350,7 +350,7 @@ class BufferConfig:
     Device residency is a lease on the life cycle's arena owned by a :class:`Batch`.
     Each Batch row has one lease, held by its seated request. Both the unit being written
     and the selected history occupy cells in it. The selection is below the watermark;
-    the single unit in flight is above it and cannot be evicted.
+    the units in flight are at or above it and cannot be evicted.
 
     A lease holds contiguous runs of buffer-sized cells, addressed by arithmetic from
     the buffer and entry index. :meth:`Batch.fetch_sparse_pages` fills selected units.
@@ -412,7 +412,11 @@ class SparseCacheConfig:
         ...
 
     num_selected_blocks: int
-    """Selection width: units a sparse-attention step selects for this layer."""
+    """Units one query token selects for this layer.
+
+    A request's selection row is this many positions for each query token it may feed a
+    step; see :attr:`KVCacheManagerConfig.sparse_queries_per_request`.
+    """
 
     max_cached_units: int
     """Cells one buffer gets in a request's GPU cache, counting both populations: the
@@ -601,6 +605,26 @@ class KVCacheManagerConfig:
     # Typical step that sizes the cold (host / disk) tiers' pool groups. None keeps the hot tier's
     # per-layer-group slot-count proportions at cold page sizes.
     cold_typical_step: BatchDesc | None = None
+    # Tokens a request with a sparse fetch path may hold between ``history_length`` and
+    # ``capacity``. Those tokens are in flight: a unit they complete has no host copy until
+    # history passes it, so its GPU cache cell is pinned until then, and every layer's
+    # ``sparse_cache`` must hold the units this many tokens span beside a full selection.
+    #
+    # One is a step that writes a single token per request and keeps it. A step that writes
+    # several tokens and keeps a prefix of them needs the widest gap a request reaches
+    # between one history advance and the next.
+    sparse_max_in_flight_tokens: int = 1
+    # Query tokens a request with a sparse fetch path may feed one step. A fetch takes one
+    # selection row per request, this many selections of ``num_selected_blocks`` back to
+    # back, and resolves the row as one list, so every unit the request's queries name is
+    # resident together.
+    #
+    # A cache must hold one query's selection beside the in-flight units, not the whole row:
+    # the queries of a request select overlapping history, and a unit they share takes one
+    # cell. A row whose distinct units outnumber the cells the cache can give them cannot be
+    # resolved, and the step that fetches it is fatal to the process. A cache of this many
+    # selections beside the in-flight units holds every row.
+    sparse_queries_per_request: int = 1
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 
@@ -872,17 +896,11 @@ class _KVCache:
         in-flight blocks describes nothing without a cache to hold them. :meth:`resize`
         rejects a gap wider than this.
 
-        **One token**, and read-only, because it is a consequence of the supported shape
-        rather than of how wide a cache is. A sparse request contributes exactly one query
-        token per step: :meth:`Batch.fetch_sparse_pages` resolves one selection
-        per request, while an attention kernel indexes its selection per query token, and
-        the two agree only at one token each. Prefill and speculative decoding give a
-        request several query tokens per step and are out of scope; this bound is the guard
-        that keeps them out.
-
-        It follows that at most one unit is ever in flight, so essentially all of
-        :attr:`SparseCacheConfig.max_cached_units` is available to the selection rather than
-        being reserved as headroom.
+        :attr:`KVCacheManagerConfig.sparse_max_in_flight_tokens`, and read-only. Every
+        :attr:`SparseCacheConfig.max_cached_units` is checked at configuration to hold a full
+        selection beside the units that many tokens span
+        (:meth:`KVCacheManager.get_sparse_cache_max_in_flight_units`), so a gap within the
+        bound always finds a cell for each unit in flight, however wide a cache is.
         """
 
     @property
@@ -1134,8 +1152,7 @@ class Batch:
         sizes the write-back's work list: a row advancing ``t`` tokens crosses at most
         ``t / unit_tokens + 1`` units, so the batch crosses at most
         ``max_total_input_tokens / unit_tokens + max_batch_size`` of them. Left unset it
-        assumes a decode step, where each row advances one token and so crosses at most
-        one unit boundary.
+        assumes a decode step, where a row's history crosses only units that were in flight.
 
         ``stream`` is the stream every member runs on. A batch owns it rather than taking
         one per call: a member's own work and the batch's transfers have to be ordered
@@ -1323,6 +1340,26 @@ class Batch:
     def reset_hit_miss_counter(self) -> None:
         """Zero the cumulative pair, enqueued on the Batch's stream."""
 
+    def peek_sparse_cache_peak_use(self, layer_id: LayerId) -> tuple[int, int]:
+        """``(peak, cells)`` for the layer's sparse cache, since build or the last reset.
+
+        ``peak`` is the most cells one request had in use after a fetch: the cells holding
+        units its row named, the cells pinned in flight and the cells its misses took.
+        ``cells`` is what the cache has. A row needing more than ``cells`` cannot be
+        resolved and is fatal to the process, so the gap between the two is the room the
+        fetches so far have left. A cache narrower than
+        :attr:`KVCacheManagerConfig.sparse_queries_per_request` selections is judged by
+        it, since whether a row fits there depends on how far the request's queries
+        overlap.
+
+        Shared by the layers of one layer group, whose caches are one size. ``(0, 0)`` when
+        the layer has no sparse fetch path. Reads the way :meth:`peek_hit_miss_counter`
+        does, so the peak may be a few launches stale.
+        """
+
+    def reset_sparse_cache_peak_use(self) -> None:
+        """Zero every layer group's peak, enqueued on the Batch's stream."""
+
     @property
     def sparse_arena_bytes(self) -> int:
         """Device bytes every life cycle's sparse arena holds, ``0`` without sparse offload.
@@ -1428,15 +1465,15 @@ class Batch:
     def prepare_sparse_write_indices(
         self,
         buffers: Sequence[BufferId],
-        out: DeviceArray,  # int32[batch, len(buffers)]
+        out: DeviceArray,  # int32[batch, len(buffers), max in-flight units]
         stream: CudaStream | None = None,
     ) -> None:
-        """Give each request's in-flight unit a cell, and report where to write it.
+        """Give every in-flight unit of each request a cell, and report where to write it.
 
-        The unit between the two watermarks is the one the model is about to produce. It
-        has no host copy yet -- a unit reaches its page only when :meth:`_KVCache.resize`
-        carries the watermark past it -- so nothing is fetched here. The call assigns a
-        cell and leaves its bytes to the model; reading one before the model writes it
+        The units between the two watermarks are the ones the model is producing. They
+        have no host copy yet -- a unit reaches its page only when :meth:`_KVCache.resize`
+        carries the watermark past it -- so nothing is fetched here. The call assigns
+        cells and leaves their bytes to the model; reading one before the model writes it
         yields whatever the cell last held.
 
         Separate from :meth:`fetch_sparse_pages` because the orders differ. A fetch needs
@@ -1444,12 +1481,14 @@ class Batch:
         needs only the watermarks. So this can run first, which is the order the model
         requires, and it needs no top-k.
 
-        Idempotent while the watermarks and the reservation hold. The resolve probes
-        residency before taking a victim, so a later call -- including the one inside
-        :meth:`fetch_sparse_pages` -- finds the entry and reuses it rather than assigning a
-        second. The entry is pinned for as long as its unit is in flight, so no fetch can
-        evict it, and a fetch never copies over it: a unit at or above the watermark has no
-        written-back host page, so there is nothing it could be refilled from.
+        Idempotent while the reservation holds. The resolve probes residency before taking
+        a victim, so a later call -- including the one inside :meth:`fetch_sparse_pages` --
+        finds a unit's entry and reuses it rather than assigning a second. An entry is
+        pinned from the call that assigns it until history passes its unit, whether or not
+        capacity still covers the unit in between. So no fetch can evict it, a unit that
+        capacity drops and later covers again is reported at the same cell, and a fetch
+        never copies over it: a unit at or above the watermark has no written-back host
+        page, so there is nothing it could be refilled from.
 
         The Batch's published rows own the arena leases; each seated cache uses its row's
         lease until it leaves the Batch.
@@ -1457,14 +1496,16 @@ class Batch:
         Args:
             buffers: exactly one layer's sparse buffers, in the cache's order -- the same
                 rule and the same order as :meth:`fetch_sparse_pages`.
-            out: int32 ``[batch.max_batch_size, len(buffers)]``. ``out[b][s]`` is the index
-                of the in-flight unit's cell, and ``BAD_PAGE_INDEX`` where the row holds no
-                reservation or has nothing in flight. ``s`` is the buffer's output slice
-                from :meth:`sparse_out_slots`, the same assignment a fetch uses: buffers
-                that share a slice are written once, and unused slices are left untouched.
-                One entry per request, not per query token: :meth:`_KVCache.resize`
-                bounds ``capacity - history_length`` to a single token, so at most one unit
-                is ever in flight.
+            out: int32 ``[batch.max_batch_size, len(buffers), units]``, where ``units`` is
+                :meth:`KVCacheManager.get_sparse_cache_max_in_flight_units` for the layer.
+                ``out[b][s][i]`` is the index of the cell of unit ``history_units + i``, and
+                ``BAD_PAGE_INDEX`` where the row holds no reservation or that unit is not
+                below ``capacity_units``. ``s`` is the buffer's output slice from
+                :meth:`sparse_out_slots`, the same assignment a fetch uses: buffers that
+                share a slice are written once, and unused slices are left untouched.
+                A row per request, not per query token: the entries follow the request's
+                watermarks, which :meth:`_KVCache.resize` keeps within
+                :attr:`_KVCache.max_input_length` tokens of each other.
 
                 ``BAD_PAGE_INDEX`` is an ordinary outcome, not an error. A unit is in flight
                 only once it is whole: with ``SparseCacheConfig.unit_tokens`` of 4, that is one
@@ -1499,8 +1540,8 @@ class Batch:
     def fetch_sparse_pages(
         self,
         buffers: Sequence[BufferId],
-        selected: DeviceArray,  # int32[batch, topk]
-        out: DeviceArray,  # int32[batch, len(buffers), topk]
+        selected: DeviceArray,  # int32[batch, queries * topk]
+        out: DeviceArray,  # int32[batch, len(buffers), queries * topk]
         stream: CudaStream | None = None,
     ) -> None:
         """Resolve a batch's selections against each buffer's per-request history cache.
@@ -1537,10 +1578,13 @@ class Batch:
         second resolve read the first's admissions as hits, issue no copies, and leave
         the second layer's cells unfilled; it raises rather than doing that.
 
-        ``selected`` holds selection-unit ordinals, ``topk`` uniform across requests and ``-1``
-        past a request's valid count. The page table and the per-request count of
-        eligible blocks come from ``batch``, whose row order ``selected`` and ``out``
-        both inherit.
+        ``selected`` holds selection-unit ordinals, ``-1`` where a position carries none. A
+        row is ``topk`` positions for each of the
+        :attr:`KVCacheManagerConfig.sparse_queries_per_request` query tokens a request may
+        feed the step, laid back to back, so its width is the same for every request. A
+        unit several positions of a row name is made resident once, and each of them reads
+        the same index. The page table and the per-request count of eligible blocks come
+        from ``batch``, whose row order ``selected`` and ``out`` both inherit.
 
         Eligible means below the history watermark: a block at or above it holds input
         tokens whose host page has not been written back yet, so selecting it would read
@@ -1552,8 +1596,11 @@ class Batch:
         Each selected unit is looked up in the owning request's cache for that layer.
         A hit is reused in place; a miss is copied from the locked host page into a slot
         taken from the free list, evicting least-recently-used when it is empty.
-        The Batch row's lease guarantees room for a full selection and the in-flight
-        unit. Eviction is local to this selection's resident set; it cannot evict another
+        The Batch row's lease guarantees room for one query's selection beside the
+        in-flight units. A row carrying several queries' selections fits when its distinct
+        units fit that room; a fetch of one that does not stops the device, and the process
+        cannot continue. :meth:`peek_sparse_cache_peak_use` reports how close the fetches
+        so far have come. Eviction is local to this selection's resident set; it cannot evict another
         selection's entries. Layers sharing a ``selection_id`` use the split resolve/fetch
         calls described above and keep their cells in matching slots.
 
@@ -1562,8 +1609,8 @@ class Batch:
         block below the watermark is already written back and immutable. A cell holding an
         in-flight block is the one exception, and is never an eviction candidate.
 
-        The in-flight unit is reserved internally but is not appended to ``out``. Use
-        :meth:`prepare_sparse_write_indices` before the model's KV writes to obtain its
+        The in-flight units are reserved internally but are not appended to ``out``. Use
+        :meth:`prepare_sparse_write_indices` before the model's KV writes to obtain their
         per-buffer physical write indices independently of the selection.
 
         ``out`` is **compact**: entry ``[b][s][k]`` is the cache index holding
@@ -1621,7 +1668,7 @@ class Batch:
     def resolve_sparse_selection(
         self,
         buffers: Sequence[BufferId],
-        selected: DeviceArray,  # int32[batch, topk]
+        selected: DeviceArray,  # int32[batch, queries * topk]
         stream: CudaStream | None = None,
     ) -> None:
         """Resolve one selection, admitting what it names and listing what to copy.
@@ -1646,8 +1693,8 @@ class Batch:
     def fetch_resolved_pages(
         self,
         buffers: Sequence[BufferId],
-        selected: DeviceArray,  # int32[batch, topk]
-        out: DeviceArray,  # int32[batch, len(buffers), topk]
+        selected: DeviceArray,  # int32[batch, queries * topk]
+        out: DeviceArray,  # int32[batch, len(buffers), queries * topk]
         stream: CudaStream | None = None,
     ) -> None:
         """Copy one layer's share of a resolved selection, and write its indices.
@@ -1798,8 +1845,18 @@ class KVCacheManager:
         """Cells a request's cache holds per buffer of this layer, in selection units.
 
         Counts both populations -- the history it caches and everything in flight -- so the
-        lease follows from this alone. Only one unit is ever in flight, so the surplus above
-        the selection width is retention rather than headroom. Zero when the layer has no
+        lease follows from this alone. What it holds above the selection width and
+        :meth:`get_sparse_cache_max_in_flight_units` is retention. Zero when the layer has
+        no sparse fetch path.
+        """
+
+    def get_sparse_cache_max_in_flight_units(self, layer_id: LayerId) -> int:
+        """Units of this layer a request can have in flight.
+
+        What :attr:`KVCacheManagerConfig.sparse_max_in_flight_tokens` can span: both
+        watermarks round down to units, so it is that many tokens divided by the layer's
+        ``unit_tokens``, rounded up. It is the last extent of
+        :meth:`Batch.prepare_sparse_write_indices`' output. Zero when the layer has no
         sparse fetch path.
         """
 

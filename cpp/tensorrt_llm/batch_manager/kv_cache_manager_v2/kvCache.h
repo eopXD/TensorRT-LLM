@@ -337,13 +337,12 @@ public:
 
     //! Bound on capacity - history_length: how far capacity may outrun the watermark.
     //!
-    //! Derived, not declared. The cache holds a whole selection plus every unit still in
-    //! flight, so whatever the reservation has above the selection width is the in-flight
-    //! headroom, and that headroom in tokens is this bound. Size it through
-    //! BufferConfig::maxCachedUnits.
+    //! KVCacheManagerConfig::sparseMaxInFlightTokens. Every sparse cache holds a whole
+    //! selection plus the units that many tokens span, which configuration validates, so a
+    //! gap within the bound always finds a cell for each unit in flight.
     //!
     //! nullopt when no sparse buffer has a cache, where a bound on in-flight blocks
-    //! describes nothing. The smallest bound across sparse life cycles when several differ.
+    //! describes nothing.
     [[nodiscard]] std::optional<int> maxInputLength() const;
 
     // Convenience: set only capacity or history length.

@@ -100,7 +100,7 @@ struct SparseCacheShape
     int unitsPerPage = 1;
     //! Sparse buffers this life cycle has.
     int buffers = 0;
-    //! Units a step selects per buffer.
+    //! Units one query selects per buffer.
     int selection = 0;
     //! Layers of this life cycle that carry a sparse cache.
     int layers = 0;
@@ -432,8 +432,8 @@ public:
     //! populations: the history it caches and everything still in flight. Zero when the life
     //! cycle is not sparse or its fetch path is unconfigured.
     //!
-    //! The reservation follows from this alone, so it is a property of the manager. What it
-    //! leaves above the selection width is the headroom KvCache::maxInputLength() reports.
+    //! The reservation follows from this alone, so it is a property of the manager. It
+    //! covers a full selection beside sparseCacheMaxInFlightUnits() units in flight.
     [[nodiscard]] int sparseCacheMaxUnits(LifeCycleId lifeCycle) const noexcept
     {
         return _sparseCacheShape(lifeCycle).maxUnits;
@@ -461,6 +461,12 @@ public:
     {
         return _sparseCacheShape(lifeCycle).unitsPerPage;
     }
+
+    //! Bound on how far capacity can lead history, in units: what the configured
+    //! sparseMaxInFlightTokens can span. One definition, because the resolve's in-flight
+    //! array, the write indices and the write-back's flush list are bounded by the same
+    //! headroom. Zero when the life cycle has no fetch path.
+    [[nodiscard]] int sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept;
 
     //! Sparse buffers this life cycle has, one per (layer, role). Cells and cold-page
     //! offsets are per buffer, so this is what the copy walks.
@@ -578,12 +584,13 @@ private:
     //! the probes, which otherwise match under the shared lock. Without a failure it reads only atomics.
     void _unlinkPagesIfARemoteLevelFailed();
 
-    //! Units a step selects per buffer of this life cycle. The cache must hold a whole
-    //! selection on top of everything in flight, so this is what the in-flight headroom is
-    //! measured against.
+    //! Positions of a request's selection row for this life cycle: one selection for each
+    //! query the request may feed a step. A fetch is handed a row of this width and the
+    //! resolve is sized by it. The cache is not: it must hold one query's selection on top
+    //! of everything in flight, so a row can be wider than the cache has cells.
     [[nodiscard]] int _sparseCacheSelectionWidth(LifeCycleId lifeCycle) const noexcept
     {
-        return _sparseCacheShape(lifeCycle).selection;
+        return _sparseCacheShape(lifeCycle).selection * mConfig.sparseQueriesPerRequest;
     }
 
     //! Layers this life cycle has that carry a sparse cache.
@@ -620,11 +627,6 @@ private:
     //! cell count divided by the expansion. A property of configuration, not of any one
     //! request, which is what lets a batch size its fetch scratch before any member exists.
     [[nodiscard]] int _sparseCacheSubSlotsPerBuffer(LifeCycleId lifeCycle) const noexcept;
-
-    //! Bound on how far capacity can lead history, in units: whatever the cache holds
-    //! beyond a full selection. One definition, because the resolve's in-flight array and
-    //! the write-back's flush list are bounded by the same headroom.
-    [[nodiscard]] int _sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept;
 
     //! This life cycle's sparse buffers, in the order the cache numbers them.
     [[nodiscard]] std::vector<SparseBufferPlan> _sparseBufferPlan(LifeCycleId lifeCycle) const;

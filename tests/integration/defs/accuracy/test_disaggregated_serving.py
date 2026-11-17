@@ -138,6 +138,14 @@ def _get_disagg_generation_stats(serve_url: str) -> list[dict[str, Any]]:
     return stats
 
 
+def _accepted_drafts_per_step(
+        stats: list[dict[str, Any]]) -> list[tuple[int, int]]:
+    """Return (draft tokens, accepted tokens) of every decode step that drafted."""
+    return [(spec["numDraftTokens"], spec["numAcceptedTokens"])
+            for spec in (stat.get("specDecodingStats") for stat in stats)
+            if spec and spec["numDraftTokens"] > 0]
+
+
 def compute_disagg_acceptance_length(serve_url: str) -> float:
     """Acceptance length from the generation workers' iteration stats."""
     return acceptance_length_from_iteration_stats(
@@ -743,6 +751,7 @@ def _test_sparse_offload_long_context(
     index_topk: int,
     unit_tokens: int,
     block_reuse: bool = False,
+    max_draft_len: int = 0,
     server_waiting_timeout: int = 1200,
 ) -> None:
     """Require exact resident/offload tokens and real host fetches on LongBench v2.
@@ -751,6 +760,10 @@ def _test_sparse_offload_long_context(
     checks determinism (all six repeat when testing block reuse), and two
     concurrent 256-token continuations cover sustained decode under eviction.
     The same prefill worker serves both generation configurations.
+
+    With ``max_draft_len``, both workers run one-engine MTP. The serial requests
+    must then also accept the same number of draft tokens in every decode step of
+    both configurations, and reject and accept drafts in each.
 
     Exact comparisons use eager, deterministic TP attention. CUDA graph replay
     and request remapping remain covered by the native offload component tests.
@@ -841,6 +854,14 @@ def _test_sparse_offload_long_context(
     assert (output_len - 1) // unit_tokens > cache_units - index_topk, (
         "Forced decode must append more history than the sparse cache's free slots"
     )
+    if max_draft_len:
+        # The generation worker verifies and drafts; the context worker runs the same
+        # layers so the KV it hands over covers the drafter's.
+        for config in (ctx_server_config, gen_server_config):
+            config["speculative_config"] = {
+                "decoding_type": "MTP",
+                "max_draft_len": max_draft_len,
+            }
     offload_config = copy.deepcopy(gen_server_config)
     offload_config["sparse_attention_config"].update(
         enable_kv_cache_offload=True,
@@ -865,6 +886,7 @@ def _test_sparse_offload_long_context(
         f"reuse={block_reuse}, prompt_tokens={list(map(len, prompts))}, "
         f"max_seq_len={max_seq_len}")
     results = {}
+    accepted_drafts = {}
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="sparse-offload-") as directory:
         observer_dir = Path(directory) / "events"
@@ -1000,7 +1022,8 @@ def _test_sparse_offload_long_context(
                 phase_start = time.monotonic()
                 if mode == "offload":
                     llm.restart_generation(offload_config)
-                normal, _ = wave(list(range(len(samples))), mode=mode)
+                normal, normal_stats = wave(list(range(len(samples))),
+                                            mode=mode)
                 repeat_indices = list(range(
                     len(samples))) if block_reuse else [0]
                 repeated, repeat_stats = wave(repeat_indices, mode=mode)
@@ -1015,8 +1038,22 @@ def _test_sparse_offload_long_context(
                     minimum = (min(map(len, prompts)) -
                                1) // tokens_per_block * tokens_per_block
                     assert cached >= minimum, f"Repeated round reused only {cached}/{minimum} tokens"
-                stress, _ = wave([0, 1], mode=mode, stress=True)
+                stress, stress_stats = wave([0, 1], mode=mode, stress=True)
                 results[mode] = normal + repeated + stress
+                if max_draft_len:
+                    # One request decodes at a time in the serial waves, so their steps
+                    # line up between the two configurations.
+                    accepted_drafts[mode] = _accepted_drafts_per_step(
+                        normal_stats + repeat_stats)
+                    kinds = {
+                        "none" if accepted == 0 else
+                        "all" if accepted == drafted else "some"
+                        for drafted, accepted in accepted_drafts[mode] +
+                        _accepted_drafts_per_step(stress_stats)
+                    }
+                    assert {"none", "all"} <= kinds, (
+                        f"{mode}: decode steps must both reject and accept drafts, got {kinds}"
+                    )
                 correct = sum(row["correct"] for row in normal)
                 print(
                     f"LongBench v2 {model_name} {mode}: {correct}/{len(normal)} correct, "
@@ -1036,6 +1073,10 @@ def _test_sparse_offload_long_context(
                 except AssertionError as error:
                     differences.append(str(error))
             assert not differences, "\n".join(differences)
+            if max_draft_len:
+                assert accepted_drafts["resident"] == accepted_drafts["offload"], (
+                    "Resident and offloaded decode accepted different draft tokens"
+                )
     print(f"Sparse offload exact parity: {len(results['resident'])} requests, "
           f"total {time.monotonic() - started:.1f}s including model loading")
 
@@ -2938,8 +2979,24 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
         """Repeated LongBench v2 prompts match and reuse the offloaded NVFP4 cache."""
         self._run_kv_cache_offload(kv_dtype="nvfp4", block_reuse=True)
 
-    def _run_kv_cache_offload(self, *, kv_dtype: str,
-                              block_reuse: bool) -> None:
+    @pytest.mark.timeout(1800)
+    @pytest.mark.skip_less_device(4)
+    def test_kv_cache_offload_mtp(self) -> None:
+        """LongBench v2 tokens and accepted drafts match with FP8 ratio-4 history offloaded.
+
+        One-engine MTP verifies a draft token beside the sampled one in every decode
+        step and keeps a prefix of them, so what a step leaves in the offloaded history
+        follows what it accepts.
+        """
+        self._run_kv_cache_offload(kv_dtype="fp8",
+                                   block_reuse=False,
+                                   max_draft_len=1)
+
+    def _run_kv_cache_offload(self,
+                              *,
+                              kv_dtype: str,
+                              block_reuse: bool,
+                              max_draft_len: int = 0) -> None:
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
@@ -2987,7 +3044,8 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                                           model_name=self.MODEL_NAME,
                                           index_topk=512,
                                           unit_tokens=4,
-                                          block_reuse=block_reuse)
+                                          block_reuse=block_reuse,
+                                          max_draft_len=max_draft_len)
 
 
 @pytest.mark.timeout(14400)

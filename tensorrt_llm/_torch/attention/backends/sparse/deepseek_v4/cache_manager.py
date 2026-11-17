@@ -1196,6 +1196,7 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
                 unit_tokens=DEEPSEEK_V4_SPARSE_RATIO,
                 tokens_per_block=self.tokens_per_block,
                 gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
+                max_in_flight_tokens=config.sparse_max_in_flight_tokens,
             )
 
         def _add_layer(
@@ -1879,12 +1880,12 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
     ) -> torch.Tensor:
         """Reserve this layer's pinned destinations on the compressor's stream.
 
-        Returns :meth:`prepare_sparse_write_indices`'s int32[B, F], in Batch and
+        Returns :meth:`prepare_sparse_write_indices`'s int32[B, F, U], in Batch and
         descriptor buffer order, under the same stream contract. The fused compressor
-        uses the data column as a one-row page table for both the data and the NVFP4
-        scales; that is sound because their arena geometry matches, which building the
-        sparse descriptors checks. Each buffer still uses its own arena base and byte
-        stride.
+        uses the first entry of the data column as a one-row page table for both the
+        data and the NVFP4 scales; that is sound because their arena geometry matches,
+        which building the sparse descriptors checks. Each buffer still uses its own
+        arena base and byte stride.
         """
         return self.prepare_sparse_write_indices(state, layer_idx)
 

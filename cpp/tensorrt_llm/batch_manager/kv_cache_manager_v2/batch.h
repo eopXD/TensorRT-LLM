@@ -125,6 +125,10 @@ struct SparseStepScratch
     //! Carried here so a fetch reaches it the way it reaches the rest of its arguments.
     SparseHitMiss* hitMiss = nullptr;
 
+    //! This life cycle's entry of the Batch's peak cache use. Per life cycle, unlike the
+    //! statistics, because a peak is read against the cells of the cache it was counted in.
+    int32_t* peakUse = nullptr;
+
     //! What differs between the pools of a copy, on the device for the kernel to index by
     //! `blockIdx.z`. Built and uploaded once with the Batch: every field comes from the
     //! buffer plan and the index tables, both fixed at construction, so a captured graph
@@ -209,10 +213,10 @@ public:
     //! advancing `t` tokens crosses at most `t / unitTokens + 1` units, so the batch
     //! crosses at most `maxTotalInputTokens / unitTokens + maxBatchSize` of them.
     //!
-    //! Left unset it falls back to `maxBatchSize * maxInFlightUnits`, which is
-    //! `maxBatchSize` -- a decode step advances capacity one token per row, so one row
-    //! crosses at most one unit boundary. Pass it once a step can ingest more than that,
-    //! which is what chunked prefill under in-flight batching does.
+    //! Left unset it falls back to `maxBatchSize * maxInFlightUnits`: a decode step moves a
+    //! row's history only across units that were in flight, so one row crosses at most that
+    //! many. Pass it once a step can ingest more than that, which is what chunked prefill
+    //! under in-flight batching does.
     explicit Batch(KvCacheManager& manager, CUstream stream, std::vector<IndexTableSpec> indexTables,
         std::optional<int> maxBatchSize = std::nullopt, std::optional<int> maxBlocksPerSeq = std::nullopt,
         std::optional<PageIndexMode> mode = std::nullopt, std::optional<int> maxTotalInputTokens = std::nullopt);
@@ -488,28 +492,36 @@ public:
     void fetchResolvedPages(std::vector<BufferId> const& buffers, int32_t const* selected, int selectionWidth,
         int32_t* out, std::optional<CUstream> stream = std::nullopt);
 
-    //! Give the in-flight unit of each request a cell, and report where to write it.
+    //! Give every in-flight unit of each request a cell, and report where to write it.
     //!
-    //! The unit between the two watermarks is the one the model is about to produce. It has
+    //! The units between the two watermarks are the ones the model is producing. They have
     //! no host copy yet -- a unit reaches its page only when resize() carries the watermark
-    //! past it -- so nothing is fetched here: the call assigns a cell and leaves its bytes
+    //! past it -- so nothing is fetched here: the call assigns cells and leaves their bytes
     //! to the model.
     //!
     //! Needs only the watermarks, not the selection, so it runs before fetchSparsePages.
     //!
-    //! Idempotent while the watermarks and the reservation hold: the resolve probes
-    //! residency before it takes a victim, so a later call -- including the fetch's own
-    //! resolve -- finds the entry and reuses it rather than assigning a second. The entry
-    //! is pinned for as long as its unit is in flight, so no fetch can evict it.
+    //! Idempotent while the reservation holds: the resolve probes residency before it takes
+    //! a victim, so a later call -- including the fetch's own resolve -- finds a unit's
+    //! entry and reuses it rather than assigning a second. An entry is pinned from the call
+    //! that assigns it until history passes its unit, whether or not capacity still covers
+    //! the unit in between. So a unit that leaves the in-flight span when capacity shrinks
+    //! and re-enters it when capacity grows again is reported at the same cell, which is
+    //! what lets the model overwrite it in place.
     //!
     //! `buffers` is one layer's sparse buffers, exactly as for fetchSparsePages.
     //!
-    //! `out` is [maxBatchSize][buffers.size()], written in full, in the same expanded index
-    //! space fetchSparsePages produces and relative to the same per-pool arena region:
-    //! kBadPageIndex where the row holds no reservation or has nothing in flight.
+    //! `maxInFlightUnits` is the last extent of `out`, and must be the manager's
+    //! sparseCacheMaxInFlightUnits() for the layer's life cycle.
+    //!
+    //! `out` is [maxBatchSize][buffers.size()][maxInFlightUnits], written in full, in the
+    //! same expanded index space fetchSparsePages produces and relative to the same per-pool
+    //! arena region. Entry `i` of a row is the cell of unit `historyUnits + i`, and
+    //! kBadPageIndex where the row holds no reservation or that unit is not below
+    //! `capacityUnits`.
     //! `stream` defaults to the Batch's own, on the same terms as fetchSparsePages.
-    void prepareSparseWriteIndices(
-        std::vector<BufferId> const& buffers, int32_t* out, std::optional<CUstream> stream = std::nullopt);
+    void prepareSparseWriteIndices(std::vector<BufferId> const& buffers, int maxInFlightUnits, int32_t* out,
+        std::optional<CUstream> stream = std::nullopt);
 
     //! The history each row has been written back to. A row that has never needed a flush
     //! reads its own history, so a caller may always compare against it.
@@ -552,6 +564,23 @@ public:
     //! Zero the cumulative pair. Enqueued on the Batch's stream, so it orders against the
     //! fetches around it rather than tearing one.
     void resetHitMissCounter();
+
+    //! The most cells a request's sparse cache has had in use after a fetch, beside the
+    //! cells the cache has, since the Batch was built or the peaks were last reset. For the
+    //! layer's life cycle, whose layers keep caches of one size; zero for both when it has
+    //! no sparse fetch path.
+    //!
+    //! In use are the cells holding units the row named, the cells pinned in flight and the
+    //! cells its misses took. A row needing more than the cache has cannot be resolved and
+    //! stops the device, so this is how close the fetches so far have come to that. It is
+    //! what a cache narrower than sparseQueriesPerRequest selections is judged by, since
+    //! whether a row fits there depends on how far the request's queries overlap.
+    //!
+    //! Read back the way peekHitMissCounter() reads, so it may be a few launches stale.
+    [[nodiscard]] SparseCachePeakUse peekSparseCachePeakUse(LayerId layerId) const;
+
+    //! Zero every life cycle's peak. Enqueued on the Batch's stream.
+    void resetSparseCachePeakUse();
 
     //! Device bytes every life cycle's sparse arena holds, zero without sparse offload.
     //!
@@ -883,6 +912,9 @@ private:
     //! Cumulative fetch statistics, across every life cycle and step. Outside mStepScratch
     //! because the step's clear must not touch it.
     CudaUniqPtr<SparseHitMiss> mHitMiss;
+
+    //! Peak cache use, one entry per life cycle. Outside mStepScratch for the same reason.
+    CudaUniqPtr<int32_t> mPeakUse;
 
     //! The eviction clock every resolve of this Batch reads. Advanced in publish(), which
     //! is the one place a step begins: a step resolves once per layer, so advancing per

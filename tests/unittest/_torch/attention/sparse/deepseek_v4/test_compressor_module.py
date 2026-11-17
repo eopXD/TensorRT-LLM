@@ -2076,7 +2076,7 @@ def _run_compressor_with_fake_postprocess(
         metadata.num_gen_tokens_per_seq = 1
         metadata.cu_seq_lens_cuda = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
         # Write rows by Batch row: the one request sits in row 2, not at its input position.
-        writes = torch.full((4, 2), -1, device=DEVICE, dtype=torch.int32)
+        writes = torch.full((4, 2, 1), -1, device=DEVICE, dtype=torch.int32)
         writes[2] = sparse_write_index
         is_nvfp4 = kv_cache_dtype == "nvfp4"
         descriptor = SimpleNamespace(

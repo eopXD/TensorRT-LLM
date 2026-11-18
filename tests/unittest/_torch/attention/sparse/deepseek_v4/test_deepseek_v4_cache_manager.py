@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 from unittest.mock import Mock, patch
@@ -816,11 +817,28 @@ class _SchedulingBatch:
         self.snapshots = []
         self.upload_pending = False
         self.flushes = []
+        self.advances = []
+        # The histories the device would hold: a row's member's own when it is seated, then
+        # whatever the advances add to it.
+        self.device_history = [0] * max_batch_size
         self.joins = []
         self.leaves = []
 
     def row_of(self, cache):
         return self.rows.index(cache) if cache in self.rows else -1
+
+    def advance_sparse_history(self, advances, batch_rows):
+        assert advances.dtype == batch_rows.dtype == torch.int32
+        assert advances.shape == batch_rows.shape
+        counts = [0] * self.max_batch_size
+        for row, kept in zip(batch_rows.tolist(), advances.tolist(), strict=True):
+            assert self.rows[row] is not None
+            counts[row] = kept
+            self.device_history[row] += kept
+        self.advances.append(counts)
+
+    def history_lengths(self):
+        return torch.tensor(self.device_history, dtype=torch.int32)
 
     def flush_sparse_units(self, new_history_lengths):
         # Recorded rather than performed: what matters here is that the write-back is asked
@@ -836,6 +854,7 @@ class _SchedulingBatch:
         assert cache.page_index_owner == "runtime"
         row = self.rows.index(None)
         self.rows[row] = cache
+        self.device_history[row] = cache.history_length
         cache.page_index_owner = "batch"
         self.joins.append(cache.id)
         return row
@@ -843,7 +862,9 @@ class _SchedulingBatch:
     def remove_kv_cache(self, cache):
         assert not self.upload_pending
         assert cache.page_index_owner == "batch"
-        self.rows[self.rows.index(cache)] = None
+        row = self.rows.index(cache)
+        self.rows[row] = None
+        self.device_history[row] = 0
         cache.page_index_owner = "cache"
         self.leaves.append(cache.id)
 
@@ -1563,6 +1584,344 @@ def test_non_offload_history_still_follows_sampling() -> None:
     manager.update_resources(batch)
     assert cache.history_length == request.max_beam_num_tokens - 1
     manager._stream.wait_stream.assert_not_called()
+
+
+# A step of one-engine speculative decoding: one input token and DRAFT_SLOTS drafts per
+# request, of which the forward keeps a prefix.
+DRAFT_SLOTS = 3
+
+
+def _speculative_request(request_id: int, num_tokens: int) -> SimpleNamespace:
+    """A generation request holding ``num_tokens`` tokens, the last of them without KV yet."""
+    return SimpleNamespace(
+        py_request_id=request_id,
+        is_dummy_request=False,
+        is_disagg_generation_init_state=False,
+        py_num_accepted_draft_tokens=0,
+        py_num_accepted_draft_tokens_indices=[],
+        py_rewind_len=0,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
+        max_beam_num_tokens=num_tokens,
+    )
+
+
+@pytest.fixture
+def speculative_offload_case(sparse_scheduling_case):
+    """Two requests whose history follows what each step keeps, as with speculative decoding.
+
+    Request 20 holds 100 tokens of history and request 10 a full block. Each has taken up
+    everything it has run, so capacity equals history.
+    """
+    case = sparse_scheduling_case
+    manager = case.manager
+    manager._sparse_history_follows_acceptance = True
+    manager._sparse_settlement = sparse_offload._SparseSettlement()
+    caches = {20: case.cache, 10: manager.kv_cache_map[10]}
+    caches[20].history_length = caches[20].capacity = 100
+    caches[10].capacity = caches[10].history_length
+    requests = {
+        request_id: _speculative_request(request_id, cache.history_length + 1)
+        for request_id, cache in caches.items()
+    }
+
+    def schedule(*request_ids: int) -> SimpleNamespace:
+        """Reserve a step for each request, as try_allocate_generation does."""
+        for request_id in request_ids:
+            cache = caches[request_id]
+            assert cache.resize(cache.capacity + 1 + DRAFT_SLOTS, None)
+            manager._allocated_draft_lens[request_id] = DRAFT_SLOTS
+            manager._inflight_draft_lens.setdefault(request_id, []).append(DRAFT_SLOTS)
+        return SimpleNamespace(
+            context_requests=[],
+            generation_requests=[requests[request_id] for request_id in request_ids],
+        )
+
+    def forward(scheduled: SimpleNamespace, kept: list[int]) -> None:
+        """Queue what the forward kept: one count per scheduled request, then graph padding."""
+        rows = [
+            manager._sparse_batch_members[req.py_request_id].row
+            for req in scheduled.generation_requests
+        ]
+        outputs = {
+            "new_tokens_lens": torch.tensor(
+                [99] * len(scheduled.context_requests) + kept + [9], dtype=torch.int32
+            ),
+            "sparse_batch_rows": torch.tensor(rows + [-1], dtype=torch.int32),
+        }
+        manager.update_forward_resources(
+            scheduled,
+            wait_for_input_copy=Mock(side_effect=AssertionError("no host table is written")),
+            forward_outputs=outputs,
+        )
+
+    def read_results(scheduled: SimpleNamespace, kept: list[int]) -> None:
+        """What the sampler does once the host has read a step: add its tokens to each request."""
+        for request, count in zip(scheduled.generation_requests, kept):
+            request.py_num_accepted_draft_tokens = count - 1
+            request.max_beam_num_tokens += count
+
+    with (
+        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch.object(torch.Tensor, "record_stream"),
+    ):
+        yield SimpleNamespace(
+            manager=manager,
+            caches=caches,
+            requests=requests,
+            schedule=schedule,
+            forward=forward,
+            read_results=read_results,
+            settlement=manager._sparse_settlement,
+        )
+
+
+@pytest.mark.cpu_only
+def test_sparse_history_follows_what_each_step_keeps_under_the_overlap_scheduler(
+    speculative_offload_case: SimpleNamespace,
+) -> None:
+    """The device is given each step's count at once; the caches follow a step later.
+
+    Three passes of the overlap loop. A step is enqueued before the host has read what the
+    step before it kept, so the caches' own histories are one step behind when the next
+    Batch is published, and catch up when the delayed results are processed.
+    """
+    case = speculative_offload_case
+    manager, caches = case.manager, case.caches
+
+    first = case.schedule(20, 10)
+    manager.prepare_resources(first)
+    batch = manager.get_sparse_batch([20, 10])
+    # Context output and graph padding have no sparse lease.
+    case.forward(
+        SimpleNamespace(context_requests=[object()], generation_requests=first.generation_requests),
+        [2, 4],
+    )
+    # By Batch row, and nothing for the rows without a member or for the graph padding.
+    assert batch.advances == [[2, 4, 0, 0]]
+    assert not batch.flushes
+    assert (caches[20].history_length, caches[10].history_length) == (100, 128)
+    assert not caches[20].calls[1:] and not caches[10].calls[1:], "only the reservation resized"
+    assert case.settlement.unsettled_steps == {20: 1, 10: 1}
+
+    # The second step is reserved, published and enqueued before the first is read. Its
+    # requests run in another order, and each row is still given its own request's count.
+    second = case.schedule(10, 20)
+    manager.prepare_resources(second)
+    assert not batch.leaves and batch.joins == [20, 10]
+    case.forward(second, [3, 1])
+    assert batch.advances[-1] == [1, 3, 0, 0]
+
+    def resized_after_upload(cache):
+        resize = cache.resize
+
+        def checked(capacity, history_length):
+            assert not batch.upload_pending, "the resize must not race the staged table upload"
+            return resize(capacity, history_length)
+
+        return checked
+
+    for cache in caches.values():
+        cache.resize = resized_after_upload(cache)
+    case.read_results(first, [2, 4])
+    manager.update_resources(first)
+    # History is what the first step kept, and capacity keeps the second step's tokens.
+    assert (caches[20].history_length, caches[20].capacity) == (102, 102 + 1 + DRAFT_SLOTS)
+    assert (caches[10].history_length, caches[10].capacity) == (132, 132 + 1 + DRAFT_SLOTS)
+    # The delayed update leaves both requests seated for the step in flight.
+    assert batch.rows[:2] == [caches[20], caches[10]] and not batch.leaves
+    assert case.settlement.unsettled_steps == {20: 1, 10: 1}
+
+    case.read_results(second, [3, 1])
+    manager.update_resources(second)
+    assert (caches[20].history_length, caches[20].capacity) == (103, 103)
+    assert (caches[10].history_length, caches[10].capacity) == (135, 135)
+    assert not case.settlement.unsettled_steps
+    assert not manager._inflight_draft_lens
+    # Each cache ends where the device advanced its row to.
+    assert batch.device_history == [103, 135, 0, 0]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("problem", ["no_outputs", "no_count", "too_few_rows"])
+def test_sparse_history_advance_needs_the_forwards_count(
+    speculative_offload_case: SimpleNamespace, problem: str
+) -> None:
+    case = speculative_offload_case
+    scheduled = case.schedule(20, 10)
+    case.manager.prepare_resources(scheduled)
+    batch = case.manager.get_sparse_batch([20, 10])
+    outputs = {
+        "no_outputs": None,
+        "no_count": {"logits": torch.zeros(2)},
+        "too_few_rows": {
+            "new_tokens_lens": torch.ones(1, dtype=torch.int32),
+            "sparse_batch_rows": torch.arange(2, dtype=torch.int32),
+        },
+    }[problem]
+    with pytest.raises((RuntimeError, ValueError), match="new_tokens_lens|fewer than"):
+        case.manager.update_forward_resources(
+            scheduled, wait_for_input_copy=Mock(), forward_outputs=outputs
+        )
+    assert not batch.advances
+    assert not case.settlement.unsettled_steps
+
+
+@pytest.mark.cpu_only
+def test_sparse_request_is_not_seated_again_before_its_last_step_is_taken_up(
+    speculative_offload_case: SimpleNamespace,
+) -> None:
+    """A row is seeded from the cache's history, which is behind until the step is read.
+
+    The request leaves the Batch with its last step unread, which the write-back already
+    queued allows, and may not return until the host has taken that step up.
+    """
+    case = speculative_offload_case
+    manager, caches = case.manager, case.caches
+    first = case.schedule(20, 10)
+    manager.prepare_resources(first)
+    batch = manager.get_sparse_batch([20, 10])
+    case.forward(first, [2, 4])
+
+    without = SimpleNamespace(context_requests=[], generation_requests=[case.requests[10]])
+    manager.prepare_resources(without)
+    assert batch.leaves == [20]
+    rows = list(batch.rows)
+
+    again = SimpleNamespace(
+        context_requests=[], generation_requests=[case.requests[20], case.requests[10]]
+    )
+    with pytest.raises(RuntimeError, match="before the host has taken up"):
+        manager.prepare_resources(again)
+    assert batch.rows == rows, "a refused request must leave the Batch as it was"
+
+    case.read_results(first, [2, 4])
+    manager.update_resources(first)
+    assert caches[20].history_length == 102
+    manager.prepare_resources(again)
+    assert batch.joins == [20, 10, 20]
+    assert batch.device_history[batch.row_of(caches[20])] == 102
+
+
+@pytest.mark.cpu_only
+def test_sparse_request_suspended_with_a_step_unread_takes_it_up_when_it_resumes(
+    speculative_offload_case: SimpleNamespace,
+) -> None:
+    """A suspended cache cannot be resized, so the step is recorded and applied on resume."""
+    case = speculative_offload_case
+    manager, request, cache = case.manager, case.requests[20], case.caches[20]
+    first = case.schedule(20, 10)
+    manager.prepare_resources(first)
+    batch = manager.get_sparse_batch([20, 10])
+    case.forward(first, [2, 4])
+
+    def suspend(req):
+        manager.kv_cache_map[req.py_request_id].is_active = False
+
+    with patch.object(KVCacheManagerV2, "suspend_request", side_effect=suspend):
+        manager.suspend_request(request)
+    assert batch.leaves == [20]
+
+    case.read_results(first, [2, 4])
+    calls = list(cache.calls)
+    manager.update_resources(first)
+    assert cache.calls == calls, "a suspended cache is not resized"
+    # Two of the three draft slots the step reserved went unused.
+    assert case.settlement.suspended == {20: (102, 2)}
+    assert 20 not in case.settlement.unsettled_steps
+
+    again = SimpleNamespace(context_requests=[], generation_requests=[request])
+    with pytest.raises(ValueError, match="active scheduled request caches"):
+        manager.prepare_resources(again)
+
+    def resume(req_id, kv_cache, optional_reuse_groups=None):
+        kv_cache.is_active = True
+        return True
+
+    with (
+        patch.object(KVCacheManagerV2, "_resume_and_restore", side_effect=resume),
+        patch.object(KVCacheManagerV2, "try_allocate_generation", return_value=True) as grow,
+    ):
+        assert manager.try_allocate_generation(request)
+    # Brought up to date before the next step's tokens are reserved.
+    assert cache.calls[-1] == (100 + 1 + DRAFT_SLOTS - 2, 102)
+    assert (cache.history_length, cache.capacity) == (102, 102)
+    assert not case.settlement.suspended
+    grow.assert_called_once_with(request)
+
+
+@pytest.mark.cpu_only
+def test_sparse_request_whose_resume_fails_reserves_nothing(
+    speculative_offload_case: SimpleNamespace,
+) -> None:
+    case = speculative_offload_case
+    manager, request = case.manager, case.requests[20]
+    case.settlement.suspended[20] = (102, 2)
+    with (
+        patch.object(KVCacheManagerV2, "_resume_and_restore", return_value=False),
+        patch.object(KVCacheManagerV2, "try_allocate_generation") as grow,
+    ):
+        assert not manager.try_allocate_generation(request)
+    grow.assert_not_called()
+    assert case.settlement.suspended == {20: (102, 2)}
+
+
+@pytest.mark.cpu_only
+def test_sparse_step_reserves_its_tokens_while_capacity_leads_a_history_that_is_behind(
+    speculative_offload_case: SimpleNamespace,
+) -> None:
+    """Capacity above history is a step the host has not read, not this step's reservation."""
+    case = speculative_offload_case
+    manager, request, cache = case.manager, case.requests[20], case.caches[20]
+    cache.capacity = cache.history_length + 1 + DRAFT_SLOTS
+    with (
+        patch.object(KVCacheManagerV2, "_resume_and_restore", return_value=True),
+        patch.object(KVCacheManagerV2, "try_allocate_generation", return_value=True) as grow,
+    ):
+        assert manager.try_allocate_generation(request)
+    grow.assert_called_once_with(request)
+
+
+@pytest.mark.cpu_only
+def test_sparse_freed_request_leaves_nothing_to_take_up(
+    speculative_offload_case: SimpleNamespace,
+) -> None:
+    case = speculative_offload_case
+    manager = case.manager
+    scheduled = case.schedule(20, 10)
+    manager.prepare_resources(scheduled)
+    case.forward(scheduled, [2, 4])
+    case.settlement.suspended[20] = (102, 2)
+    with patch.object(KVCacheManagerV2, "free_resources"):
+        manager.free_resources(case.requests[20])
+    assert case.settlement.unsettled_steps == {10: 1}
+    assert not case.settlement.suspended
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("agrees", [True, False])
+def test_sparse_debug_check_compares_the_caches_history_with_the_devices(
+    speculative_offload_case: SimpleNamespace, agrees: bool
+) -> None:
+    """Opt-in: the device's history is read before each advance and compared at the take-up."""
+    case = speculative_offload_case
+    manager = case.manager
+    with patch.object(sparse_offload, "SPARSE_OFFLOAD_DEBUG_ASSERT", True):
+        first = case.schedule(20, 10)
+        manager.prepare_resources(first)
+        case.forward(first, [2, 4])
+        second = case.schedule(20, 10)
+        manager.prepare_resources(second)
+        case.forward(second, [1, 1])
+        assert case.settlement.expected_history == {20: 102, 10: 132}
+
+        # The host reads one token fewer than the device kept for request 20.
+        case.read_results(first, [2 if agrees else 1, 4])
+        if agrees:
+            manager.update_resources(first)
+            assert not case.settlement.expected_history
+        else:
+            with pytest.raises(RuntimeError, match="101 tokens on the host and 102 on the device"):
+                manager.update_resources(first)
 
 
 @pytest.mark.cpu_only

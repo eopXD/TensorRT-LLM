@@ -919,6 +919,56 @@ __global__ __launch_bounds__(kThreads) void sparseFlushListKernel(SparseFlushLis
     gridDependencyRelease();
 }
 
+//! One thread per row. The ranges are written before the history they are derived from
+//! moves, and nothing else in the kernel reads either.
+__global__ __launch_bounds__(kThreads) void sparseHistoryAdvanceKernel(SparseHistoryAdvanceArgs args)
+{
+    int32_t const input = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (input >= args.numInputs)
+    {
+        return;
+    }
+    int32_t const row = args.batchRows == nullptr ? input : args.batchRows[input];
+    KVCM2_SPARSE_REQUIRE(row >= 0 && row < args.numRows);
+    if (args.leases[row] == kNoSparseLease)
+    {
+        return;
+    }
+    int32_t const history = args.historyTokens[row];
+    int32_t const advance = args.advance[input];
+    // Compared as a difference, so a count large enough to wrap the sum is caught too.
+    KVCM2_SPARSE_REQUIRE(advance >= 0 && advance <= args.capacityTokens[row] - history);
+    int32_t const advanced = history + advance;
+
+    for (int32_t lifeCycle = 0; lifeCycle < args.numLifeCycles; ++lifeCycle)
+    {
+        int32_t const unitTokens = args.unitTokens[lifeCycle];
+        if (unitTokens == 0)
+        {
+            continue;
+        }
+        auto* const fromUnits = args.flushRanges + static_cast<ptrdiff_t>(2) * lifeCycle * args.numRows;
+        fromUnits[row] = history / unitTokens;
+        fromUnits[args.numRows + row] = advanced / unitTokens;
+    }
+    args.historyTokens[row] = advanced;
+}
+
+//! One thread per row.
+__global__ __launch_bounds__(kThreads) void sparseHistoryPublishKernel(SparseHistoryPublishArgs args)
+{
+    int32_t const row = static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (row >= args.numRows)
+    {
+        return;
+    }
+    int32_t const staged = args.staged[row];
+    if (staged != kKeepSparseHistory)
+    {
+        args.historyTokens[row] = staged;
+    }
+}
+
 } // namespace
 
 //! Throw unless the work list is fully described.
@@ -963,6 +1013,31 @@ void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream)
     dim3 const grid(static_cast<unsigned>(args.arena.numLayers), static_cast<unsigned>(args.numRows));
     tensorrt_llm::common::launchWithPdlWhenEnabled(
         "sparseFlushList", sparseFlushListKernel, grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream), args);
+}
+
+void launchSparseHistoryAdvance(SparseHistoryAdvanceArgs const& args, CUstream stream)
+{
+    TLLM_CHECK_WITH_INFO(args.numRows > 0 && args.numLifeCycles > 0,
+        "launchSparseHistoryAdvance: rows and life cycles must be positive");
+    TLLM_CHECK_WITH_INFO(args.leases != nullptr && args.advance != nullptr && args.historyTokens != nullptr
+            && args.capacityTokens != nullptr && args.unitTokens != nullptr && args.flushRanges != nullptr,
+        "launchSparseHistoryAdvance: every device array must be provided");
+    // Without a launch dependency of its own: it starts once everything ahead of it on the
+    // stream has finished, which is what the watermark it moves needs, and the scan that
+    // follows waits for it before reading the ranges.
+    dim3 const grid(static_cast<unsigned>((args.numInputs + kThreads - 1) / kThreads));
+    sparseHistoryAdvanceKernel<<<grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+void launchSparseHistoryPublish(SparseHistoryPublishArgs const& args, CUstream stream)
+{
+    TLLM_CHECK_WITH_INFO(args.numRows > 0, "launchSparseHistoryPublish: rows must be positive");
+    TLLM_CHECK_WITH_INFO(args.staged != nullptr && args.historyTokens != nullptr,
+        "launchSparseHistoryPublish: every device array must be provided");
+    dim3 const grid(static_cast<unsigned>((args.numRows + kThreads - 1) / kThreads));
+    sparseHistoryPublishKernel<<<grid, kThreads, 0, reinterpret_cast<cudaStream_t>(stream)>>>(args);
+    TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
 SparseCopyWidth sparseCopyWidth(SelectionUnitLayout const& layout, uint64_t hostPageStride, uint64_t bufferBytes)

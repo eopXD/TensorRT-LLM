@@ -21,12 +21,13 @@ from __future__ import annotations
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Collection, Iterable
+from typing import TYPE_CHECKING, Callable, Collection, Iterable, Mapping
 
 import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_max_in_flight_units
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -327,17 +328,51 @@ class _SparseBatchMember:
     blocks: int
 
 
+@dataclass(slots=True)
+class _SparseSettlement:
+    """What the host has yet to take up where a step keeps a prefix of the tokens it writes.
+
+    The device advances a request's history right after the step, by the count the
+    step kept. The host reads that count with the step's sampling results, which may be
+    after the next step is enqueued, and raises the cache's own history then.
+    """
+
+    # Steps a request has run whose count the host has not taken up, by request id.
+    unsettled_steps: dict[int, int] = field(default_factory=dict)
+    # The history a suspended request's last step reached and the capacity that step did
+    # not use, by request id. A suspended cache cannot be resized, so both are applied
+    # when it resumes.
+    suspended: dict[int, tuple[int, int]] = field(default_factory=dict)
+    # With SPARSE_OFFLOAD_DEBUG_ASSERT, the device history a request's unsettled step
+    # reached, by request id, for the host's count to be compared with.
+    expected_history: dict[int, int] = field(default_factory=dict)
+
+
 class SparseOffloadCacheMixin:
     """KV cache manager side of sparse KV cache offload, model-agnostic.
 
     Mix in before ``KVCacheManagerV2``. Call ``_init_sparse_offload`` before the
     base constructor; it reads the selection width while building the config.
 
-    A request's sparse history advances right after each forward, since one
-    query token per request writes one unit. Between ``prepare_resources`` and
-    the post-forward update, the scheduled requests are members of a native
-    Batch, which owns their host page-index rows; every path that mutates a
-    request's cache releases the Batch first.
+    A request's sparse history advances right after each forward. Between
+    ``prepare_resources`` and the post-forward update, the scheduled requests
+    are members of a native Batch, which owns their host page-index rows; every
+    path that mutates a request's cache releases the Batch first.
+
+    How far the history advances depends on the step:
+
+    - One query token per request writes one unit and keeps it. The host knows
+      the new history, so it asks for the write-back and raises the cache's
+      history itself.
+    - A step that keeps a prefix of the tokens it writes produces the count on
+      the device (``_sparse_history_follows_acceptance``). The write-back and
+      the history the next forward reads are then advanced on the device from
+      that count, and the cache's own history follows in ``update_resources``,
+      once the host has read the step's results.
+
+    Either way the write-back is queued on the cache stream behind the forward,
+    and the next forward waits for that stream, so a step starts with the units
+    the previous one kept in their host pages.
 
     Batch rows are slots. A request keeps its row, and with it the GPU cache
     lease, for as long as it stays scheduled; a departing request frees its row
@@ -349,6 +384,8 @@ class SparseOffloadCacheMixin:
     _sparse_offload_topk: int | None = None
     _sparse_batch: Batch | None = None
     _sparse_batch_prepared: bool = False
+    _sparse_history_follows_acceptance: bool = False
+    _sparse_settlement: _SparseSettlement | None = None
 
     def _init_sparse_offload(self, *, enabled: bool, topk: int | None) -> None:
         self._enable_kv_cache_offload = enabled
@@ -356,6 +393,7 @@ class SparseOffloadCacheMixin:
         self._sparse_batch = None
         self._sparse_batch_members: dict[int, _SparseBatchMember] = {}
         self._sparse_batch_prepared = False
+        self._sparse_settlement = _SparseSettlement()
 
     def _sparse_offload_nvfp4_head_dim(self) -> int | None:
         """Head dim of the dequantized rows an NVFP4 gather keeps per selection.
@@ -531,6 +569,8 @@ class SparseOffloadCacheMixin:
                 raise ValueError("Invalid KVCM history frontier")
             if cache.num_blocks > self.max_blocks_per_seq:
                 raise ValueError("Request allocation exceeds sparse Batch page-table capacity")
+            if request_id not in self._sparse_batch_members:
+                self._check_sparse_history_settled(request_id)
             caches[request_id] = cache
 
         batch = self._ensure_sparse_batch()
@@ -641,6 +681,11 @@ class SparseOffloadCacheMixin:
     def free_resources(self, request: llm_request.LlmRequest, pin_on_release: bool = False) -> None:
         self._release_sparse_batch([request.py_request_id])
         self._order_sparse_history_update([request])
+        if self._sparse_settlement is not None:
+            # The cache goes with whatever the host had yet to take up for it.
+            self._sparse_settlement.unsettled_steps.pop(request.py_request_id, None)
+            self._sparse_settlement.suspended.pop(request.py_request_id, None)
+            self._sparse_settlement.expected_history.pop(request.py_request_id, None)
         super().free_resources(request, pin_on_release)
 
     def release_index_slot(self, request_id: int) -> None:
@@ -711,22 +756,71 @@ class SparseOffloadCacheMixin:
         super().update_context_resources(scheduled_batch)
 
     def try_allocate_generation(self, req: llm_request.LlmRequest) -> bool:
-        """Reserve a decode request's next input token unless it is already reserved.
+        """Reserve a decode request's next input tokens unless they are already reserved.
 
-        With offload, history advances right after each forward, so at scheduling
-        time a cache holding capacity beyond its history has already reserved this
+        Where the host raises history right after each forward, a cache holding
+        capacity beyond its history at scheduling time has already reserved this
         step. Attention-DP padding dummies are created that way. Growing such a
         cache again would exceed the manager config's ``sparse_max_in_flight_tokens``,
         the bound on the tokens between capacity and history. No growth is recorded,
         so a skipped step reverts nothing.
+
+        Where history follows what a step keeps, the cache's own history is behind
+        between steps, so capacity leads it whether or not this step is reserved and
+        every step reserves its tokens the ordinary way. A request that was suspended
+        with a step the host had not taken up is brought up to date first.
         """
         if self._enable_kv_cache_offload:
             if self._sparse_batch is not None:
                 self._sparse_batch.wait_published()
             cache = self.kv_cache_map.get(req.py_request_id)
-            if cache is not None and cache.is_active and cache.capacity > cache.history_length:
+            if self._sparse_history_follows_acceptance:
+                if cache is not None and not self._resume_and_restore(req.py_request_id, cache):
+                    return False
+            elif cache is not None and cache.is_active and cache.capacity > cache.history_length:
                 return True
         return super().try_allocate_generation(req)
+
+    def _resume_and_restore(self, req_id: int, kv_cache, optional_reuse_groups=None) -> bool:
+        if not super()._resume_and_restore(req_id, kv_cache, optional_reuse_groups):
+            return False
+        self._settle_suspended_sparse_history(req_id, kv_cache)
+        return True
+
+    def _settle_suspended_sparse_history(self, request_id: int, cache: _KVCache) -> None:
+        """Take up the step a request was suspended before the host had read.
+
+        ``update_resources`` recorded where that step left the request's history and
+        the capacity it did not use, since a suspended cache cannot be resized. The
+        units below that history were written back before the request left the Batch,
+        so raising the cache's history here is all that is left.
+        """
+        settlement = self._sparse_settlement
+        if settlement is None or request_id not in settlement.suspended:
+            return
+        history_length, unused_capacity = settlement.suspended[request_id]
+        if not cache.resize(cache.capacity - unused_capacity, history_length):
+            raise ValueError(
+                f"Failed to bring sparse KV history for resumed request {request_id} up to "
+                f"{history_length} tokens"
+            )
+        del settlement.suspended[request_id]
+
+    def _check_sparse_history_settled(self, request_id: int) -> None:
+        """Refuse to seat a request whose own history is behind the device's.
+
+        A Batch row is seeded from the cache's history. Seated with a step the host has
+        not taken up, the request would start below units that are already in its host
+        pages, and the fetch would treat them as still in flight.
+        """
+        settlement = self._sparse_settlement
+        if settlement is None or not self._sparse_history_follows_acceptance:
+            return
+        if settlement.unsettled_steps.get(request_id) or request_id in settlement.suspended:
+            raise RuntimeError(
+                f"Request {request_id} joins the sparse Batch before the host has taken up "
+                "the tokens its last step kept"
+            )
 
     def revert_allocate_generation(self, req: llm_request.LlmRequest) -> None:
         if self._sparse_batch is not None:
@@ -734,16 +828,27 @@ class SparseOffloadCacheMixin:
         super().revert_allocate_generation(req)
 
     def update_forward_resources(
-        self, scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
+        self,
+        scheduled_batch: ScheduledRequests,
+        *,
+        wait_for_input_copy: Callable[[], None],
+        forward_outputs: Mapping[str, object] | None = None,
     ) -> None:
         """Advance sparse decode history from executed inputs before the next schedule.
 
-        Offload decode validates one input token per request, with speculation
-        disabled. That input's KV is produced by this forward; the sampled
+        The KV of a step's input tokens is produced by this forward; the sampled
         output has no KV yet. Queue writeback after the forward on the cache
         stream, independently of when the executor consumes sampling results.
+
+        With one input token per request the history advances by one and the host
+        raises it here. Where a step keeps a prefix of its input tokens, the count is
+        ``forward_outputs["new_tokens_lens"]`` and the device advances by it; see
+        ``_advance_sparse_history_on_device``.
         """
         if not self._enable_kv_cache_offload or not scheduled_batch.generation_requests:
+            return
+        if self._sparse_history_follows_acceptance:
+            self._advance_sparse_history_on_device(scheduled_batch, forward_outputs)
             return
         wait_for_input_copy()
         self._order_sparse_history_update(scheduled_batch.generation_requests)
@@ -787,6 +892,83 @@ class SparseOffloadCacheMixin:
                     del self._inflight_draft_lens[request_id]
         self._sparse_batch_prepared = False
 
+    def _advance_sparse_history_on_device(
+        self, scheduled_batch: ScheduledRequests, forward_outputs: Mapping[str, object] | None
+    ) -> None:
+        """Queue the write-back of what each request kept of this step, by the forward's count.
+
+        The forward writes every input token of a request and keeps a prefix of them:
+        ``new_tokens_lens`` holds, per forward output row, the input tokens whose KV
+        stays. The host reads it with the step's sampling results, which may be after
+        the next forward is enqueued, so the native Batch takes the count from the
+        device: it writes back the units each row keeps and advances the history the
+        next forward reads. The caches' own histories follow in ``update_resources``.
+
+        Nothing here writes a host page table, so this does not wait for the model's
+        input copy.
+        """
+        batch = self._sparse_batch
+        if batch is None or not self._sparse_batch_members:
+            return
+        outputs = forward_outputs or {}
+        kept = outputs.get("new_tokens_lens")
+        if not isinstance(kept, torch.Tensor):
+            raise RuntimeError(
+                "Sparse offload advances history by the tokens a step keeps, which the "
+                "forward reports as new_tokens_lens; this forward reported none"
+            )
+        settlement = self._sparse_settlement
+        assert settlement is not None
+        batch_rows = outputs.get("sparse_batch_rows")
+        if not isinstance(batch_rows, torch.Tensor):
+            raise RuntimeError(
+                "Sparse history advancement requires the forward's sparse Batch row map"
+            )
+        # The decode-only row map covers all live members, followed by graph padding.
+        # Any context outputs precede the generation counts and have no sparse lease.
+        first_row = len(scheduled_batch.context_requests)
+        live = len(self._sparse_batch_members)
+        end = first_row + live
+        if kept.shape[0] < end:
+            raise ValueError(
+                f"The forward reported kept tokens for {kept.shape[0]} rows, fewer than the "
+                f"{end} its scheduled requests take"
+            )
+        self._order_sparse_history_update(scheduled_batch.generation_requests)
+        if SPARSE_OFFLOAD_DEBUG_ASSERT:
+            self._record_sparse_device_history(batch)
+        with torch.cuda.stream(self._stream):
+            kept.record_stream(self._stream)
+            batch_rows.record_stream(self._stream)
+            counts = kept[first_row:end].to(torch.int32).contiguous()
+            batch.advance_sparse_history(counts, batch_rows[:live])
+        for request_id in self._sparse_batch_members:
+            settlement.unsettled_steps[request_id] = (
+                settlement.unsettled_steps.get(request_id, 0) + 1
+            )
+        self._sparse_batch_prepared = False
+
+    def _record_sparse_device_history(self, batch: Batch) -> None:
+        """Read the device's histories before a step advances them, for the debug comparison.
+
+        Waits for the cache stream, so it is opt-in. A member with no step left to take up
+        must already agree with the device. One with a step outstanding is compared when
+        ``update_resources`` takes that step up.
+        """
+        settlement = self._sparse_settlement
+        assert settlement is not None
+        self._stream.synchronize()
+        device_history = torch.from_dlpack(batch.history_lengths()).tolist()
+        for request_id, member in self._sparse_batch_members.items():
+            on_device = device_history[member.row]
+            if settlement.unsettled_steps.get(request_id):
+                settlement.expected_history[request_id] = on_device
+            elif member.cache.history_length != on_device:
+                raise RuntimeError(
+                    f"Sparse KV history for request {request_id} is {member.cache.history_length} "
+                    f"tokens on the host and {on_device} on the device"
+                )
+
     def update_resources(
         self,
         scheduled_batch: ScheduledRequests,
@@ -794,11 +976,74 @@ class SparseOffloadCacheMixin:
         kv_cache_dtype_byte_size: float | None = None,
     ) -> None:
         if self._enable_kv_cache_offload:
-            # Sparse decode has no speculative slots to rewind. History follows
-            # forward completion; delayed sampling updates must neither rewind it
-            # nor detach the Batch prepared for a later forward.
-            return
+            if not self._sparse_history_follows_acceptance:
+                # A step of one token per request has no speculative slots to rewind.
+                # History follows forward completion; delayed sampling updates must
+                # neither rewind it nor detach the Batch prepared for a later forward.
+                return
+            self._note_sparse_steps_taken_up(scheduled_batch)
+            if self._sparse_batch is not None:
+                # The resizes below write the members' staged page-index rows, and the
+                # Batch prepared for a later forward may still be uploading them.
+                self._sparse_batch.wait_published()
         super().update_resources(scheduled_batch, attn_metadata, kv_cache_dtype_byte_size)
+        if self._enable_kv_cache_offload and SPARSE_OFFLOAD_DEBUG_ASSERT:
+            self._check_sparse_history_taken_up(scheduled_batch)
+
+    def _note_sparse_steps_taken_up(self, scheduled_batch: ScheduledRequests) -> None:
+        """Account for the step the host is about to take up for each request.
+
+        The base update raises an active cache's history to what the step kept and gives
+        back the capacity it did not use. It skips a suspended cache, which cannot be
+        resized, so the same two values are recorded here for when the request resumes.
+        Runs before the base update, which consumes the step's reserved width.
+        """
+        settlement = self._sparse_settlement
+        assert settlement is not None
+        for request in scheduled_batch.generation_requests:
+            request_id = request.py_request_id
+            steps = settlement.unsettled_steps.get(request_id, 0)
+            if steps > 1:
+                settlement.unsettled_steps[request_id] = steps - 1
+            else:
+                settlement.unsettled_steps.pop(request_id, None)
+            cache = self.kv_cache_map.get(request_id)
+            if cache is None or cache.is_active:
+                continue
+            accepted = request.py_num_accepted_draft_tokens
+            inflight = self._inflight_draft_lens.get(request_id)
+            reserved = (
+                inflight[0]
+                if inflight
+                else self._allocated_draft_lens.get(request_id, request.py_rewind_len + accepted)
+            )
+            _, unused = settlement.suspended.get(request_id, (0, 0))
+            settlement.suspended[request_id] = (
+                request.max_beam_num_tokens - 1,
+                unused + max(reserved - accepted, 0),
+            )
+
+    def _check_sparse_history_taken_up(self, scheduled_batch: ScheduledRequests) -> None:
+        """Compare each cache's history with what the device advanced it to.
+
+        A request that finished inside the tokens its last step kept stops counting at
+        the token it finished on, so its history is behind the device's and stays there.
+        """
+        settlement = self._sparse_settlement
+        if settlement is None:
+            return
+        for request in scheduled_batch.generation_requests:
+            expected = settlement.expected_history.pop(request.py_request_id, None)
+            cache = self.kv_cache_map.get(request.py_request_id)
+            if expected is None or cache is None or not cache.is_active:
+                continue
+            if request.state == LlmRequestState.GENERATION_COMPLETE:
+                continue
+            if cache.history_length != expected:
+                raise RuntimeError(
+                    f"Sparse KV history for request {request.py_request_id} is "
+                    f"{cache.history_length} tokens on the host and {expected} on the device"
+                )
 
     # ------------------------------------------------------------------
     # Arena descriptors

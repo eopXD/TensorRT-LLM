@@ -175,10 +175,30 @@ when the previous publish has not been waited on, because waiting there would
 cover only its own write and hide a member already mutated into the hazard; the
 lock and unlock paths carry a debug check for the member side of the same rule.
 
-A sparse member writes back the units its history passes through
-`flushSparseUnits()`, and must have done so for the history it is giving up
-before it leaves, since removal returns the arena lease and discards whatever the
-GPU cache held.
+A sparse member is a request's `KvCache` seated in a `Batch` row.
+The model writes new sparse KV into that request's GPU cache. The row's history
+length counts input tokens whose KV the request keeps. Whenever that length
+crosses a sparse unit boundary, KVCM copies the completed unit to its host page
+so a later attention step can fetch it after GPU eviction. Write-back must be
+ordered before the request leaves the batch because removal releases its GPU cache.
+
+In ordinary decode, the forward processes one input token per request, so the
+host knows to call `flushSparseUnits()` with the old history length plus one.
+With MTP, the target forward processes the current token and a sequence of draft
+tokens. For example, if it processes `A B C D`, where `A` is the current token
+and verification accepts drafts `B C`, the KV for `A B C` belongs to the
+request's history. The next forward can reuse the position written for `D`.
+Verification reports `new_tokens_lens = 3` for this request on the GPU.
+
+Under overlap scheduling, the executor can enqueue the next forward before
+the host reads that count. The next forward needs the updated history length
+to locate its first write. After verification, the executor's
+`update_forward_resources()` hook passes the GPU counts to
+`Batch::advanceSparseHistory()` by batch row. On the batch's CUDA stream,
+KVCM advances each row's history length and writes back the sparse units that
+the accepted prefix completed. Subsequent calls to `publish()` preserve that
+device-side length. When the host reads the sampling results, it updates the
+request's `KvCache` history length and releases unused draft capacity.
 
 The dependency direction is broadly:
 

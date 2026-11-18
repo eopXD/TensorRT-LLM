@@ -8,8 +8,9 @@ SPDX-License-Identifier: Apache-2.0
 Target: the **decode instance of a disaggregated deployment**.
 
 **Implemented**: the resolve, copy, index and flush-list kernels; `Batch`; the per-request
-reservation and device state; batch-wide write-back through `Batch::flushSparseUnits()`;
-`fetch_sparse_pages` and `prepare_sparse_write_indices`; sparse buffers across more than one pool; sparsity as a pool
+reservation and device state; batch-wide write-back through `Batch::flushSparseUnits()`
+or `Batch::advanceSparseHistory()`; `fetch_sparse_pages` and
+`prepare_sparse_write_indices`; sparse buffers across more than one pool; sparsity as a pool
 attribute, so one layer may hold both sparse and dense buffers.
 
 Compression is a separate feature, configured through
@@ -51,9 +52,9 @@ Two existing properties make this cheap:
 | page | the KVCM2 allocation, locking and migration unit: `tokens_per_block` tokens |
 | buffer | one layer's slice of a page; several coalesce into one page |
 | selection unit | what the backend selects; a factor of `tokens_per_block`, never larger |
-| in-flight | units in the published span from history (inclusive) to capacity (exclusive), both rounded down to units |
+| in-flight | units in the published span from device history (inclusive) to capacity (exclusive), both rounded down to units |
 | units per page | selection units a page holds, `tokens_per_block / sparse_selection_unit_tokens` |
-| pure history | a unit whose ordinal is below the row's published history length divided by `unit_tokens` (rounded down) |
+| pure history | a unit whose ordinal is below the row's device history length divided by `unit_tokens` (rounded down) |
 
 ## Scope
 
@@ -93,7 +94,7 @@ entry and the selection unit is already a page.
    written and the history a step selects occupy cache cells, drawn from the same lease and
    replaced by the same eviction.
 5. **A completed unit can be fetched from its host page.** The batch queues write-back
-   of units crossed by a history advance before the next fetch. Until published history
+   of units crossed by a history advance before the next fetch. Until device history
    passes a unit, its GPU cell holds the request's live KV and stays pinned.
 6. **Extraction is pluggable**, because KVCM2 buffers are opaque bytes and a sub-page unit
    cannot be located without layout knowledge.
@@ -114,15 +115,22 @@ for a dense buffer. Nothing resolves against the cache arena, and no caller has 
 which rule applies to which ordinal.
 
 A block's data reaches its host page by a **flush**: a copy on the Batch's stream that does
-**not** evict the GPU entry, which stays cached and becomes evictable once published history passes its unit.
+**not** evict the GPU entry, which stays cached and becomes evictable once device history passes its unit.
 
 ### Who flushes
 
-The caller passes the new per-row history lengths to `Batch::flushSparseUnits()` before
-`resize()`. The batch uses the page indices from the last `publish()` to queue write-back
-of newly completed units. When a seated row crosses a unit boundary, `resize()` checks
-that the recorded flush covers the requested history (`newHistory <= recorded`). Several
-resizes can use the same flush, including a retry that advances history by fewer tokens.
+The batch orders write-back of newly completed units before the next fetch on its CUDA
+stream. Both paths use the page indices from the last `publish()`.
+
+- **Host-managed history.** The caller passes the new per-row lengths to
+  `Batch::flushSparseUnits(newHistoryLengths)` before `resize()`. When a seated row's history
+  crosses a unit boundary, `resize()` checks that the recorded flush covers the requested
+  history (`newHistory <= recorded`). Several resizes can use the same flush, including
+  a retry that advances history by fewer tokens.
+- **Device-managed history.** `Batch::advanceSparseHistory()` takes the kept-token counts
+  from the GPU, advances each row's device watermark, then queues write-back of the units
+  it crossed. `publish()` preserves that watermark. Once the host reads the count,
+  `resize()` records the accepted history in the member's `KvCache` without a second flush.
 
 **Related page operations**
 
@@ -136,7 +144,7 @@ resizes can use the same flush, including a retry that advances history by fewer
   moved: it assigns `mHistoryLength`, returns true, and `resize()` returns before reaching
   its body. Work placed in that body does not run for a sparse layer.
 - `commit()` can share a completed page because `num_committed_tokens <= history_length`.
-  When it raises the member's history length, it does so through `resize()`.
+  When it raises the member's host history length, it does so through `resize()`.
 
 ### How much a step may cross
 
@@ -148,7 +156,9 @@ previous step. With a batch token budget, the list capacity is therefore
 reserves `maxBatchSize * maxInFlightUnits` entries per layer.
 
 `flushSparseUnits()` checks the total units crossed across all rows against the list
-capacity.
+capacity. For a device-managed row, the advance kernel checks
+`0 <= advance <= published_capacity - device_history` and computes the row's range on
+the GPU. Both paths use the same write-back list.
 
 ### Ordering
 
@@ -182,16 +192,66 @@ The write-back reads the index table as of the **last publish**. That is current
 because the move is clamped to the capacity the step started from, so the blocks it touches
 were allocated by an earlier resize and published then.
 
+### Advancing sparse KV history on the GPU between MTP steps
+
+The native `Batch` can advance a request's history from MTP verification results on the
+GPU. With overlap scheduling, the next forward can be enqueued before the host reads
+those results. For example, if a member starts with 100 tokens of history and verification
+accepts two drafts, the current input token and those two drafts extend its history to
+103. The next forward starts writing at position 103. The Python sparse-offload manager
+currently rejects speculative decoding at construction.
+
+`Batch::advanceSparseHistory()` takes the number of input tokens each row kept, including
+the current token and the accepted drafts (three tokens in this example). On the batch's
+CUDA stream, a kernel adds that count to the row's device watermark. The batch then
+queues write-back of each newly completed sparse unit to its host page.
+
+`publish()` preserves the updated watermark for the next forward, so the executor can
+enqueue that forward without waiting for the host to read the count and send back a new
+watermark. The host updates the member's `KvCache` history length when it processes the
+sampling results.
+
+The advance kernel checks that each advance is nonnegative and fits within the row's
+published capacity. The batch queues the write-back scans and copies on every step because
+only the GPU knows which rows completed a sparse unit. The scan skips rows with an empty range.
+
+**Joining the batch.** A sparse member's host pages hold its completed KV units.
+When it joins, the batch assigns it GPU cache cells. Call `publish()` before its first
+decode step so the GPU has the lease, page table, and starting history length.
+After the first call to `advanceSparseHistory()`, `publish()` uses `kKeepSparseHistory`
+to preserve the row's device watermark. `move()` rejects such a row because it would
+initialize the destination from the host's potentially stale history length.
+
+**Recording an accepted step.** In the example above, the GPU uses position 103 for the
+next write even while the host still records 100. When the host reads the same step's
+sampling results, it calls `resize()` to record 103 in the member's `KvCache`.
+`advanceSparseHistory()` has already queued copies of any newly completed units to their
+host pages. If the batch calls `flushSparseUnits()` for other rows, it must pass this
+member's current host history length so the call skips write-back for this row.
+
+**Leaving and rejoining.** `removeKvCache()` releases the member's GPU cells after the
+queued write-back on the same CUDA stream. The member can leave while the host still
+records 100. Before it rejoins, the host must apply all outstanding acceptance results.
+Publishing 100 again would put the next write at position 100 and could cause a sparse
+fetch to treat a completed unit in host memory as an in-flight unit in an empty GPU cell.
+
+**GPU cache capacity.** The host reserves space for every position MTP may write, including
+drafts that verification may reject. With overlap, it can reserve the next step's positions
+before it knows how many drafts the previous step kept. `sparseMaxInFlightTokens` bounds
+the difference between reserved capacity and the history length the host currently records.
+The minimum cache holds one query's selection plus the maximum number of in-flight
+units. See [Sizing](#sizing) for requests with several queries.
+
 ### Unflushed entries carry no state
 
 The resolve kernel derives pinning from a resident entry's ordinal and the row's
-published history.
+device history.
 
 ```
-pinned  <=>  entry_ordinal >= floor(published_history / unit_tokens)
+pinned  <=>  entry_ordinal >= floor(device_history / unit_tokens)
 ```
 
-A pinned cell holds this request's KV until published history passes the unit. A history
+A pinned cell holds this request's KV until device history passes the unit. A history
 advance queues write-back for each newly completed unit, so a subsequent fetch can evict
 its cell and later refill it from the host page. Only finalized pages enter the radix tree,
 so the request owns its unflushed units exclusively.
@@ -225,10 +285,13 @@ multi-query bound.
 ### `max_input_length`
 
 `KVCacheManagerConfig.sparse_max_in_flight_tokens` sets a sparse request's read-only
-`max_input_length`. `resize()` rejects a capacity more than this many tokens ahead of
-`history_length`. Size it for the largest gap a decode step can reserve before history
-advances. The batch publishes the request's history and capacity for fetch and write-index
-preparation.
+`max_input_length`. `resize()` checks `capacity - history_length` using the **host**
+history length. With overlap, this gap includes capacity reserved for the next step
+before the host processes the previous step's accepted count.
+
+Fetch and write-index preparation use the **device** history watermark. It can already
+include the accepted tokens while the host still counts their positions in the
+reservation.
 
 The lease size depends on configuration alone. It is taken when the cache is seated in
 a `Batch` and returned when it leaves, so a request holds cells exactly while it is being
@@ -636,11 +699,11 @@ the watermark passes it.
 
 `prepare_sparse_write_indices` gives the model a destination for each in-flight unit.
 It can run before the indexer produces its selections because it needs only the row's
-published capacity and history. A later fetch reuses these cells. Only misses
-below the published watermark read from host pages.
+published capacity and device history. A later fetch reuses these cells. Only misses
+below the device watermark read from host pages.
 
 The output shape is `[batch, buffers, max_in_flight_units]`. Set
-`history_units = floor(published_history / unit_tokens)` and
+`history_units = floor(device_history / unit_tokens)` and
 `capacity_units = floor(published_capacity / unit_tokens)`. For each request and buffer,
 slot `i` holds the arena index for unit `history_units + i` if that ordinal is below
 `capacity_units`. All remaining slots hold `BAD_PAGE_INDEX`. With four-token units and
@@ -658,8 +721,7 @@ The four output positions reference three cells per buffer. Both occurrences of 
 return the same index, and a miss for that unit requires one copy per buffer.
 
 The native fetch serves the decode instance in a disaggregated deployment. The prefill
-instance computes the prompt and hands over its KV cache. The Python sparse-offload
-manager currently rejects speculative decoding at construction.
+instance computes the prompt and hands over its KV cache.
 
 ### Arriving with a history: the bulk watermark jump
 
@@ -689,7 +751,7 @@ there is nothing to write back and no converted table is needed yet.
 
 A row fits when its distinct misses fit in the free or evictable cells. A selected unit
 already resident needs no additional cell. The resolve protects every cell the row names
-and every cell pinned by published history. It uses free cells and evicts the stalest
+and every cell pinned by device history. It uses free cells and evicts the stalest
 eligible entries to satisfy misses. If too few cells are available, the kernel traps
 and the process cannot continue. See [Sizing](#sizing) for the guaranteed capacity.
 
@@ -698,12 +760,24 @@ and the process cannot continue. See [Sizing](#sizing) for the guaranteed capaci
 Selections must name only pure-history units; `num_blocks` carries each request's eligible
 count.
 
+**Host-managed row**
+
 1. `flushSparseUnits(newHistory)` — writes back what the watermark is about to pass. It
    reads the index table as of the last publish, which covers the blocks in range.
 2. `resize(...)` per row, or `Batch::resize` — refused if it would take history past what
    was flushed.
 3. `publish()` — converts this step's indices for the fetch to read.
 4. the fetch, inside the captured graph.
+
+**Device-managed row**
+
+1. After verification, `advanceSparseHistory(advances)` moves each row's device watermark
+   and queues write-back of the newly completed units.
+2. `publish()` — for the next step. Leaves the advanced rows' histories alone.
+3. the fetch, inside the captured graph.
+4. `resize(...)` per row, once the host has read the count — records that step's accepted
+   tokens in the member's host history and returns its unused capacity. The next step may
+   already be in flight.
 
 `publish()` uploads the staged rows asynchronously, so anything that writes what it staged
 has to be separated from it by `waitPublished()` — a direct `resize()` on a member, a
@@ -839,7 +913,7 @@ It also owns three things the sparse path depends on:
   records its events on the stream the flush is launched on.
 - **the converted index tables** (`INDEX_CONVERSION_DESIGN.md`), which both the fetch and
   the write-back read.
-- **the write-back** through `flushSparseUnits()`. See
+- **the write-back** through `flushSparseUnits()` or `advanceSparseHistory()`. See
   [Who flushes](#who-flushes).
 
 **The upload is whole-table by decision.** `publish()` stages every row and sends the table
@@ -911,7 +985,7 @@ Declared in `tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi`:
   `num_selected_blocks` (the selection width `k`), `max_cached_units` (the reservation
   bound), `unit_tokens` and `selection_id`; construction-time, per layer.
 - `KVCacheManagerConfig.sparse_max_in_flight_tokens: int` — maximum gap in tokens between
-  reserved capacity and the request's history length.
+  reserved capacity and the request's host history length.
 - `KVCacheManagerConfig.sparse_queries_per_request: int` — query tokens a request may feed
   one step; a fetch's row is that many selections wide.
 - `KVCacheManager.is_sparse(layer_id, data_role) -> bool`.
@@ -920,8 +994,9 @@ Declared in `tensorrt_llm/runtime/kv_cache_manager_v2/__init__.pyi`:
 - `Batch.fetch_sparse_pages(buffers, selected, out, stream)`.
 - `Batch.sparse_out_slots(buffers) -> list[int]` — the slice of `out` each buffer's
   indices land in, for both the fetch and the write.
-- `Batch.flush_sparse_units(new_history_lengths)` — queues write-back before the caller
-  advances request history.
+- `Batch.flush_sparse_units(new_history_lengths)` and
+  `Batch.advance_sparse_history(advances)` — the write-back, with the history given by the
+  host or advanced on the device; `Batch.history_on_device(row)` tells which a row uses.
 
 Publishing the page table is `Batch`'s job. It must not reuse the dense path's block
 offsets: those are scaled and fold `BAD_PAGE_INDEX` to slot zero, whereas a sparse table
@@ -1339,7 +1414,9 @@ span, which is the span a selection would otherwise have to discover.
 Properties the rest of the design is entitled to assume.
 
 - **Decode only.** A separate prefill instance computes and transfers the prompt KV.
-- **History is monotonic for a request.** `resize()` rejects a decrease in history.
+- **History is monotonic for a request.** `resize()` rejects a decrease in host history.
+  `advanceSparseHistory()` accepts only nonnegative advances within published capacity,
+  and `publish()` preserves device-managed rows' watermarks.
 - **A selection unit never exceeds `tokens_per_block`.** Sub-page units are supported
   through `expansion`; a unit spanning several pages is rejected, which is what keeps slot
   contiguity and k-at-a-time eviction out of the design.
@@ -1351,7 +1428,7 @@ Properties the rest of the design is entitled to assume.
   free-list push. Flushes are triggered by the watermark alone, never by eviction pressure.
 - **Pinning covers unflushed units only.** They are private because unflushed blocks are
   not in the radix tree, and bounded by `max_input_length`. A unit stays pinned until
-  published history passes it, including while capacity does not cover it. Staleness orders
+  device history passes it, including while capacity does not cover it. Staleness orders
   the eligible entries.
 - **No stale-key invalidation.** Per-request cache scope makes it impossible.
 - **`tokens_per_block_override` is not the sparse granularity lever**, and is rejected on a

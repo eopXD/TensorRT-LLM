@@ -1687,7 +1687,10 @@ bool KvCache::resize(std::optional<int> capacity, std::optional<int> historyLeng
             int const unitTokens = mTokensPerBlock / mManager->sparseCacheUnitsPerPage(lc);
             crosses = std::min(newHist, mCapacity) / unitTokens > mHistoryLength / unitTokens;
         }
-        if (crosses)
+        // A row the device advances has had its units written back by each advance, with a
+        // count the host reads only afterwards. Raising the history here is the host taking
+        // that count up, and the Batch holds no record to check it against.
+        if (crosses && !mBatch->historyOnDevice(*mBatchRow))
         {
             // Not equality: a step may resize a row more than once, and a row whose growth
             // failed rolls back to a history below the one flushed for it.

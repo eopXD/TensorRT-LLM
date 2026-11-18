@@ -568,6 +568,8 @@ void Batch::_buildIndexTables(std::vector<IndexTableSpec> const& specs)
 Batch::LayoutGenerator Batch::_layoutFlushRanges()
 {
     mFlushedHistory = TypedVec<BatchRow, int>(BatchRow{mMaxBatchSize}, 0);
+    mHistoryOnDevice = TypedVec<BatchRow, uint8_t>(BatchRow{mMaxBatchSize}, 0);
+    mRowPublished = TypedVec<BatchRow, uint8_t>(BatchRow{mMaxBatchSize}, 0);
 
     bool anySparse = false;
     for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
@@ -579,12 +581,27 @@ Batch::LayoutGenerator Batch::_layoutFlushRanges()
         co_return;
     }
 
-    auto const elements
-        = 2 * static_cast<size_t>(mMaxBatchSize) * static_cast<size_t>(mManager->numLifeCycles().value());
-    mFlushRanges = co_yield elements;
+    auto const lifeCycles = static_cast<size_t>(mManager->numLifeCycles().value());
+    auto const elements = 2 * static_cast<size_t>(mMaxBatchSize) * lifeCycles;
+    mFlushRanges = co_yield elements + lifeCycles;
+    mFlushUnitTokens = mFlushRanges + elements;
     // An empty range asks for nothing, which is what a row that never flushes should read.
     cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(mFlushRanges), 0, elements, cudaStream()));
     mFlushRangeStaging.assign(elements, 0);
+
+    std::vector<int32_t> unitTokens(lifeCycles, 0);
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
+    {
+        if (mManager->hasSparseFetchPath(lcId))
+        {
+            unitTokens[static_cast<size_t>(lcId.value())]
+                = mManager->config().tokensPerBlock / mManager->sparseCacheUnitsPerPage(lcId);
+        }
+    }
+    cuCheck(cuMemcpyHtoDAsync(reinterpret_cast<CUdeviceptr>(mFlushUnitTokens), unitTokens.data(),
+        sizeof(int32_t) * lifeCycles, cudaStream()));
+    // `unitTokens` does not outlive this scope, so the copy out of it has to have landed.
+    cuCheck(cuStreamSynchronize(cudaStream()));
 }
 
 int32_t const* Batch::flushFromUnits(LifeCycleId lifeCycle) const
@@ -620,6 +637,13 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
                 "Batch::flushSparseUnits: row %d was given history %d against capacity %d; flush a history the "
                 "row can take up",
                 row.value(), newHistoryLengths[toSizeT(row)], kvCache->capacity());
+            // The host's count for such a row may be behind the device's, so a range taken
+            // from it would name units already written back, or miss ones that were not.
+            TLLM_CHECK_WITH_INFO(!mHistoryOnDevice[row] || newHistoryLengths[toSizeT(row)] == kvCache->historyLength(),
+                "Batch::flushSparseUnits: row %d's history is advanced on the device, where "
+                "advanceSparseHistory() writes back what it passes; give this call the row's current history "
+                "%d, not %d",
+                row.value(), kvCache->historyLength(), newHistoryLengths[toSizeT(row)]);
         }
     }
     if (!mFlushRanges)
@@ -715,6 +739,92 @@ void Batch::flushSparseUnits(std::vector<int> const& newHistoryLengths)
         writeBackSparseUnits(lcId, cudaStream());
     }
     mFlushCountersDirty = true;
+    mFlushRead = CachedCudaEvent{reinterpret_cast<CudaStream>(cudaStream())};
+}
+
+bool Batch::historyOnDevice(BatchRow row) const
+{
+    TLLM_CHECK_WITH_INFO(row >= 0 && row < mMaxBatchSize, "Batch::historyOnDevice: row is beyond max_batch_size");
+    return mHistoryOnDevice[row] != 0;
+}
+
+void Batch::advanceSparseHistory(int32_t const* advances, std::span<int32_t const> batchRows)
+{
+    TLLM_CHECK_WITH_INFO(advances != nullptr, "Batch::advanceSparseHistory: advances must be provided");
+    TLLM_CHECK_WITH_INFO(mFlushRanges != nullptr,
+        "Batch::advanceSparseHistory: the manager has no sparse cache, so no history is written back from the "
+        "device");
+
+    // The kernel reads a row through the watermarks and the lease the last publish carried.
+    // A member seated since then has neither on the device, so its advance would be dropped
+    // while the row was marked as holding its history there. Checked for every row before
+    // any is marked.
+    size_t numMembers = 0;
+    for (BatchRow row{0}; row < mRows.size(); ++row)
+    {
+        if (mRows[row] == nullptr)
+        {
+            continue;
+        }
+        TLLM_CHECK_WITH_INFO(mRowPublished[row],
+            "Batch::advanceSparseHistory: row %d was seated after the last publish(), so the device does not "
+            "hold its watermarks yet; publish before the step whose tokens this advances over",
+            row.value());
+        ++numMembers;
+    }
+    TLLM_CHECK_WITH_INFO(batchRows.empty() || batchRows.size() == numMembers,
+        "Batch::advanceSparseHistory: batchRows must name every published member exactly once");
+    if (numMembers == 0)
+    {
+        return;
+    }
+    for (BatchRow row{0}; row < mRows.size(); ++row)
+    {
+        if (mRows[row] != nullptr && !mHistoryOnDevice[row])
+        {
+            mHistoryOnDevice[row] = 1;
+            ++mHistoryOnDeviceRows;
+        }
+    }
+
+    // On the Batch's stream throughout, with no upload: the ranges are written where the
+    // scans read them, behind whatever a previous write-back still has to read of them.
+    SparseHistoryAdvanceArgs args;
+    args.leases = _leaseMirror();
+    args.numRows = mMaxBatchSize;
+    args.advance = advances;
+    args.batchRows = batchRows.empty() ? nullptr : batchRows.data();
+    args.numInputs = batchRows.empty() ? mMaxBatchSize : static_cast<int32_t>(batchRows.size());
+    args.historyTokens = reinterpret_cast<int32_t*>(_mirrorAt(BufName::kHistory));
+    args.capacityTokens = reinterpret_cast<int32_t const*>(_mirrorAt(BufName::kCapacity));
+    args.unitTokens = mFlushUnitTokens;
+    args.numLifeCycles = static_cast<int32_t>(mManager->numLifeCycles().value());
+    args.flushRanges = mFlushRanges;
+    launchSparseHistoryAdvance(args, cudaStream());
+
+    // Launched whether or not any row crossed a unit, which only the device knows: a row
+    // whose range is empty leaves the scan at its first check.
+    for (LifeCycleId lcId{0}; lcId < mManager->numLifeCycles(); ++lcId)
+    {
+        if (!mManager->hasSparseFetchPath(lcId))
+        {
+            continue;
+        }
+        if (mFlushCountersDirty)
+        {
+            auto const& scratch = mScratch[lcId];
+            cuCheck(cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(scratch.flushWork.total), 0U,
+                static_cast<size_t>(scratch.flushWork.numLists), cudaStream()));
+        }
+        writeBackSparseUnits(lcId, cudaStream());
+    }
+    mFlushCountersDirty = true;
+    // A later flushSparseUnits() uploads the same ranges from another stream, so it waits
+    // for these scans as it does for its own.
+    if (!mFlushRead.isClosed())
+    {
+        mFlushRead.close();
+    }
     mFlushRead = CachedCudaEvent{reinterpret_cast<CudaStream>(cudaStream())};
 }
 
@@ -1175,6 +1285,12 @@ void Batch::_stageRowState()
     {
         auto const& kvCache = mRows[row];
         history[toSizeT(row)] = kvCache == nullptr ? 0 : kvCache->historyLength();
+        if (mHistoryOnDevice[row])
+        {
+            // The device has advanced the row, and the member's own count may be behind it,
+            // so the device keeps what it holds.
+            history[toSizeT(row)] = kKeepSparseHistory;
+        }
         capacity[toSizeT(row)] = kvCache == nullptr ? 0 : kvCache->capacity();
         TLLM_CHECK_WITH_INFO(capacity[toSizeT(row)] <= capacityLimit,
             "Batch: row %d has capacity %d tokens, past the %lld its page table holds", row.value(),
@@ -1272,6 +1388,9 @@ BatchRow Batch::addKvCache(KvCache& kvCache, std::optional<BatchRow> requestedRo
     // history names already lives in the pages behind it. Seeding from the history is what
     // lets the row be reused, since the departing member leaves this equal to its own.
     mFlushedHistory[row] = kvCache.historyLength();
+    // The device learns of the member at the next publish, which is also where its history
+    // is taken from the count above.
+    mRowPublished[row] = 0;
 
     // Joining is a stream change, so it carries the same cross-stream sync a direct move
     // would: work the member already enqueued has to retire before the Batch's stream
@@ -1312,7 +1431,12 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
     // a member that has written back everything it means to keep looks like. The leases
     // released below discard the GPU cache, and the next occupant seeds its own watermark
     // from its own history, so anything still pending here has no later chance to be noticed.
-    if (mManager->hasSparseCache())
+    //
+    // Not for a row the device advances, which keeps no such record. Each advance issued its
+    // write-back, ahead of the lease reset below on the same stream, and the member's count
+    // is raised afterwards with no flush of its own, so it matches nothing recorded here
+    // once the host has taken a step up, and is behind the device's until then.
+    if (mManager->hasSparseCache() && !mHistoryOnDevice[row])
     {
         TLLM_CHECK_WITH_INFO(kvCache.historyLength() == mFlushedHistory[row],
             "A sparse KvCache leaving row %d has history %d against %d written back; call "
@@ -1351,6 +1475,14 @@ std::shared_ptr<KvCache> Batch::removeKvCache(KvCache& kvCache)
         }
     }
     _seedRowWatermarks(row, 0, 0);
+    // The device's history goes with the member. The next publish stages the free row's
+    // zero over it, and the next occupant's own count after that.
+    if (mHistoryOnDevice[row])
+    {
+        mHistoryOnDevice[row] = 0;
+        --mHistoryOnDeviceRows;
+    }
+    mRowPublished[row] = 0;
     mRows[row] = nullptr;
     return leaving;
 }
@@ -1368,6 +1500,12 @@ void Batch::move(BatchRow dstRow, BatchRow srcRow)
     if (mRows[dstRow] != nullptr)
     {
         throw LogicError("Batch::move: destination row is already occupied");
+    }
+    if (mHistoryOnDevice[srcRow])
+    {
+        // The destination is seeded from the member's own count below, which may be behind
+        // the history the device holds for the source row.
+        throw LogicError("Batch::move: moving a row whose history the device advances is not supported yet");
     }
 
     waitPublished();
@@ -1391,6 +1529,9 @@ void Batch::move(BatchRow dstRow, BatchRow srcRow)
     }
     std::swap(mRows[dstRow], mRows[srcRow]);
     std::swap(mFlushedHistory[dstRow], mFlushedHistory[srcRow]);
+    // Neither row is on the device as it now stands until the next publish.
+    mRowPublished[dstRow] = 0;
+    mRowPublished[srcRow] = 0;
     // The member keeps the cells it already filled, so its lease travels with it rather
     // than its contents being copied into the destination row's.
     std::swap(mRowLease[dstRow], mRowLease[srcRow]);
@@ -1570,10 +1711,34 @@ void Batch::publish()
     // The staging now holds this step's tables, so carrying the mirror across is all that
     // is left on the Batch's stream -- one copy, because the mirror is its tail verbatim.
     mPublished.waitInStream(reinterpret_cast<CudaStream>(cudaStream()));
-    cuCheck(cuMemcpyDtoDAsync(
-        reinterpret_cast<CUdeviceptr>(mMirror.get()), _deviceBufAt(BufName::kHistory), _mirrorBytes(), cudaStream()));
+    if (mHistoryOnDeviceRows == 0)
+    {
+        cuCheck(cuMemcpyDtoDAsync(reinterpret_cast<CUdeviceptr>(mMirror.get()), _deviceBufAt(BufName::kHistory),
+            _mirrorBytes(), cudaStream()));
+    }
+    else
+    {
+        // Some rows hold a history only the device knows, which the copy above would
+        // overwrite with the member's count. The histories lead the mirror, so they go row
+        // by row and the copy takes the rest. The kernel comes first, which leaves the
+        // conversion below behind a copy, as it is on the other path.
+        SparseHistoryPublishArgs args;
+        args.staged = reinterpret_cast<int32_t const*>(_deviceBufAt(BufName::kHistory));
+        args.historyTokens = reinterpret_cast<int32_t*>(_mirrorAt(BufName::kHistory));
+        args.numRows = mMaxBatchSize;
+        launchSparseHistoryPublish(args, cudaStream());
+        cuCheck(cuMemcpyDtoDAsync(_mirrorAt(BufName::kCapacity), _deviceBufAt(BufName::kCapacity),
+            static_cast<size_t>(mBuf[BufName::kLeases].end - mBuf[BufName::kCapacity].beg), cudaStream()));
+    }
     _convertIndices(cudaStream());
     mDeviceStagingConsumed = CachedCudaEvent{reinterpret_cast<CudaStream>(cudaStream())};
+
+    // Only now, with the transfer enqueued: a publish refused above leaves a member seated
+    // since the last one still unknown to the device.
+    for (BatchRow row{0}; row < mRows.size(); ++row)
+    {
+        mRowPublished[row] = mRows[row] != nullptr;
+    }
 }
 
 void Batch::waitPublished()

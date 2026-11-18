@@ -2718,9 +2718,22 @@ class KVCacheManagerV2(BaseResourceManager):
                 shared_draft_block_width=self._shared_draft_block_width,
             )
         )
-        # Tokens a request may hold between its history and its capacity under sparse KV
-        # cache offload: a decode step reserves and writes one token per request.
+        # In ordinary decode, a sparse member's KV history advances by one token per step.
+        # With speculative decoding, it advances by one plus the number of accepted drafts.
+        # Advance history on the GPU so the next forward has its KV write position even
+        # when overlap scheduling enqueues that forward before the host reads the result.
+        self._sparse_history_follows_acceptance = spec_config is not None
+
+        # Bound the gap between reserved capacity and the history length known to the host.
+        # Disaggregated decode can reserve draft slots on arrival. With overlap, the next
+        # step can also reserve slots before the host updates the previous step's history.
         self._sparse_max_in_flight_tokens = 1
+        if spec_config is not None:
+            self._sparse_max_in_flight_tokens = (
+                self._generation_kv_capacity_headroom + self.max_total_draft_tokens
+            )
+            if not disable_overlap_scheduler:
+                self._sparse_max_in_flight_tokens += spec_config.tokens_per_gen_step
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.enable_stats = enable_stats
@@ -10091,7 +10104,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return quota if quota > 0 else None
 
     def update_forward_resources(
-        self, scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
+        self,
+        scheduled_batch: ScheduledRequests,
+        *,
+        wait_for_input_copy: Callable[[], None],
+        forward_outputs: Optional[Dict[str, object]] = None,
     ) -> None:
         """Update resources after a successful model forward has been enqueued.
 
@@ -10101,6 +10118,10 @@ class KVCacheManagerV2(BaseResourceManager):
         can override it; ordinary caches update history after sampling.
         Overrides must call wait_for_input_copy before changing host page tables
         that the model's input preparation may still be copying to the device.
+
+        ``forward_outputs`` is what the forward returned when that is a dict of
+        device tensors, for a manager that takes a step's result from the device
+        instead of waiting for the host to read it.
         """
 
     def update_context_resources(self, scheduled_batch: ScheduledRequests):

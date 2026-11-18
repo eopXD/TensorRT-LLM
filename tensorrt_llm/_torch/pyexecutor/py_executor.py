@@ -11620,9 +11620,13 @@ class PyExecutor:
                     self._stream_ordering_events[1])
 
             if self._is_kv_manager_v2:
+                # The outputs go along for a manager that advances history by
+                # what the forward itself kept, before the host has read it.
                 self.kv_cache_manager.update_forward_resources(
                     scheduled_requests,
-                    wait_for_input_copy=self._wait_for_model_engine_input_copy)
+                    wait_for_input_copy=self._wait_for_model_engine_input_copy,
+                    forward_outputs=outputs
+                    if isinstance(outputs, dict) else None)
 
             self._kv_connector_wait_for_save()
             if route_capture is not None:

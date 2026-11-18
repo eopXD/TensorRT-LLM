@@ -5750,6 +5750,517 @@ class TestSparseFlush(unittest.TestCase):
             manager.shutdown()
 
 
+class _SparseAdvanceRig:
+    """One sparse layer, a Batch over it, and raw access to its cells and host pages."""
+
+    SENTINEL = 0xA5
+
+    def __init__(self, ctypes, cudart, torch, manager, batch, handle, unit_tokens: int) -> None:
+        self.ctypes = ctypes
+        self.cudart = cudart
+        self.torch = torch
+        self.manager = manager
+        self.batch = batch
+        self.handle = handle
+        self.unit_tokens = unit_tokens
+        self.caches: list = []
+        self.buffers = [BufferId(0, "key")]
+        self.layer_group = manager.get_layer_group_id(0)
+        self.units_per_page = TestSparseHistoryAdvance.TPB // unit_tokens
+        self.unit_bytes = TestSparseHistoryAdvance.BUF // self.units_per_page
+        self.pool = int(manager.get_mem_pool_base_address(LayerId(0), "key"))
+        self.stride = manager.get_page_stride(LayerId(0), "key")
+        self.arena = int(batch.get_sparse_cache_base_address(LayerId(0), "key"))
+        self.width = manager.get_sparse_cache_max_in_flight_units(LayerId(0))
+
+    def seat(self, history: int, capacity: int):
+        """Seat a cache holding `history` tokens and room up to `capacity`.
+
+        Resized before it joins, so its row is seeded with that history and the cache needs
+        no write-back to leave again.
+        """
+        cache = self.manager.create_kv_cache()
+        self.caches.append(cache)
+        assert cache.resume(self.handle)
+        assert cache.resize(capacity, history)
+        self.batch.add_kv_cache(cache)
+        return cache
+
+    def publish(self) -> None:
+        self.batch.wait_published()
+        self.batch.publish()
+
+    def units(self, begin_tokens: int, end_tokens: int) -> range:
+        """The units a history watermark passes on its way from one token count to another."""
+        return range(begin_tokens // self.unit_tokens, end_tokens // self.unit_tokens)
+
+    def write_cells(self) -> list[list[int]]:
+        """Each row's cells for its in-flight units, from the first unit above its history."""
+        rows = self.batch.max_batch_size
+        out = self.torch.full((rows, 1, self.width), 12345, dtype=self.torch.int32, device="cuda")
+        self.batch.prepare_sparse_write_indices(self.buffers, out, self.handle)
+        self.torch.cuda.synchronize()
+        return out[:, 0, :].tolist()
+
+    def payload(self, unit: int, version: int) -> bytes:
+        seed = unit + 1 + 1000 * version
+        return bytes((i * seed + 13) % 251 for i in range(self.unit_bytes))
+
+    def fill(self, cell: int, payload: bytes) -> None:
+        """Write a unit's bytes into its cell, as the model would."""
+        source = (self.ctypes.c_ubyte * self.unit_bytes).from_buffer(bytearray(payload))
+        (err,) = self.cudart.cudaMemcpy(
+            self.arena + cell * self.unit_bytes,
+            self.ctypes.addressof(source),
+            self.unit_bytes,
+            self.cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+        )
+        assert int(err) == 0
+
+    def _host(self, cache, unit: int) -> int:
+        pages = [int(x) for x in cache.get_base_page_indices(self.layer_group)]
+        page, unit_in_page = divmod(unit, self.units_per_page)
+        return self.pool + pages[page] * self.stride + unit_in_page * self.unit_bytes
+
+    def poison(self, cache, units) -> None:
+        """Mark the host bytes of `units`, so a write-back that reached them shows."""
+        for unit in units:
+            self.ctypes.memset(self._host(cache, unit), self.SENTINEL, self.unit_bytes)
+
+    def landed(self, cache, unit: int) -> bytes:
+        return self.ctypes.string_at(self._host(cache, unit), self.unit_bytes)
+
+    @property
+    def untouched(self) -> bytes:
+        return bytes([self.SENTINEL]) * self.unit_bytes
+
+    def advance(self, tokens: list[int]) -> None:
+        """Advance every row by a count the device holds, and wait for the write-back."""
+        advances = self.torch.tensor(tokens, dtype=self.torch.int32, device="cuda")
+        self.batch.advance_sparse_history(advances)
+        self.torch.cuda.synchronize()
+
+    def histories(self) -> list[int]:
+        """The histories the device holds, which are what a resolve reads."""
+        self.torch.cuda.synchronize()
+        return _introspection.batch_watermarks(self.batch)[0]
+
+
+class TestSparseHistoryAdvance(unittest.TestCase):
+    """advance_sparse_history: a step's write-back and watermark move, taken from the device.
+
+    A step that writes several tokens per request and keeps a prefix of them produces the
+    count kept on the device. These cover that the units a row keeps are written back and no
+    others, that the watermark a resolve reads moves by that count while the member's own
+    stays behind, that a publish leaves it alone, and what a member whose count is behind
+    may and may not do.
+    """
+
+    TPB = 128
+    BUF = 4096
+    SELECTED = 2
+    CELLS = 4
+    # Not a multiple of four, so with four-token units the span ends inside a unit.
+    IN_FLIGHT_TOKENS = 10
+    # Four tokens short of a block boundary, so the in-flight span reaches into a second
+    # host page at either unit size.
+    HISTORY = TPB - 4
+    CAPACITY = HISTORY + IN_FLIGHT_TOKENS
+
+    def setUp(self) -> None:
+        init_cuda_once()
+
+    @classmethod
+    @contextlib.contextmanager
+    def _rig(cls, unit_tokens: int = 1, rows: int = 1):
+        try:
+            import ctypes
+
+            import cuda.bindings.runtime as cudart
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch and the CUDA bindings are needed to address raw memory")
+        manager = KVCacheManager(
+            KVCacheManagerConfig(
+                tokens_per_block=cls.TPB,
+                cache_tiers=[GpuCacheTierConfig(64 << 20), HostCacheTierConfig(64 << 20)],
+                constraints=[
+                    BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 4)
+                ],
+                layers=[
+                    AttentionLayerConfig(
+                        0,
+                        [
+                            BufferConfig("key", cls.BUF, is_sparse=True),
+                            # A pool group sizes its slots from its device-backed pools.
+                            BufferConfig("index", 256),
+                        ],
+                        sparse_cache=SparseCacheConfig(
+                            num_selected_blocks=cls.SELECTED,
+                            max_cached_units=cls.CELLS * (cls.TPB // unit_tokens),
+                            unit_tokens=unit_tokens,
+                        ),
+                    )
+                ],
+                sparse_max_in_flight_tokens=cls.IN_FLIGHT_TOKENS,
+            )
+        )
+        rig = None
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager,
+                    handle,
+                    max_batch_size=rows,
+                    max_blocks_per_seq=8,
+                    index_tables=manager.sparse_index_table_specs(),
+                )
+                rig = _SparseAdvanceRig(ctypes, cudart, torch, manager, batch, handle, unit_tokens)
+                yield rig
+        finally:
+            if rig is not None:
+                for cache in rig.caches:
+                    if rig.batch.row_of(cache) is not None:
+                        rig.batch.remove_kv_cache(cache)
+                    cache.close()
+            manager.shutdown()
+
+    def _write_in_flight(self, rig, cache, cells: list[int], history: int, version: int) -> dict:
+        """Fill every in-flight unit's cell, and return what each unit was given."""
+        in_flight = rig.units(history, self.CAPACITY)
+        live = cells[: len(in_flight)]
+        self.assertNotIn(BAD_PAGE_INDEX, live, f"a unit in flight has no cell: {cells}")
+        written = {}
+        for unit, cell in zip(in_flight, live):
+            written[unit] = rig.payload(unit, version)
+            rig.fill(cell, written[unit])
+        return written
+
+    def test_an_advance_writes_back_what_a_row_keeps_and_moves_the_watermark_a_resolve_reads(self):
+        """The write-back stops at the count kept, and only the device's history moves.
+
+        Every in-flight unit is written and its host bytes marked, so a write-back that ran
+        to capacity instead of to the count kept shows in the units the row did not keep.
+        """
+        kept = 5
+        for unit_tokens in (1, 4):
+            with self.subTest(unit_tokens=unit_tokens), self._rig(unit_tokens) as rig:
+                in_flight = rig.units(self.HISTORY, self.CAPACITY)
+                passed = rig.units(self.HISTORY, self.HISTORY + kept)
+                self.assertTrue(
+                    0 < len(passed) < len(in_flight), "the advance must split the in-flight span"
+                )
+                cache = rig.seat(self.HISTORY, self.CAPACITY)
+                rig.publish()
+                written = self._write_in_flight(rig, cache, rig.write_cells()[0], self.HISTORY, 0)
+                rig.poison(cache, in_flight)
+
+                rig.advance([kept])
+
+                for unit in in_flight:
+                    expected = written[unit] if unit in passed else rig.untouched
+                    self.assertEqual(
+                        rig.landed(cache, unit),
+                        expected,
+                        f"unit {unit} was {'not ' if unit in passed else ''}written back",
+                    )
+                self.assertEqual(rig.histories(), [self.HISTORY + kept])
+                self.assertTrue(rig.batch.history_on_device(0))
+                self.assertEqual(
+                    cache.history_length, self.HISTORY, "the member's own count moved with it"
+                )
+
+                # The host takes the count up once it has read it, with no flush of its own.
+                rig.batch.wait_published()
+                self.assertTrue(cache.resize(None, self.HISTORY + kept))
+                rig.publish()
+                self.assertEqual(rig.histories(), [self.HISTORY + kept])
+                # The row kept no write-back record for that history, and the member leaves
+                # without one.
+                rig.batch.remove_kv_cache(cache)
+
+    def test_one_advance_serves_every_row_by_its_own_count(self):
+        """Rows keep different counts in one call, and a row that keeps nothing stays put."""
+        with self._rig(rows=4) as rig:
+            kept = [5, 0, 2]
+            caches = [rig.seat(self.HISTORY, self.CAPACITY) for _ in range(4)]
+            rig.batch.remove_kv_cache(caches.pop(1))
+            rig.publish()
+            cells = rig.write_cells()
+            in_flight = rig.units(self.HISTORY, self.CAPACITY)
+            written = []
+            for row, cache in enumerate(caches):
+                written.append(
+                    self._write_in_flight(
+                        rig, cache, cells[rig.batch.row_of(cache)], self.HISTORY, row
+                    )
+                )
+                rig.poison(cache, in_flight)
+
+            rows = rig.torch.tensor([3, 0, 2], dtype=rig.torch.int32, device="cuda")
+            counts = rig.torch.tensor([2, 5, 0], dtype=rig.torch.int32, device="cuda")
+            rig.torch.cuda.synchronize()
+            rig.batch.advance_sparse_history(counts, rows)
+            rig.torch.cuda.synchronize()
+
+            for row, cache in enumerate(caches):
+                passed = rig.units(self.HISTORY, self.HISTORY + kept[row])
+                for unit in in_flight:
+                    expected = written[row][unit] if unit in passed else rig.untouched
+                    self.assertEqual(rig.landed(cache, unit), expected, f"row {row}, unit {unit}")
+            histories = [self.HISTORY + 5, 0, self.HISTORY, self.HISTORY + 2]
+            self.assertEqual(rig.histories(), histories)
+
+            # Repeating the step with zero advances must not replay its old flush ranges.
+            for cache in caches:
+                rig.poison(cache, in_flight)
+            counts.zero_()
+            rig.torch.cuda.synchronize()
+            rig.batch.advance_sparse_history(counts, rows)
+            self.assertEqual(rig.histories(), histories)
+            for cache in caches:
+                for unit in in_flight:
+                    self.assertEqual(rig.landed(cache, unit), rig.untouched)
+
+    def test_a_publish_leaves_a_history_the_device_advanced(self):
+        """A row is published from its member's count when it is seated, and not again.
+
+        The first member's own count stays behind the device's throughout, which is where a
+        host that has not yet read a step's count stands when it publishes for the next one.
+        """
+        with self._rig(rows=2) as rig:
+            first = rig.seat(self.HISTORY, self.CAPACITY)
+            rig.publish()
+            rig.advance([5, 0])
+            self.assertEqual(rig.histories(), [self.HISTORY + 5, 0])
+
+            # A second member joins: its row is seeded from its own count, and the first
+            # row keeps the device's.
+            second = rig.seat(64, 70)
+            rig.publish()
+            self.assertEqual(rig.histories(), [self.HISTORY + 5, 64])
+            self.assertEqual(first.history_length, self.HISTORY)
+
+            rig.advance([0, 3])
+            rig.publish()
+            self.assertEqual(rig.histories(), [self.HISTORY + 5, 67])
+
+            # Catching up changes nothing on the device.
+            rig.batch.wait_published()
+            self.assertTrue(first.resize(None, self.HISTORY + 5))
+            rig.publish()
+            self.assertEqual(rig.histories(), [self.HISTORY + 5, 67])
+
+            # The device's history leaves with the member, and the next occupant of the row
+            # is published from its own count.
+            rig.batch.remove_kv_cache(first)
+            rig.publish()
+            self.assertEqual(rig.histories(), [0, 67])
+            rig.seat(32, 40)
+            rig.publish()
+            self.assertEqual(rig.histories(), [32, 67])
+            self.assertFalse(rig.batch.history_on_device(0))
+            self.assertTrue(rig.batch.history_on_device(1))
+            self.assertEqual(second.history_length, 64)
+
+    def test_a_unit_a_step_did_not_keep_is_rewritten_in_place_and_written_back_once_kept(self):
+        """Two steps over one span: what the first did not keep, the second overwrites.
+
+        The member's own count never moves, and a publish runs between the steps, so the
+        second step's cells are found from the device's history alone. With four-token units
+        the first step keeps too few tokens to complete a unit: nothing is written back, and
+        the unit reaches its host page with the second step's bytes.
+        """
+        first_kept, second_kept = 2, 3
+        for unit_tokens in (1, 4):
+            with self.subTest(unit_tokens=unit_tokens), self._rig(unit_tokens) as rig:
+                in_flight = rig.units(self.HISTORY, self.CAPACITY)
+                cache = rig.seat(self.HISTORY, self.CAPACITY)
+                rig.publish()
+                first_cells = rig.write_cells()[0]
+                first = self._write_in_flight(rig, cache, first_cells, self.HISTORY, 0)
+                rig.poison(cache, in_flight)
+                rig.advance([first_kept])
+
+                after_first = self.HISTORY + first_kept
+                rig.publish()
+                second_cells = rig.write_cells()[0]
+                still_in_flight = rig.units(after_first, self.CAPACITY)
+                offset = still_in_flight[0] - in_flight[0]
+                self.assertEqual(
+                    second_cells[: len(still_in_flight)],
+                    first_cells[offset : offset + len(still_in_flight)],
+                    "a unit the first step did not keep must keep its cell",
+                )
+                second = self._write_in_flight(rig, cache, second_cells, after_first, 1)
+                rig.advance([second_kept])
+
+                after_second = after_first + second_kept
+                kept_by_first = rig.units(self.HISTORY, after_first)
+                kept_by_second = rig.units(after_first, after_second)
+                self.assertTrue(kept_by_second, "the second step must complete a unit")
+                for unit in in_flight:
+                    if unit in kept_by_first:
+                        expected = first[unit]
+                    elif unit in kept_by_second:
+                        expected = second[unit]
+                    else:
+                        expected = rig.untouched
+                    self.assertEqual(rig.landed(cache, unit), expected, f"unit {unit}")
+                self.assertEqual(rig.histories(), [after_second])
+                self.assertEqual(cache.history_length, self.HISTORY)
+
+    def test_a_member_leaves_with_its_count_behind_and_returns_once_it_has_caught_up(self):
+        """A member may leave before the host has read what its last step kept.
+
+        Nothing waits for the write-back before the removal. It is ordered ahead of the
+        lease reset on the Batch's stream, so what the row kept is in its host pages once
+        both have run. The member takes the count up while it is out, and its row is seeded
+        from that when it is seated again.
+        """
+        kept = 5
+        with self._rig() as rig:
+            in_flight = rig.units(self.HISTORY, self.CAPACITY)
+            passed = rig.units(self.HISTORY, self.HISTORY + kept)
+            cache = rig.seat(self.HISTORY, self.CAPACITY)
+            rig.publish()
+            written = self._write_in_flight(rig, cache, rig.write_cells()[0], self.HISTORY, 0)
+            rig.poison(cache, in_flight)
+            advances = rig.torch.tensor([kept], dtype=rig.torch.int32, device="cuda")
+            rig.batch.advance_sparse_history(advances)
+
+            # Before anything waits for the write-back: it is ordered ahead of the lease
+            # reset on the Batch's stream.
+            rig.batch.remove_kv_cache(cache)
+            rig.torch.cuda.synchronize()
+            for unit in passed:
+                self.assertEqual(rig.landed(cache, unit), written[unit], f"unit {unit}")
+            self.assertEqual(cache.history_length, self.HISTORY)
+
+            self.assertTrue(cache.resize(None, self.HISTORY + kept))
+            row = rig.batch.add_kv_cache(cache)
+            rig.publish()
+            self.assertEqual(rig.histories(), [self.HISTORY + kept])
+            self.assertFalse(rig.batch.history_on_device(row))
+            # The cells above the new history are fresh ones: the lease came back empty.
+            cells = rig.write_cells()[0]
+            remaining = rig.units(self.HISTORY + kept, self.CAPACITY)
+            self.assertNotIn(BAD_PAGE_INDEX, cells[: len(remaining)])
+
+    def test_an_advance_refuses_a_member_the_device_has_not_been_told_of(self):
+        """The kernel reads a row through what the last publish carried."""
+        with self._rig() as rig:
+            rig.seat(self.HISTORY, self.CAPACITY)
+            advances = rig.torch.zeros(1, dtype=rig.torch.int32, device="cuda")
+            with self.assertRaisesRegex(Exception, "publish"):
+                rig.batch.advance_sparse_history(advances)
+            self.assertFalse(rig.batch.history_on_device(0))
+            rig.publish()
+            rig.batch.advance_sparse_history(advances)
+            self.assertTrue(rig.batch.history_on_device(0))
+
+    def test_an_advance_takes_one_count_per_row(self):
+        with self._rig(rows=2) as rig:
+            rig.seat(self.HISTORY, self.CAPACITY)
+            rig.publish()
+            short = rig.torch.zeros(1, dtype=rig.torch.int32, device="cuda")
+            with self.assertRaisesRegex(Exception, "one entry per batch row"):
+                rig.batch.advance_sparse_history(short)
+            with self.assertRaisesRegex(ValueError, "same positive length"):
+                rig.batch.advance_sparse_history(short, short.repeat(2))
+            with self.assertRaisesRegex(Exception, "every published member"):
+                rig.batch.advance_sparse_history(short.repeat(2), short.repeat(2))
+
+    def test_a_host_flush_may_only_repeat_the_history_of_a_row_the_device_advances(self):
+        """The member's count may be behind, so a range taken from it would be wrong."""
+        with self._rig() as rig:
+            cache = rig.seat(self.HISTORY, self.CAPACITY)
+            rig.publish()
+            rig.advance([5])
+            rig.batch.flush_sparse_units([cache.history_length])
+            with self.assertRaisesRegex(Exception, "advanced on the device"):
+                rig.batch.flush_sparse_units([self.HISTORY + 5])
+
+    def test_a_row_the_device_advances_cannot_be_moved(self):
+        with self._rig(rows=2) as rig:
+            rig.seat(self.HISTORY, self.CAPACITY)
+            rig.publish()
+            rig.advance([5, 0])
+            with self.assertRaisesRegex(Exception, "not supported yet"):
+                rig.batch.move(1, 0)
+
+    def test_a_manager_without_a_sparse_cache_has_no_history_to_advance(self):
+        try:
+            import torch
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to pass device arrays")
+        manager = TestBatch._manager()
+        try:
+            with TemporaryCudaStream([]) as stream:
+                handle = cast(CudaStream, stream.handle)
+                batch = Batch(
+                    manager, handle, index_tables=[], max_batch_size=1, max_blocks_per_seq=4
+                )
+                advances = torch.zeros(1, dtype=torch.int32, device="cuda")
+                with self.assertRaisesRegex(Exception, "no sparse cache"):
+                    batch.advance_sparse_history(advances)
+        finally:
+            manager.shutdown()
+
+    def test_an_advance_past_capacity_stops_the_process(self):
+        """Tokens above a row's capacity were never written, so there is nothing to keep.
+
+        The advance stops the device instead of moving the watermark over them. That leaves
+        the device unusable to the process, so the advance runs in one of its own.
+        """
+        try:
+            import torch  # noqa: F401
+        except ImportError:  # pragma: no cover - fast mode without torch
+            raise unittest.SkipTest("torch is needed to pass device arrays")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import runpy, sys; runpy.run_path(sys.argv[1])['_advance_a_row_past_its_capacity']()",
+                os.path.abspath(__file__),
+            ],
+            env=_env_outside_the_mpi_job(),
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+        output = result.stdout + result.stderr
+        self.assertIn(_ADVANCE_STOPPED, result.stdout, output)
+        self.assertNotIn(_ADVANCE_RETURNED, result.stdout, output)
+
+
+_ADVANCE_STOPPED = "SPARSE_ADVANCE_STOPPED"
+_ADVANCE_RETURNED = "SPARSE_ADVANCE_RETURNED"
+
+
+def _advance_a_row_past_its_capacity() -> None:
+    """Advance a row one token further than its capacity reaches, and say what happened.
+
+    The entry point of a process of its own: once the advance stops the device nothing here
+    can use it again, so the process leaves without running the destructors that would try.
+    """
+    init_cuda_once()
+    cls = TestSparseHistoryAdvance
+    with cls._rig() as rig:
+        rig.seat(cls.HISTORY, cls.CAPACITY)
+        rig.publish()
+        try:
+            rig.advance([cls.CAPACITY - cls.HISTORY + 1])
+            histories = rig.histories()
+        except RuntimeError as error:
+            print(f"{_ADVANCE_STOPPED}: {error}", flush=True)
+        else:
+            print(f"{_ADVANCE_RETURNED}: {histories}", flush=True)
+        os._exit(0)
+
+
 class TestBatch(unittest.TestCase):
     """Row order and the device-side page table the sparse fetch reads."""
 

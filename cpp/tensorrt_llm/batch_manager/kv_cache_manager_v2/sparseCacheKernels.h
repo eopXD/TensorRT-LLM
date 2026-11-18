@@ -476,6 +476,64 @@ struct SparseFlushListArgs
 //! Launch the flush-list scan. One CTA per (layer, row).
 void launchSparseFlushList(SparseFlushListArgs const& args, CUstream stream);
 
+//! Staged in place of a row's history when the device holds the row's current value, so a
+//! publish leaves it alone. A history is never negative.
+inline constexpr int32_t kKeepSparseHistory = -1;
+
+//! Advance each row's history watermark by a token count the device holds, and name the
+//! units every life cycle has to write back for it.
+//!
+//! A step that writes several tokens per request and keeps a prefix of them produces the
+//! count kept on the device. The host can then state neither the new history nor the units
+//! it passes, so this reads the count, writes the ranges the flush-list scan reads, and
+//! moves the watermark the resolves read.
+struct SparseHistoryAdvanceArgs
+{
+    //! [numRows] the arena slot each row holds. A row holding kNoSparseLease has no
+    //! reservation and is left alone, whatever `advance` holds for it.
+    SparseLeaseIndex const* leases;
+    int32_t numRows;
+
+    //! Optional [numInputs] forward-position to Batch-row map. Without it the input is in row order.
+    int32_t const* batchRows;
+    int32_t numInputs;
+
+    //! [numInputs] tokens kept, in the same order as batchRows. Zero keeps the current history.
+    int32_t const* advance;
+
+    //! [numRows] history length and capacity, in tokens, as the resolves read them. The
+    //! history is advanced in place. An advance that is negative or passes the row's capacity
+    //! stops the device: the tokens between were never written.
+    int32_t* historyTokens;
+    int32_t const* capacityTokens;
+
+    //! [numLifeCycles] tokens one selection unit holds, zero for a life cycle with no sparse
+    //! fetch path. One token count quantises differently per life cycle.
+    int32_t const* unitTokens;
+    int32_t numLifeCycles;
+
+    //! [numLifeCycles][2][numRows] the unit ordinals each row's watermark crossed, as
+    //! [from][to]: the arrays SparseFlushListArgs::fromUnits and toUnits name per life cycle.
+    int32_t* flushRanges;
+};
+
+//! Launch the history advance. One thread per row.
+void launchSparseHistoryAdvance(SparseHistoryAdvanceArgs const& args, CUstream stream);
+
+//! Carry the staged histories into the array the resolves read, leaving a row alone where
+//! the stage holds kKeepSparseHistory.
+struct SparseHistoryPublishArgs
+{
+    //! [numRows] a row's history in tokens, or kKeepSparseHistory.
+    int32_t const* staged;
+    //! [numRows] the histories the resolves read.
+    int32_t* historyTokens;
+    int32_t numRows;
+};
+
+//! Launch the history publish. One thread per row.
+void launchSparseHistoryPublish(SparseHistoryPublishArgs const& args, CUstream stream);
+
 //! Launch the resolve. One CTA per row; enqueues and returns.
 //!
 //! Rejects shapes that are inconsistent or need more shared memory than the device allows.

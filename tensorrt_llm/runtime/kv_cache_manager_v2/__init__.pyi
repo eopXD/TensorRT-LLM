@@ -1221,8 +1221,11 @@ class Batch:
         Returns the arena lease, which **discards whatever the GPU cache held**: a lease
         comes back with every entry free, so a unit whose only copy was in a cell can no
         longer be addressed. Call :meth:`flush_sparse_units` first for anything worth
-        keeping. A batch is meant to persist across steps -- churning membership per step
-        cold-starts every request's cache.
+        keeping; a member whose history is not the one that wrote back to is refused. A row
+        the device advances keeps no such record and has nothing left to write back, so its
+        member may leave whatever its own history is (:meth:`advance_sparse_history`). A
+        batch is meant to persist across steps -- churning membership per step cold-starts
+        every request's cache.
         """
 
     def remove_row(self, row: BatchRow) -> _KVCache | None:
@@ -1241,7 +1244,8 @@ class Batch:
         also writes each life cycle's index-table row once instead of twice.
 
         Raises when either row is out of range, ``src_row`` holds nothing, or ``dst_row`` is
-        occupied. Waits for the previous staging upload. Device tables keep their addresses
+        occupied. Moving a row whose history the device advances is not supported yet and
+        raises too. Waits for the previous staging upload. Device tables keep their addresses
         and reach the new row on the next ``publish``, so a step may resize, move and publish
         once rather than publishing per operation.
         """
@@ -1460,6 +1464,53 @@ class Batch:
 
         Reads the index table as of the last :meth:`publish`, which covers the blocks in
         range because they were allocated by an earlier step.
+
+        A row whose history the device advances -- see :meth:`advance_sparse_history` --
+        may only repeat its current history here.
+        """
+
+    def advance_sparse_history(
+        self,
+        advances: DeviceArray,  # int32[rows]
+        batch_rows: DeviceArray | None = None,  # int32[rows]
+    ) -> None:
+        """Advance each row's history by a token count held on the device.
+
+        For a step that writes several tokens per request and keeps a prefix of them, where
+        the step itself produces the count kept. The host then knows neither the new history
+        nor the units it passes when the step ends, and waiting to read them would hold the
+        next step back. This is :meth:`flush_sparse_units` and the history advance in one,
+        both taken from the device, enqueued on the batch's stream behind the step.
+
+        ``advances`` is in row order: the tokens each row keeps, zero for a row that keeps
+        none or holds no member. Order the batch's stream after whatever produces it. An
+        advance that is negative or passes the row's published capacity stops the device.
+
+        With ``batch_rows``, advances are in forward order. The device int32 map names every
+        published member exactly once, excluding padding. Both arrays have the same length.
+
+        From this call on the device holds the row's history and the member's own count
+        follows it:
+
+        - :meth:`publish` leaves the row's history alone. Every member must have been
+          published before the call, which raises for one that has not.
+        - The member's ``resize`` may raise its history with no :meth:`flush_sparse_units`
+          for it. That is how the host takes the count up once it has read it. Nothing
+          compares it with the device's, so give both the same number.
+        - :meth:`remove_kv_cache` does not hold the member's history to a write-back
+          record, which the row no longer keeps: what the device advanced past is already in
+          its host pages, whether or not the host has taken the count up. A row is seeded
+          from its member's own history, so a member takes the count up before it is seated
+          again.
+        - :meth:`move` refuses the row.
+
+        Raises when the manager has no sparse cache.
+        """
+
+    def history_on_device(self, row: BatchRow) -> bool:
+        """Whether the device has advanced this row's history since its member was seated.
+
+        The member's own count may then be behind the history the device holds.
         """
 
     def prepare_sparse_write_indices(
@@ -1734,10 +1785,10 @@ class Batch:
         """
 
     def flushed_history(self, row: BatchRow) -> int:
-        """The history a row has been written back to.
+        """The history a row has been written back to by :meth:`flush_sparse_units`.
 
         A row that has never needed a flush reads its own history, so a caller may always
-        compare against it.
+        compare against it. It says nothing of a row the device advances.
         """
 
     def publish(self) -> None:
@@ -1822,7 +1873,10 @@ class Batch:
         works in units and divides by ``unit_tokens`` instead. Publishing the source rather
         than the three derived counts keeps one truth.
 
-        A free row reads zero -- a request with nothing eligible.
+        A free row reads zero -- a request with nothing eligible. A row's entry is its
+        member's own count as of the last publish, until :meth:`advance_sparse_history`
+        advances it: from then on the entry is the device's, moved by each advance and left
+        alone by a publish.
         """
 
     def capacities(self) -> DeviceArray:

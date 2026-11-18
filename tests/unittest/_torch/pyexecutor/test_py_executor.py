@@ -984,10 +984,15 @@ def test_free_request_resources_releases_target_and_draft_model_state() -> None:
 
 @pytest.mark.parametrize("is_v2", [False, True])
 @pytest.mark.parametrize("forward_fails", [False, True])
-def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fails: bool) -> None:
+@pytest.mark.parametrize("returns_dict", [False, True])
+def test_forward_step_updates_kv_after_model_stream_join(
+    is_v2: bool, forward_fails: bool, returns_dict: bool
+) -> None:
     batch = ScheduledRequests()
     events = []
-    logits = object()
+    # A dict of device tensors is handed on to the KV cache manager, which may take the
+    # step's result from it; any other output is not.
+    logits = {"new_tokens_lens": object()} if returns_dict else object()
 
     def forward(*args: object, **kwargs: object) -> object:
         events.append("forward")
@@ -1000,7 +1005,10 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
     kv_cache_manager = Mock()
 
     def update_forward_resources(
-        scheduled_batch: ScheduledRequests, *, wait_for_input_copy: Callable[[], None]
+        scheduled_batch: ScheduledRequests,
+        *,
+        wait_for_input_copy: Callable[[], None],
+        forward_outputs: object | None,
     ) -> None:
         wait_for_input_copy()
         events.append("history")
@@ -1028,7 +1036,9 @@ def test_forward_step_updates_kv_after_model_stream_join(is_v2: bool, forward_fa
         executor._handle_errors.assert_not_called()
     if is_v2 and not forward_fails:
         kv_cache_manager.update_forward_resources.assert_called_once_with(
-            batch, wait_for_input_copy=executor._wait_for_model_engine_input_copy
+            batch,
+            wait_for_input_copy=executor._wait_for_model_engine_input_copy,
+            forward_outputs=logits if returns_dict else None,
         )
     else:
         kv_cache_manager.update_forward_resources.assert_not_called()

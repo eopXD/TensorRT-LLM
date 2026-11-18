@@ -232,6 +232,9 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
             ),
         )
         graph_attn_metadata = runner.maybe_get_cuda_graph.return_value[0]
+        graph_rows = torch.tensor([1, 0], dtype=torch.int32)
+        graph_attn_metadata.sparse_offload_state = SimpleNamespace(batch_rows=graph_rows)
+        outputs["new_tokens_lens"] = torch.ones(2, dtype=torch.int32)
         runner.maybe_get_cuda_graph.return_value = (
             graph_attn_metadata,
             engine._metadata.spec_metadata,
@@ -252,7 +255,11 @@ class DecoderGraphForwardTestCase(unittest.TestCase):
                 resource_manager=resource_manager,
             )
 
-        self.assertEqual(actual_outputs, {**outputs, "runtime_draft_len": 0})
+        self.assertIs(actual_outputs["sparse_batch_rows"], graph_rows)
+        self.assertNotIn("sparse_batch_rows", outputs)
+        self.assertEqual(
+            actual_outputs, {**outputs, "sparse_batch_rows": graph_rows, "runtime_draft_len": 0}
+        )
         self.assertIsNot(actual_outputs, outputs)
         graph_batch = runner.maybe_get_cuda_graph.call_args.args[0]
         self.assertEqual(graph_batch.generation_requests, [context, generation])

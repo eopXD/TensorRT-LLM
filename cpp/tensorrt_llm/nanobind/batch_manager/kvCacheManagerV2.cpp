@@ -56,6 +56,7 @@
 #include <nanobind/stl/vector.h>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -3215,7 +3216,55 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Call this before advancing history, not after: a block must be in its host page before it can "
             "be selected, and resize() refuses a history this has not covered. Bounded by the capacity each "
             "row started from, so a resumed request moving history across a whole prompt writes back "
-            "nothing. Reads the index table as of the last publish.")
+            "nothing. Reads the index table as of the last publish. A row whose history the device advances "
+            "may only repeat its current history here.")
+        .def(
+            "advance_sparse_history",
+            [](kv::Batch& self, DeviceArray1D const& advances, std::optional<DeviceArray1D> const& batchRows)
+            {
+                std::span<int32_t const> rows;
+                if (batchRows)
+                {
+                    if (batchRows->shape(0) == 0 || batchRows->shape(0) != advances.shape(0)
+                        || batchRows->device_id() != advances.device_id())
+                    {
+                        throw std::invalid_argument(
+                            "advance_sparse_history: counts and batch rows must have the same positive length and "
+                            "device");
+                    }
+                    rows = {batchRows->data(), batchRows->shape(0)};
+                }
+                else if (advances.shape(0) != static_cast<size_t>(self.maxBatchSize()))
+                {
+                    throw std::invalid_argument("advance_sparse_history: advances must carry one entry per batch row");
+                }
+                auto const* advancesPtr = advances.data();
+                nb::gil_scoped_release rel;
+                self.advanceSparseHistory(advancesPtr, rows);
+            },
+            nb::arg("advances").noconvert(), nb::arg("batch_rows").noconvert().none() = nb::none(),
+            "Advance each row's history by a token count held on the device, writing back the units it "
+            "passes.\n\n"
+            "For a step that writes several tokens per request and keeps a prefix of them, where the step "
+            "itself produces the count kept. It is flush_sparse_units() and the history advance in one, "
+            "both taken from the device, enqueued on the Batch's stream behind the step.\n\n"
+            "advances is int32[max_batch] on the device, in row order: the tokens each row keeps, zero for "
+            "a row that keeps none or holds no member. Order the Batch's stream after whatever produces it. "
+            "With batch_rows, advances are in forward order. batch_rows is a device int32 vector naming every "
+            "published member exactly once, excluding padding. Both vectors have the same length. "
+            "An advance that is negative or passes the row's published capacity stops the device.\n\n"
+            "From this call on the device holds the row's history and the member's own count follows it. "
+            "publish() leaves the row's history alone, so every member must have been published before the "
+            "call. The member's resize() may then raise its history with no flush_sparse_units() for it, "
+            "which is how the host takes up the count once it has read it; give it the number the device "
+            "was given. remove_kv_cache() keeps no write-back record to hold the member's history to, so the "
+            "member may leave before or after taking the count up; it takes the count up before it is seated "
+            "again, since a row is seeded from its member's own history. move() refuses the row.")
+        .def(
+            "history_on_device", [](kv::Batch const& self, int row) { return self.historyOnDevice(kv::BatchRow{row}); },
+            nb::arg("row"),
+            "Whether the device has advanced this row's history since its member was seated, so the "
+            "member's own count may be behind it.")
         .def(
             "prepare_sparse_write_indices",
             [](kv::Batch& self, std::vector<kv::BufferId> const& buffers, DeviceArray3D const& out, nb::object stream)

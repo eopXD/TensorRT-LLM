@@ -907,6 +907,11 @@ class DecoderRunner(ScheduledModelRunner):
             if context_plan is not None and context_plan.handled:
                 outputs = dict(outputs) if isinstance(outputs, dict) else {"logits": outputs}
                 outputs["context_logits_handled"] = True
+            if isinstance(outputs, dict) and "new_tokens_lens" in outputs:
+                sparse_state = getattr(attn_metadata, "sparse_offload_state", None)
+                if sparse_state is not None:
+                    # Graph replay can select a different metadata object for each batch size.
+                    outputs = {**outputs, "sparse_batch_rows": sparse_state.batch_rows}
             if captures_model_body:
                 return outputs
 

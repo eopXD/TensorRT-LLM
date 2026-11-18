@@ -297,7 +297,10 @@ public:
     //! Throws when it is not a member.
     //!
     //! Returns the arena lease, which discards whatever the GPU cache held: a lease comes back
-    //! with every entry free. Call flushSparseUnits() first for anything worth keeping.
+    //! with every entry free. Call flushSparseUnits() first for anything worth keeping, and
+    //! this refuses a member whose history is not the one that wrote back to. A row the
+    //! device advances keeps no such record and has nothing left to write back, so its member
+    //! may leave whatever its own history is; see advanceSparseHistory().
     std::shared_ptr<KvCache> removeKvCache(KvCache& kvCache);
 
     //! The same, by the row addKvCache returned. Null when nothing is seated there.
@@ -311,7 +314,9 @@ public:
     //! entry free -- and so would discard residency the member is still entitled to.
     //!
     //! Throws when either row is out of range, when `srcRow` holds nothing, or when `dstRow`
-    //! is occupied -- including `dstRow == srcRow`, which is both at once.
+    //! is occupied -- including `dstRow == srcRow`, which is both at once. Also when the
+    //! device advances `srcRow`'s history, which is not supported yet: the destination is
+    //! seeded from the member's own count, and that may be behind.
     //!
     //! Waits for the previous staging upload before touching either row. Device tables retain
     //! their addresses; the move reaches them on the next publish.
@@ -370,6 +375,10 @@ public:
     //! into the same hazard. It refuses rather than waiting because a wait here covers only
     //! its own write -- a member mutated before the call has already raced by then, and
     //! waiting would hide it.
+    //!
+    //! A row's history is published from its member's own count, except for a row the device
+    //! advances: the device holds that history, the member's count may be behind it, and the
+    //! publish leaves it alone. See advanceSparseHistory().
     void publish();
 
     //! Write back the units each row's watermark is about to pass, given the history the
@@ -395,7 +404,47 @@ public:
     //!
     //! Reads the index table as of the last publish, which covers the blocks in range for
     //! the same reason -- they were allocated by an earlier step.
+    //!
+    //! A row whose history the device advances -- see advanceSparseHistory() -- may only
+    //! repeat its current history here.
     void flushSparseUnits(std::vector<int> const& newHistoryLengths);
+
+    //! Advance each row's history by a token count held on the device, writing back the
+    //! units it passes.
+    //!
+    //! For a step that writes several tokens per request and keeps a prefix of them, where
+    //! the step itself produces the count kept: the host knows neither the new history nor
+    //! the units it passes when the step ends, and waiting to read them would hold the next
+    //! step back. Enqueued on the Batch's stream behind the step, this is flushSparseUnits()
+    //! and the history advance in one, with both taken from the device.
+    //!
+    //! `advances` is device int32[maxBatchSize] in row order: the tokens each row keeps, zero
+    //! for a row that keeps none or holds no member. The caller orders the Batch's stream
+    //! after whatever produces it. An advance that is negative or passes the row's published
+    //! capacity stops the device, like any other sparse precondition.
+    //!
+    //! With `batchRows`, advances are in forward order. The device map names every
+    //! published member exactly once and excludes padding. Both arrays have the same length.
+    //!
+    //! From this call on the device holds the row's history and the host's count follows it:
+    //! - publish() leaves the row's history alone, so a member is published before it is
+    //!   first advanced and this refuses one that is not.
+    //! - The member's resize() may raise its history without a flushSparseUnits() for it,
+    //!   which is how the host takes up the count once it has read it. Nothing checks that
+    //!   count against the device's; the caller gives both the same number.
+    //! - removeKvCache() does not hold the member's history to a write-back record, which
+    //!   the row no longer keeps: everything the device advanced past is already in its host
+    //!   pages, whether or not the host has taken the count up. The row forgets the device
+    //!   history then, and a later occupant is seeded from its own host history, so a member
+    //!   takes up the count before it is seated again.
+    //! - move() refuses the row.
+    //!
+    //! Throws when the manager has no sparse cache.
+    void advanceSparseHistory(int32_t const* advances, std::span<int32_t const> batchRows = {});
+
+    //! Whether the device has advanced this row's history since its member was seated, so
+    //! the host's count for it may be behind.
+    [[nodiscard]] bool historyOnDevice(BatchRow row) const;
 
     //! Where each of `buffers` reads its indices in fetchSparsePages()' output.
     //!
@@ -523,8 +572,9 @@ public:
     void prepareSparseWriteIndices(std::vector<BufferId> const& buffers, int maxInFlightUnits, int32_t* out,
         std::optional<CUstream> stream = std::nullopt);
 
-    //! The history each row has been written back to. A row that has never needed a flush
-    //! reads its own history, so a caller may always compare against it.
+    //! The history each row has been written back to by flushSparseUnits(). A row that has
+    //! never needed a flush reads its own history, so a caller may always compare against it.
+    //! It says nothing of a row the device advances, whose write-back the host does not see.
     [[nodiscard]] int flushedHistory(BatchRow row) const;
 
     //! Block until the last publish() has finished reading the staging rows.
@@ -708,9 +758,10 @@ private:
     //! token count quantises differently per life cycle. That is why these are per life
     //! cycle where flushedHistory(), which is in tokens, is not.
     //!
-    //! Device memory, written by flushSparseUnits() and read by the scan it launches.
-    //! Stale unless that flush found work: a step where no row crossed a boundary skips
-    //! the upload, which is safe only because nothing reads these then.
+    //! Device memory, written by flushSparseUnits() or advanceSparseHistory() and read by
+    //! the scan either launches. Stale unless that call found work: a flushSparseUnits()
+    //! where no row crossed a boundary skips the upload, which is safe only because nothing
+    //! reads these then.
     [[nodiscard]] int32_t const* flushFromUnits(LifeCycleId lifeCycle) const;
 
     //! @see flushFromUnits
@@ -806,17 +857,30 @@ private:
     void _allocateCopyDesc();
 
     //! Device room for the per-row unit ranges a write-back reads:
-    //! [life cycle][2][maxBatchSize], as [from][to]. Allocated with the fetch scratch,
-    //! which has the same lifetime.
-    //! Yields the elements the write-back ranges need, then clears the slice.
+    //! [life cycle][2][maxBatchSize], as [from][to], then each life cycle's unit size.
+    //! Allocated with the fetch scratch, which has the same lifetime.
+    //! Yields the elements both need, then clears the ranges and fills the unit sizes.
     LayoutGenerator _layoutFlushRanges();
 
     //! Points into mDeviceArena; null when no life cycle holds a sparse cache.
     int32_t* mFlushRanges = nullptr;
+    //! [life cycle] tokens one selection unit holds, zero without a sparse fetch path, for
+    //! the history advance to quantise a token count by. Follows mFlushRanges.
+    int32_t* mFlushUnitTokens = nullptr;
     //! Staged host-side, then handed to a copy that consumes it before returning.
     std::vector<int32_t> mFlushRangeStaging;
-    //! Per row, the history its units have been written back to.
+    //! Per row, the history its units have been written back to. Not kept for a row whose
+    //! history the device advances.
     TypedVec<BatchRow, int> mFlushedHistory;
+    //! Per row, whether advanceSparseHistory() has advanced the member seated there. The
+    //! device then holds the row's history, and publish() stages kKeepSparseHistory for it.
+    TypedVec<BatchRow, uint8_t> mHistoryOnDevice;
+    //! Rows set in mHistoryOnDevice. Zero keeps publish() on the single copy that carries
+    //! every row's history.
+    int mHistoryOnDeviceRows = 0;
+    //! Per row, whether a publish has carried the member seated there to the device, which
+    //! is what the history advance reads the row through.
+    TypedVec<BatchRow, uint8_t> mRowPublished;
     //! Recorded after the write-back, so the next call's staging can wait for its reads.
     CachedCudaEvent mFlushRead = CachedCudaEvent::makeNull();
     //! Whether the write-back counters hold a total some earlier launch left there. The

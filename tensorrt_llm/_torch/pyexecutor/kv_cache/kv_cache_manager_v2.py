@@ -2320,6 +2320,8 @@ class KVCacheManagerV2(BaseResourceManager):
     # offload. Declared on the class so it is present even when an instance is
     # built without running __init__.
     _sparse_kv_offload: Optional[SparseKvCacheOffloadConfig] = None
+    # Query tokens a sparse member feeds one forward; one without speculative decoding.
+    _sparse_queries_per_request: int = 1
     # Host history pages admitted requests hold through their last token; None
     # unless offload runs with no host or disk level below the hot one.
     _host_history_reservations: Optional[HostHistoryReservations] = None
@@ -2734,6 +2736,13 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             if not disable_overlap_scheduler:
                 self._sparse_max_in_flight_tokens += spec_config.tokens_per_gen_step
+
+        # Query tokens a sparse member feeds one forward: the sampled token and its drafts.
+        # Each selects its own top-k, and one fetch resolves the request's selections
+        # together.
+        self._sparse_queries_per_request = (
+            1 if spec_config is None else spec_config.tokens_per_gen_step
+        )
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.enable_stats = enable_stats
@@ -4790,6 +4799,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # _build_cache_config sizes each layer's sparse_cache from this bound, and the
             # native manager checks the two against each other.
             sparse_offload_kwargs["sparse_max_in_flight_tokens"] = self._sparse_max_in_flight_tokens
+            sparse_offload_kwargs["sparse_queries_per_request"] = self._sparse_queries_per_request
 
         rebalance_cfg = kv_cache_config.kv_pool_rebalance_config
         return KVCacheManagerConfigPy(
@@ -5035,6 +5045,7 @@ class KVCacheManagerV2(BaseResourceManager):
             max_batch_size=self.max_batch_size,
             max_blocks_per_seq=self._get_max_blocks_per_seq(self.max_seq_len),
             max_in_flight_tokens=config.sparse_max_in_flight_tokens,
+            queries_per_request=config.sparse_queries_per_request,
         )
         device_bytes = batch.device_bytes + self.get_sparse_offload_scratch_bytes(config)
         return device_bytes, batch.staging_bytes

@@ -26,7 +26,7 @@ from ..mixed_precision_high_rows import (
     mixed_precision_high_row_indices,
     overlay_mixed_precision_high_rows,
 )
-from ..offload_kernels import gather_sparse_batch_rows, merge_sparse_arena_indices
+from ..offload_kernels import merge_sparse_arena_indices, sparse_token_write_rows
 from .indexer import (
     Indexer,
     transform_local_topk_and_prepare_pool_view,
@@ -328,9 +328,10 @@ class DSATrtllmAttention(TrtllmAttention):
     ) -> torch.Tensor:
         """Fetch this layer's selected history and return its latent arena rows.
 
-        The selection holds token ordinals in query order, one query per request.
-        History tokens come from the fetch, the token written this step from its
-        write row, and attention reads both through the layer's arena base. An
+        The selection holds token ordinals in query order; a request's query tokens
+        are consecutive. History tokens come from the fetch, the tokens written this
+        step from their write rows, and attention reads both through the layer's
+        arena base. An
         NVFP4 latent is first dequantized to FP8 scratch rows, and attention reads
         those instead, as it does from the GPU-resident NVFP4 cache.
         """
@@ -365,10 +366,11 @@ class DSATrtllmAttention(TrtllmAttention):
             kv_lengths,
             state.history_lengths,
             fetched[:, data_slot, :],
-            # Entry 0 is the unit at the history watermark, the one this step writes.
-            state.write_indices[len(descriptor.buffer_ids)][:, data_slot, 0],
+            # Entry i is the unit i past the history watermark.
+            state.write_indices[len(descriptor.buffer_ids)][:, data_slot, :],
             metadata.sparse_offload_attn_indices[:num_tokens],
             unit_tokens=descriptor.unit_tokens,
+            queries_per_request=state.queries_per_request,
             coverage=state.coverage,
         )
         if state.nvfp4_scratch is None:
@@ -450,7 +452,11 @@ class DSATrtllmAttention(TrtllmAttention):
     def _prepare_sparse_write_mapping(
         self, metadata: DSAtrtllmAttentionMetadata, layer_idx: Optional[int] = None
     ) -> None:
-        """Publish the reserved arena rows and the writer's one-token page table."""
+        """Publish the reserved arena rows and the writer's one-token page tables.
+
+        Each request gets a one-token page per query token, holding the arena row of
+        the in-flight unit at that token's position, and each token the page it writes.
+        """
         if layer_idx is None:
             layer_idx = self.layer_idx
         state = metadata.sparse_offload_state
@@ -458,14 +464,21 @@ class DSATrtllmAttention(TrtllmAttention):
         write_indices = manager.prepare_sparse_write_indices(state, layer_idx)
         descriptor = state.layers[layer_idx]
         # At the slot: the write resolves coinciding buffers once, as the fetch does.
-        # Entry 0 is the unit at the history watermark, the one this step writes.
         data_slot = state.out_slots[layer_idx][descriptor.data_buffer_index]
-        write_rows = gather_sparse_batch_rows(
-            write_indices[:, data_slot, 0],
+        num_tokens = metadata.num_tokens
+        num_seqs = metadata.num_seqs
+        sparse_token_write_rows(
+            write_indices[:, data_slot, :],
             state.batch_rows,
-            out=metadata.sparse_latent_block_offsets[0, :, 0, 0],
+            metadata.req_idx_per_token[:num_tokens],
+            state.active_request_count,
+            metadata.kv_lens_cuda[:num_seqs],
+            state.history_lengths,
+            metadata.sparse_latent_block_offsets[0, :, 0, :],
+            metadata.sparse_latent_write_slots[:num_tokens],
+            unit_tokens=descriptor.unit_tokens,
+            queries_per_request=state.queries_per_request,
         )
-        metadata.sparse_latent_write_slots.copy_((write_rows >= 0).to(torch.int32) - 1)
 
     def mla_rope_generation(
         self,

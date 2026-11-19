@@ -767,7 +767,7 @@ def _host_batch(*, prefill=False):
         cache.history_length = 0
     metadata = SimpleNamespace(
         sparse_metadata_params=SimpleNamespace(enable_kv_cache_offload=True),
-        sparse_offload_state=SimpleNamespace(prepared=True),
+        sparse_offload_state=SimpleNamespace(prepared=True, queries_per_request=1),
         kv_cache_manager=manager,
         request_ids=[20, 10],
         beam_width=1,

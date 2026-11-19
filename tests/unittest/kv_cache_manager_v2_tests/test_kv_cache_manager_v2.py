@@ -1160,13 +1160,31 @@ class TestSparseCacheReservation(unittest.TestCase):
             self._manager(16256, num_selected_blocks=16255, unit_tokens=1)
 
     def test_manager_rejects_a_row_too_wide_for_resolve_shared_memory(self) -> None:
-        # The probe index and the miss lists follow the row a fetch takes, not the cache, so
-        # the queries per request widen them on their own. Sixteen selections of 2048 units
-        # need over 700 KiB for those two, against a cache one selection wide.
+        # The probe index and the miss list follow the row a fetch takes, not the cache, so
+        # the queries per request widen them on their own. Eight selections of 2048 units
+        # need 256 KiB for the probe index alone, against a cache one selection wide.
         with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
+            self._manager(
+                2049, num_selected_blocks=2048, unit_tokens=1, sparse_queries_per_request=8
+            )
+        # Sixteen would also need probe positions past the 16 bits a miss is recorded in.
+        with self.assertRaisesRegex(RuntimeError, "probe table can index"):
             self._manager(
                 2049, num_selected_blocks=2048, unit_tokens=1, sparse_queries_per_request=16
             )
+
+    def test_a_four_query_row_fits_the_widest_cache_it_needs(self) -> None:
+        # GLM-5.2 MTP3: four selections of 2048 token units beside 13 in flight, in the
+        # widest cache the probe can name. The resolve holds a 32768-word probe index,
+        # 16256 entries and 16-bit miss positions, which fit one block on SM100.
+        manager = self._manager(
+            16256,
+            num_selected_blocks=2048,
+            unit_tokens=1,
+            sparse_queries_per_request=4,
+            sparse_max_in_flight_tokens=13,
+        )
+        manager.shutdown()
 
     def test_the_cache_floor_is_one_querys_selection_however_wide_the_row(self) -> None:
         """sparse_queries_per_request widens the row a fetch takes and leaves the floor alone.

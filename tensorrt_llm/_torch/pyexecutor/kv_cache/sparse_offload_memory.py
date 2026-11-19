@@ -67,6 +67,9 @@ _MIB = float(1 << 20)
 # ---------------------------------------------------------------------------
 
 # SparseCellArena rounds every region to this many bytes.
+# The most cells one selection's cache may hold: the resolve's probe word names an entry
+# in 14 bits, two values of which it reserves (SparseCacheConfig::kMaxCacheEntries).
+SPARSE_MAX_CACHE_ENTRIES = (1 << 14) - 2
 SPARSE_ARENA_ALIGNMENT = 256
 # One zeroed KV tile per pool, outside the usable cells (kTailUnits in sparseCache.cpp).
 _SPARSE_ARENA_TAIL_UNITS = 128
@@ -611,6 +614,35 @@ def sparse_cache_cells(
     return ceil_div(selected_units + max_in_flight_units, units_per_cell)
 
 
+def resolve_sparse_cache_factor(
+    gpu_cache_factor: float, *, explicit: bool, queries_per_request: int
+) -> float:
+    """Return the selections of one query a request's GPU cache holds.
+
+    A step resolves the selections of all ``queries_per_request`` query tokens of a
+    request together, so its cache must hold that many selections for any step to
+    fit, however little they overlap. The default factor scales with the queries so
+    each one keeps the room a single query has; an explicit factor is taken as
+    given, but may not be smaller than that floor.
+
+    Args:
+        gpu_cache_factor: ``SparseKvCacheOffloadConfig.gpu_cache_factor``.
+        explicit: Whether the user set it, rather than leaving the default.
+        queries_per_request: The manager config's ``sparse_queries_per_request``.
+    """
+    if queries_per_request <= 0:
+        raise ValueError(f"queries_per_request must be positive, got {queries_per_request}")
+    if not explicit:
+        return gpu_cache_factor * queries_per_request
+    if gpu_cache_factor < queries_per_request:
+        raise ValueError(
+            f"sparse_kv_offload.gpu_cache_factor={gpu_cache_factor} cannot hold the selections "
+            f"of the {queries_per_request} query tokens a request feeds each step; set it to "
+            f"at least {queries_per_request}, or leave it unset"
+        )
+    return gpu_cache_factor
+
+
 def sparse_cache_config(
     *,
     num_selected_units: int,
@@ -619,6 +651,7 @@ def sparse_cache_config(
     gpu_cache_factor: float,
     max_in_flight_tokens: int,
     selection_id: int | None = None,
+    queries_per_request: int = 1,
 ) -> SparseCacheConfig:
     """Return a layer's sparse fetch path whose cache holds ``gpu_cache_factor`` selections.
 
@@ -643,6 +676,9 @@ def sparse_cache_config(
             layers an indexer selects for, and those layers must agree on every
             other argument here. None, the default, means the layer selects for
             itself; a layer that names nothing never shares.
+        queries_per_request: Query tokens a request feeds a step, each with its own
+            selection. The cache is capped at the entries the resolve can name, but
+            never below the selections of every query beside the units in flight.
     """
     if unit_tokens is not None and (unit_tokens <= 0 or tokens_per_block % unit_tokens):
         raise ValueError(
@@ -652,12 +688,25 @@ def sparse_cache_config(
     # Resolved rather than passed through: the config names a unit size, and a whole
     # page is one of them. None is this helper's convenience, not the config's.
     resolved_unit_tokens = tokens_per_block // units_per_page
+    in_flight_units = sparse_max_in_flight_units(max_in_flight_tokens, resolved_unit_tokens)
     cells = sparse_cache_cells(
-        gpu_cache_factor,
-        num_selected_units,
-        units_per_page,
-        sparse_max_in_flight_units(max_in_flight_tokens, resolved_unit_tokens),
+        gpu_cache_factor, num_selected_units, units_per_page, in_flight_units
     )
+    if queries_per_request > 1:
+        # Capped where the resolve can no longer name an entry. Every query's selection
+        # beside the units in flight must still fit, or a step could be unresolvable.
+        max_cells = SPARSE_MAX_CACHE_ENTRIES // units_per_page
+        min_cells = ceil_div(
+            queries_per_request * num_selected_units + in_flight_units, units_per_page
+        )
+        if min_cells > max_cells:
+            raise ValueError(
+                f"A sparse cache for {queries_per_request} query tokens of "
+                f"{num_selected_units} selected units needs {min_cells * units_per_page} "
+                f"entries, more than the {max_cells * units_per_page} the resolve can name; "
+                "use fewer draft tokens"
+            )
+        cells = min(max(cells, min_cells), max_cells)
     return SparseCacheConfig(
         num_selected_blocks=num_selected_units,
         max_cached_units=cells * units_per_page,

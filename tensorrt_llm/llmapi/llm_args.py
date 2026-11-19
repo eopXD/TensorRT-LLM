@@ -1034,11 +1034,15 @@ class SparseKvCacheOffloadConfig(StrictBaseModel):
         status="prototype",
         description=
         "Size of each request's GPU cache for offloaded attention history, in "
-        "selections: the cache holds this many times the units one decode step "
-        "selects, plus the unit being written, rounded up to whole pages. A "
+        "selections: the cache holds this many times the units one query token "
+        "selects, plus the units being written, rounded up to whole pages. A "
         "larger cache keeps more history on the GPU between decode steps, so "
         "fewer units are fetched from host memory, at the cost of GPU memory per "
-        "request.")
+        "request. With speculative decoding a step feeds each request its "
+        "sampled token and its drafts, and resolves their selections together: "
+        "left unset, the factor is multiplied by that token count, and a value "
+        "set explicitly must be at least that count. The cache is capped at "
+        "what the sparse resolve can address.")
     host_history_size: Optional[NonNegativeInt] = Field(
         default=None,
         status="prototype",

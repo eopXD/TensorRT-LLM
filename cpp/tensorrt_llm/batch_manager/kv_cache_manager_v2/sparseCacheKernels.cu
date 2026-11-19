@@ -101,7 +101,6 @@ struct SmemLayout
     size_t entry = 0;
     size_t flag = 0;
     size_t missPosition = 0;
-    size_t missOrd = 0;
     size_t hist = 0;
     size_t total = 0;
 };
@@ -118,10 +117,9 @@ __host__ __device__ inline SmemLayout smemLayout(int32_t tableSize, int32_t entr
     offset = alignUp16(offset + sizeof(uint32_t) * static_cast<size_t>(entries));
     layout.flag = offset;
     offset = alignUp16(offset + sizeof(uint8_t) * static_cast<size_t>(entries));
+    // A miss is named by its position in the table alone, which also holds its ordinal.
     layout.missPosition = offset;
-    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
-    layout.missOrd = offset;
-    offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(required));
+    offset = alignUp16(offset + sizeof(uint16_t) * static_cast<size_t>(required));
     layout.hist = offset;
     offset = alignUp16(offset + sizeof(int32_t) * static_cast<size_t>(kAgeBuckets));
     layout.total = offset;
@@ -272,6 +270,12 @@ struct QueryTable
             == (keyed | kTableSlotMask);
     }
 
+    //! The ordinal keyed at `position`, which must be keyed.
+    __device__ int32_t ordinalAt(uint32_t position) const
+    {
+        return static_cast<int32_t>(word[position] >> kTableSlotBits);
+    }
+
     //! Name `slot` as the entry holding `ordinal`, at the position claimMiss() returned.
     __device__ void setSlot(uint32_t position, int32_t ordinal, int32_t slot) const
     {
@@ -410,8 +414,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     QueryTable const table(smem + layout.table);
     auto* entryCache = reinterpret_cast<uint32_t*>(smem + layout.entry);
     auto* flag = reinterpret_cast<uint8_t*>(smem + layout.flag);
-    auto* missPosition = reinterpret_cast<int32_t*>(smem + layout.missPosition);
-    auto* missOrd = reinterpret_cast<int32_t*>(smem + layout.missOrd);
+    auto* missPosition = reinterpret_cast<uint16_t*>(smem + layout.missPosition);
     auto* hist = reinterpret_cast<int32_t*>(smem + layout.hist);
 
     __shared__ typename Scan::TempStorage temp;
@@ -530,8 +533,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         if (slot == kNoSparseSlot && table.claimMiss(ord, mask, position))
         {
             int32_t const j = atomicAdd(&numMiss, 1);
-            missOrd[j] = ord;
-            missPosition[j] = static_cast<int32_t>(position);
+            missPosition[j] = static_cast<uint16_t>(position);
         }
     }
     if (resolvedMine > 0)
@@ -548,7 +550,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         int32_t mine = 0;
         for (int32_t j = tid; j < numMiss; j += kResolveThreads)
         {
-            mine += missOrd[j] < historyUnits ? 1 : 0;
+            mine += table.ordinalAt(missPosition[j]) < historyUnits ? 1 : 0;
         }
         int32_t scanned = 0;
         int32_t claimed = 0;
@@ -622,9 +624,10 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
             continue;
         }
         int32_t const j = atomicAdd(&victimCounter, 1);
-        int32_t const ordinal = missOrd[j];
+        uint32_t const position = missPosition[j];
+        int32_t const ordinal = table.ordinalAt(position);
         entry[s] = SparseEntry::pack(SparseEntry::usedByte(stepAge, false), static_cast<uint32_t>(ordinal));
-        table.setSlot(static_cast<uint32_t>(missPosition[j]), ordinal, s);
+        table.setSlot(position, ordinal, s);
         // Only history has anything to fetch. An in-flight unit's host page is not
         // written until the watermark passes it, so copying from it would read stale
         // bytes over the data the model is about to write.
@@ -1208,6 +1211,13 @@ int resolveThreads(int32_t entriesPerSelection, int32_t selectionWidth, int32_t 
 
 size_t checkedSparseResolveSharedBytes(int32_t entriesPerSelection, int32_t selectionWidth, int32_t maxInFlightUnits)
 {
+    // A miss is recorded by its 16-bit position in the probe table, which is twice the
+    // row rounded up to a power of two.
+    TLLM_CHECK_WITH_INFO(nextPow2(2 * (maxInFlightUnits + selectionWidth)) <= (1 << 16),
+        "Sparse resolve: a row of " + std::to_string(selectionWidth) + " selected and "
+            + std::to_string(maxInFlightUnits)
+            + " in-flight units is wider than the resolve's probe table can index; reduce "
+              "num_selected_blocks or sparse_queries_per_request");
     size_t const shared = sparseResolveSharedBytes(entriesPerSelection, selectionWidth, maxInFlightUnits);
     int32_t const limit = sparseResolveSharedLimit();
     TLLM_CHECK_WITH_INFO(shared <= static_cast<size_t>(limit),

@@ -830,14 +830,17 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             # a group and distinct between them; it is not a layer reference.
             return None if leader is None else -(leader + 1)
 
+        cache_factor = self._sparse_offload_cache_factor(config)
+
         def cache_for(local_layer_idx: int):
             return sparse_cache_config(
                 num_selected_units=self._sparse_offload_topk,
                 unit_tokens=DSA_SPARSE_UNIT_TOKENS,
                 tokens_per_block=self.tokens_per_block,
-                gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
+                gpu_cache_factor=cache_factor,
                 max_in_flight_tokens=config.sparse_max_in_flight_tokens,
                 selection_id=selection_id(local_layer_idx),
+                queries_per_request=config.sparse_queries_per_request,
             )
 
         sparse_roles = self._sparse_latent_roles()
@@ -970,14 +973,15 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
         """Count the offload state, the latent writer's one-token page table and the
         indices the sparse attention reads.
 
-        Per Batch row, the page table holds a K and a V offset and the write slots
-        one entry, since an offloading step has one query token per request, and the
-        attention reads ``topk`` merged indices. Both metadata copies hold them.
+        Per Batch row and query token a request may feed a step, the page table
+        holds a K and a V offset and the write slots one entry, and the attention
+        reads ``topk`` merged indices. Both metadata copies hold them.
         """
         scratch = super().get_sparse_offload_scratch_bytes(config)
         if scratch:
-            writer_entries = 3 * self.max_batch_size
-            attn_index_entries = self.max_batch_size * self._sparse_offload_topk
+            query_rows = self.max_batch_size * config.sparse_queries_per_request
+            writer_entries = 3 * query_rows
+            attn_index_entries = query_rows * self._sparse_offload_topk
             scratch += (
                 SPARSE_OFFLOAD_STATE_COPIES
                 * (writer_entries + attn_index_entries)

@@ -2789,8 +2789,25 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
 
         Each decode step fetches the indexer-selected tokens into a GPU cache.
         Only a decode-only worker can offload, so the context server keeps its
-        history resident. Offload takes no speculative decoding.
+        history resident.
         """
+        self._run_kv_cache_offload(kv_dtype=kv_dtype)
+
+    @pytest.mark.timeout(1800)
+    @pytest.mark.skip_less_device(4)
+    def test_kv_cache_offload_mtp(self) -> None:
+        """LongBench v2 tokens and accepted drafts match with MTP over offloaded history.
+
+        One-engine MTP verifies the sampled token and its drafts in every decode
+        step, resolving their selections together, and the MTP layer's latent is
+        offloaded as its own selection.
+        """
+        self._run_kv_cache_offload(kv_dtype="fp8", max_draft_len=3)
+
+    def _run_kv_cache_offload(self,
+                              *,
+                              kv_dtype: str,
+                              max_draft_len: int = 0) -> None:
         # Both servers use the same KV dtype for transfer and decode.
         kv_cache_config = {
             "dtype": kv_dtype,
@@ -2846,7 +2863,8 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
                                           self.MODEL_PATH,
                                           model_name=self.MODEL_NAME,
                                           index_topk=2048,
-                                          unit_tokens=1)
+                                          unit_tokens=1,
+                                          max_draft_len=max_draft_len)
 
 
 @pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)

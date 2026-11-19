@@ -432,6 +432,14 @@ across ranks, so a rank with an unsupported layer stops its peers before serving
 Multiplicative hashing rather than identity, because ordinals are small and dense, and dense
 runs make an unsuccessful probe walk the whole run.
 
+**A miss is recorded by its table position alone.** The position's word already holds the
+ordinal, so the miss list keeps one 16-bit position per miss and reads the ordinal back
+from the table when it assigns the victim. That bounds the table at 65,536 positions, a row
+of at most 32,768 required units, which the shared-memory check enforces. At GLM-5.2 MTP3
+(a row of `4 * 2048` units beside 13 in flight, a cache of 16,256 entries) the CTA takes
+about 224 KiB: the 128 KiB table, 64 KiB of entry words, 16 KiB of flags and 16 KiB of
+miss positions.
+
 The table stays at `next_pow2(2 * required)` rather than being right-sized to a load factor
 of one half. Right-sizing measured *slower*: the publish pass is dominated by *unsuccessful*
 probes, whose expected cost is `0.5 * (1 + 1/(1-a)^2)` and so rises much faster in the load
@@ -971,6 +979,13 @@ default to one.
   misses fit the free or evictable cells.
 - **Retention** — extra cells can retain history for later steps. For single-query decode,
   `2k`–`4k` is the starting range reported by HiSparse, subject to the configuration minimum.
+
+The Python managers size `N` from `SparseKvCacheOffloadConfig.gpu_cache_factor`, in
+selections of one query. Left at its default, the factor is multiplied by `S`, so a step
+always has room for the worst-case row and each query keeps the retention a single query
+has; set explicitly, it must be at least `S`. The result is capped at the largest whole-page
+cache the probe can name (16,256 token units at 128 per page), but never below `S * k + H`.
+A step therefore never meets a row it cannot resolve, which would stop the process.
 
 The batch reserves `max_batch_size` leases of `N` units per buffer. For measured demand,
 see [Measuring how full the cache gets](#measuring-how-full-the-cache-gets).

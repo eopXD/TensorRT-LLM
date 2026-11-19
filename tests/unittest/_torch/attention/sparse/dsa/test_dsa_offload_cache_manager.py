@@ -878,6 +878,11 @@ def test_overlapped_write_mapping_tracks_reordered_requests(monkeypatch, dtype, 
         sparse_latent_write_slots=torch.full(
             (MAX_BATCH_SIZE,), -1, dtype=torch.int32, device="cuda"
         ),
+        # One query token per request, at its history watermark.
+        num_tokens=len(requests),
+        num_seqs=len(requests),
+        req_idx_per_token=torch.arange(len(requests), dtype=torch.int32, device="cuda"),
+        kv_lens_cuda=torch.zeros(len(requests), dtype=torch.int32, device="cuda"),
     )
     observed = torch.empty((2, MAX_BATCH_SIZE), dtype=torch.int32, device="cuda")
     observed_slots = torch.empty_like(observed)
@@ -932,6 +937,9 @@ def test_overlapped_write_mapping_tracks_reordered_requests(monkeypatch, dtype, 
             manager.prepare_resources(scheduled)
             manager.prepare_sparse_offload(
                 state, [request.py_request_id for request in ordered], beam_width=1
+            )
+            metadata.kv_lens_cuda.copy_(
+                state.history_lengths[state.batch_rows[: len(requests)].long()] + 1
             )
             with with_multi_stream(True):
                 if capture and graph is None:

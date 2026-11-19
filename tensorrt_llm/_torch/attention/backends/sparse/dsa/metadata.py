@@ -421,14 +421,21 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.sparse_offload_write_pending: Optional[int] = None
         self.sparse_offload_fetch_pending: Optional[int] = None
         self.sparse_offload_next_shared_layer: dict[int, int] = {}
+        self.sparse_offload_queries_per_request = 1
         if not self._offloads_dsa_latent():
             return
+        if self.enable_ragged_verification:
+            raise NotImplementedError(
+                "DSA KV cache offload does not support ragged speculative verification"
+            )
         self.sparse_offload_stream = torch.cuda.Stream()
         self.sparse_offload_start_event = torch.cuda.Event()
         self.sparse_offload_write_event = torch.cuda.Event()
         self.sparse_offload_fetch_event = torch.cuda.Event()
         manager = self.kv_cache_manager
-        layers = get_sparse_offload_metadata_layers(self)
+        # The DSA writer and merge address every query token of a request, so
+        # one-model MTP can verify and draft over offloaded history.
+        layers = get_sparse_offload_metadata_layers(self, allow_speculation=True)
         local_layers = manager.pp_layers
         indexer_mask = manager.indexer_k_cache_local_layer_mask
         self.sparse_offload_next_shared_layer = {
@@ -439,6 +446,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             if not has_indexer and previous in layers and following in layers
         }
         batch = manager.max_batch_size
+        init_config = manager.impl.init_config
+        # Query tokens a request feeds one forward: the sampled token and its drafts.
+        queries = init_config.sparse_queries_per_request
+        self.sparse_offload_queries_per_request = queries
 
         def allocate(name: str, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
             return self.get_empty(
@@ -456,25 +467,30 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             layers,
             max_batch_size=batch,
             topk=self.sparse_mla_topk,
-            max_in_flight_units=manager._sparse_offload_max_in_flight_units(
-                manager.impl.init_config
-            ),
+            max_in_flight_units=manager._sparse_offload_max_in_flight_units(init_config),
             nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
+            queries_per_request=queries,
         )
+        # The latent writer addresses each request through one-token pages, one per
+        # query token, each holding the arena row of the unit that token completes.
         self.sparse_latent_block_offsets = allocate(
-            "latent_block_offsets", (1, batch, 2, 1), torch.int32
+            "latent_block_offsets", (1, batch, 2, queries), torch.int32
         )
         self.sparse_latent_block_offsets.fill_(-1)
-        self.sparse_latent_write_slots = allocate("latent_write_slots", (batch,), torch.int32)
+        self.sparse_latent_write_slots = allocate(
+            "latent_write_slots", (batch * queries,), torch.int32
+        )
         self.sparse_latent_write_slots.fill_(-1)
         self.sparse_offload_attn_indices = allocate(
-            "attn_indices", (batch, self.sparse_mla_topk), torch.int32
+            "attn_indices", (batch * queries, self.sparse_mla_topk), torch.int32
         )
 
     def _validate_dsa_sparse_offload_batch(self) -> None:
         """Reject batches offload cannot run, on the host before any model writes.
 
-        An offloading worker only decodes, one query token per request.
+        An offloading worker only decodes. A request feeds a forward one query
+        token, or with speculative decoding its sampled token and drafts, at most
+        ``sparse_offload_queries_per_request`` of them.
         """
         self.sparse_offload_state.prepared = False
         if self.num_contexts:
@@ -484,8 +500,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             )
         if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
             raise ValueError("Sparse offload batch validation requires host sequence lengths")
-        if not torch.equal(self.seq_lens, self.seq_lens_kv) or not torch.all(self.seq_lens == 1):
-            raise NotImplementedError("Sparse offload decode requires one query per request")
+        queries = self.sparse_offload_state.queries_per_request
+        if not torch.equal(self.seq_lens, self.seq_lens_kv) or not torch.all(
+            (self.seq_lens >= 1) & (self.seq_lens <= queries)
+        ):
+            raise NotImplementedError(
+                f"Sparse offload decode requires one to {queries} query tokens per request"
+            )
 
     def _has_mixed_precision_staging(self) -> bool:
         # No staging: attention reads the gather's FP8 scratch.

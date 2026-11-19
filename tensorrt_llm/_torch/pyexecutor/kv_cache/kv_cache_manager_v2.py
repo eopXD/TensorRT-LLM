@@ -2322,6 +2322,9 @@ class KVCacheManagerV2(BaseResourceManager):
     _sparse_kv_offload: Optional[SparseKvCacheOffloadConfig] = None
     # Query tokens a sparse member feeds one forward; one without speculative decoding.
     _sparse_queries_per_request: int = 1
+    # A subclass whose sparse backend reads several query tokens per request
+    # sets this to accept a fixed-length speculative decoding config.
+    _sparse_offload_allows_speculation: bool = False
     # Host history pages admitted requests hold through their last token; None
     # unless offload runs with no host or disk level below the hot one.
     _host_history_reservations: Optional[HostHistoryReservations] = None
@@ -2447,7 +2450,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # memory passes their sizing; the manager then accounts for that memory.
         if sparse_kv_offload_config is not None:
             self._check_sparse_kv_offload_config(
-                sparse_kv_offload_config, kv_cache_config, mapping, spec_config=spec_config
+                sparse_kv_offload_config,
+                kv_cache_config,
+                mapping,
+                spec_config=spec_config,
+                allow_speculation=self._sparse_offload_allows_speculation,
             )
         self._sparse_kv_offload = sparse_kv_offload_config
         self._validate_speculative_config(spec_config)
@@ -8371,15 +8378,20 @@ class KVCacheManagerV2(BaseResourceManager):
         mapping: Mapping,
         *,
         spec_config: Optional["DecodingBaseConfig"],
+        allow_speculation: bool = False,
     ) -> None:
         """Reject sparse KV cache offload settings any rank cannot honor.
 
         Host memory differs by node, so every rank calls this at the same point,
         and all of them raise when any rank cannot honor the settings.
 
+        Args:
+            allow_speculation: The sparse backend reads several query tokens per
+                request, as a fixed-length draft step feeds them.
+
         Raises:
-            ValueError: KV pool rebalancing, speculative decoding or pipeline
-                parallelism is enabled, or the host history size, with an explicit
+            ValueError: KV pool rebalancing, unsupported speculative decoding or
+                pipeline parallelism is enabled, or the host history size, with an explicit
                 host cache tier, exceeds this rank's share of available host memory or
                 the pinned-memory limit.
             RuntimeError: Another rank cannot honor the settings.
@@ -8393,11 +8405,24 @@ class KVCacheManagerV2(BaseResourceManager):
                 "take their pool group's slot count, so a rebalance would resize pinned host "
                 "memory outside the host budget."
             )
-        elif spec_config is not None:
+        elif spec_config is not None and not allow_speculation:
             error = ValueError(
                 "Sparse KV cache offload does not support speculative decoding: a sparse cache "
                 "takes one input token per decode step. Remove speculative_config or disable "
                 "sparse_attention_config.enable_kv_cache_offload."
+            )
+        elif spec_config is not None and (
+            getattr(spec_config, "draft_len_schedule", None)
+            or (
+                (getattr(spec_config, "acceptance_rate_window_size", 0) or 0) > 0
+                and (getattr(spec_config, "acceptance_rate_threshold", 0) or 0) > 0
+            )
+        ):
+            error = ValueError(
+                "Sparse KV cache offload does not support speculative decoding with a variable "
+                "draft length: the history it sets aside for CUDA-graph padding covers one "
+                "padding request. Remove draft_len_schedule and the acceptance-rate fallback, "
+                "or disable sparse_attention_config.enable_kv_cache_offload."
             )
         elif mapping.pp_size > 1:
             error = ValueError(
@@ -8492,7 +8517,7 @@ class KVCacheManagerV2(BaseResourceManager):
         These are the CUDA-graph padding dummies, one per reserved index slot,
         an attention-DP dummy when attention DP is on, and the guard page when
         it is held. Each holds one token plus its draft and extra tokens.
-        Offload rejects speculative decoding (``_check_sparse_kv_offload_config``),
+        Offload rejects a variable draft length (``_check_sparse_kv_offload_config``),
         so padding uses one draft length and needs one dummy; the count relies
         on that.
         """

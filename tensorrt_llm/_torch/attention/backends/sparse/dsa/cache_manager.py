@@ -434,6 +434,8 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
     # The history is already NVFP4 here; only the mixed-precision high layers are added.
     _supports_mixed_precision_kv = True
     _own_pool_is_mixed_precision_low = True
+    # Offload resolves every verify and draft token of a request in one selection.
+    _sparse_offload_allows_speculation = True
 
     def __init__(
         self,

@@ -6692,6 +6692,25 @@ def test_sparse_kv_offload_rejects_speculative_decoding() -> None:
             Mapping(),
             spec_config=MTPDecodingConfig(max_draft_len=1),
         )
+    # A backend that reads several query tokens per request takes a fixed draft
+    # length, but not a variable one: padding would need more than one dummy.
+    KVCacheManagerV2._check_sparse_kv_offload_config(
+        SparseKvCacheOffloadConfig(),
+        KvCacheConfig(enable_block_reuse=False),
+        Mapping(),
+        spec_config=MTPDecodingConfig(max_draft_len=3),
+        allow_speculation=True,
+    )
+    with pytest.raises(ValueError, match="variable draft length"):
+        KVCacheManagerV2._check_sparse_kv_offload_config(
+            SparseKvCacheOffloadConfig(),
+            KvCacheConfig(enable_block_reuse=False),
+            Mapping(),
+            spec_config=MTPDecodingConfig(
+                max_draft_len=3, acceptance_rate_window_size=8, acceptance_rate_threshold=0.5
+            ),
+            allow_speculation=True,
+        )
 
 
 @pytest.mark.cpu_only

@@ -68,8 +68,12 @@ def assert_host_fetches(
     world_size: int,
     index_topk: int,
     unit_tokens: int,
+    queries_per_request: int = 1,
 ) -> None:
     """Require fetch participation and positive native misses on every rank.
+
+    A request's selectable history at its first fetch is its prompt plus the
+    ``queries_per_request`` tokens that step feeds.
 
     Counters are per native Batch. Serial requests get individual evidence;
     concurrent requests have overlapping counter intervals, which must not be
@@ -93,7 +97,8 @@ def assert_host_fetches(
             )
             assert row["index_topk"] == index_topk and row["unit_tokens"] == unit_tokens
             assert any(
-                abs(units - length // unit_tokens) <= 1 for units in row["selectable_units"]
+                abs(units - length // unit_tokens) <= queries_per_request
+                for units in row["selectable_units"]
             ), (
                 f"rank {rank}: selectable history {row['selectable_units']} does not match prompt {length}"
             )

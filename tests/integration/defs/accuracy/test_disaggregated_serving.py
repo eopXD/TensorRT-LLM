@@ -848,10 +848,15 @@ def _test_sparse_offload_long_context(
                              max_num_tokens=2048,
                              iter_stats_max_iterations=-1,
                              max_stats_len=-1)
+    # The smallest cache offload accepts holds one selection per query token a
+    # request feeds a step, plus the tokens in flight.
+    queries = 1 + max_draft_len
     units_per_page = tokens_per_block // unit_tokens
-    cache_units = (index_topk // units_per_page + 1) * units_per_page
+    cache_units = (queries * index_topk // units_per_page + 1) * units_per_page
     assert all(len(prompt) // unit_tokens > cache_units for prompt in prompts)
-    assert (output_len - 1) // unit_tokens > cache_units - index_topk, (
+    assert (
+        output_len - 1
+    ) // unit_tokens > cache_units - queries * index_topk, (
         "Forced decode must append more history than the sparse cache's free slots"
     )
     if max_draft_len:
@@ -865,7 +870,7 @@ def _test_sparse_offload_long_context(
     offload_config = copy.deepcopy(gen_server_config)
     offload_config["sparse_attention_config"].update(
         enable_kv_cache_offload=True,
-        kv_cache_offload_config={"gpu_cache_factor": 1.0})
+        kv_cache_offload_config={"gpu_cache_factor": float(queries)})
     deterministic_env = {
         "TLLM_LOG_LEVEL": "info",
         "TLLM_LOG_LEVEL_BY_MODULE": "info:_torch",
@@ -1004,18 +1009,27 @@ def _test_sparse_offload_long_context(
                             prompt_lengths=[len(prompts[i]) for i in group],
                             world_size=world_size,
                             index_topk=index_topk,
-                            unit_tokens=unit_tokens)
+                            unit_tokens=unit_tokens,
+                            queries_per_request=queries)
                         print(
                             f"Native offload evidence: {len(group)} requests, {world_size} ranks, "
                             f"minimum batch-counter miss delta={min(e['misses'] for e in current)}"
                         )
                 stats = _get_disagg_generation_stats(llm.serve_url)
                 if stress:
-                    batched_steps = sum(
-                        stat.get("inflightBatchingStats", {}).get(
-                            "numGenRequests", 0) > 1 for stat in stats)
-                    assert batched_steps >= tokens_per_block, (
-                        f"Only {batched_steps} batched decode iterations")
+                    # Tokens each request decoded while sharing a step: one per
+                    # step plus its share of the accepted drafts.
+                    batched_tokens = 0.0
+                    for stat in stats:
+                        requests = stat.get("inflightBatchingStats",
+                                            {}).get("numGenRequests", 0)
+                        if requests > 1:
+                            spec = stat.get("specDecodingStats") or {}
+                            batched_tokens += 1 + spec.get(
+                                "numAcceptedTokens", 0) / requests
+                    assert batched_tokens >= tokens_per_block, (
+                        f"Only {batched_tokens:.0f} tokens decoded in batched steps"
+                    )
                 return rows, stats
 
             for mode in ("resident", "offload"):
@@ -1051,7 +1065,8 @@ def _test_sparse_offload_long_context(
                         for drafted, accepted in accepted_drafts[mode] +
                         _accepted_drafts_per_step(stress_stats)
                     }
-                    assert {"none", "all"} <= kinds, (
+                    # Rejected drafts leave written rows that the next step rewrites.
+                    assert "all" in kinds and kinds & {"none", "some"}, (
                         f"{mode}: decode steps must both reject and accept drafts, got {kinds}"
                     )
                 correct = sum(row["correct"] for row in normal)

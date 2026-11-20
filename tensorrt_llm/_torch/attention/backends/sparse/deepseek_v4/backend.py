@@ -351,16 +351,17 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                     data_slot = sparse_state.out_slots[layer_idx][data_index]
                     sparse_index_kwargs = dict(
                         compressed_fetched_indices=fetched[:, data_slot, :],
-                        # Entry 0 is the unit at the history watermark, the one this
-                        # step writes.
+                        # Entry i is the unit i past the history watermark; this step
+                        # writes the ones its tokens complete.
                         compressed_write_indices=sparse_state.write_indices[
                             len(descriptor.buffer_ids)
-                        ][:, data_slot, 0],
+                        ][:, data_slot, :],
                         compressed_history_lengths=sparse_state.history_lengths,
                         compressed_lengths=compressed_lengths,
                         compressed_batch_rows=sparse_state.batch_rows,
                         active_request_count=sparse_state.active_request_count,
                         compressed_coverage=sparse_state.coverage,
+                        queries_per_request=sparse_state.queries_per_request,
                     )
                     compress_pool_base_ptr = descriptor.arena_base_addresses[data_index]
                     forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = (

@@ -317,6 +317,10 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
 class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
     _supports_reuse_match_backoff = False
     _supports_draft_reuse_match_backoff = False
+    # Offload resolves every verify token of a request in one selection, and the
+    # compressor writes each unit those tokens complete. MTP layers are sliding-window
+    # only, so draft steps read no offloaded history.
+    _sparse_offload_allows_speculation = True
 
     # This tensor is for compatibility with AttentionOp, it only contains swa attention.
     # kv_cache_pool_pointers contains one virtual attention-op pool per local
@@ -1875,10 +1879,10 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
 
         Returns :meth:`prepare_sparse_write_indices`'s int32[B, F, U], in Batch and
         descriptor buffer order, under the same stream contract. The fused compressor
-        uses the first entry of the data column as a one-row page table for both the
-        data and the NVFP4 scales; that is sound because their arena geometry matches,
-        which building the sparse descriptors checks. Each buffer still uses its own
-        arena base and byte stride.
+        uses the entries of the data column as a page table of one-row pages for both
+        the data and the NVFP4 scales; that is sound because their arena geometry
+        matches, which building the sparse descriptors checks. Each buffer still uses
+        its own arena base and byte stride.
         """
         return self.prepare_sparse_write_indices(state, layer_idx)
 

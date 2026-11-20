@@ -2060,10 +2060,16 @@ def test_compressor_wkv_gate_uses_checkpoint_dtype():
 
 
 def _run_compressor_with_fake_postprocess(
-    monkeypatch, kv_cache_dtype: str, is_indexer: bool, sparse=False, sparse_write_index=7
+    monkeypatch,
+    kv_cache_dtype: str,
+    is_indexer: bool,
+    sparse=False,
+    sparse_writes=(7,),
+    new_rows=1,
+    tokens_per_request=1,
 ):
     compressor = _create_small_compressor(kv_cache_dtype, is_indexer)
-    metadata = _create_minimal_metadata(compressor)
+    metadata = _create_minimal_metadata(compressor, total_compressed_tokens=new_rows)
     seen = {}
     if sparse:
         from types import SimpleNamespace
@@ -2072,12 +2078,15 @@ def _run_compressor_with_fake_postprocess(
         metadata.num_contexts = 0
         metadata.num_generations = 1
         metadata.num_ctx_tokens = 0
-        metadata.num_tokens = 1
-        metadata.num_gen_tokens_per_seq = 1
-        metadata.cu_seq_lens_cuda = torch.tensor([0, 1], device=DEVICE, dtype=torch.int32)
+        metadata.num_tokens = tokens_per_request
+        metadata.num_gen_tokens_per_seq = tokens_per_request
+        metadata.cu_seq_lens_cuda = torch.tensor(
+            [0, tokens_per_request], device=DEVICE, dtype=torch.int32
+        )
         # Write rows by Batch row: the one request sits in row 2, not at its input position.
-        writes = torch.full((4, 2, 1), -1, device=DEVICE, dtype=torch.int32)
-        writes[2] = sparse_write_index
+        # Entry i of a row is the unit i past its history watermark.
+        writes = torch.full((4, 2, len(sparse_writes)), -1, device=DEVICE, dtype=torch.int32)
+        writes[2] = torch.tensor(sparse_writes, device=DEVICE, dtype=torch.int32)
         is_nvfp4 = kv_cache_dtype == "nvfp4"
         descriptor = SimpleNamespace(
             data_buffer_index=1,
@@ -2215,7 +2224,7 @@ def test_compressor_routes_only_main_writes_to_arena(
     monkeypatch, kv_cache_dtype, is_indexer, write_index
 ):
     _, seen = _run_compressor_with_fake_postprocess(
-        monkeypatch, kv_cache_dtype, is_indexer, sparse=True, sparse_write_index=write_index
+        monkeypatch, kv_cache_dtype, is_indexer, sparse=True, sparse_writes=(write_index,)
     )
     if is_indexer:
         seen["prepare"].assert_not_called()
@@ -2231,6 +2240,38 @@ def test_compressor_routes_only_main_writes_to_arena(
     assert seen["start_pos"].data_ptr() == seen["zero_positions"].data_ptr()
     assert (seen["start_pos"] == 0).all()
     assert (seen["num_outputs"] == int(write_index >= 0)).all()
+
+
+@pytest.mark.parametrize(
+    "writes, new_rows, expected_outputs",
+    [
+        # MTP verify tokens complete the unit at the history watermark.
+        ((7, 9), 1, 1),
+        # They complete two units, each written to its own in-flight cell.
+        ((7, 9), 2, 2),
+        # Only the rows that have a cell, counted from the first, are written.
+        ((7, -1), 2, 1),
+        ((-1, 9), 2, 0),
+    ],
+)
+def test_compressor_writes_each_new_row_to_its_in_flight_unit(
+    monkeypatch, writes, new_rows, expected_outputs
+):
+    _, seen = _run_compressor_with_fake_postprocess(
+        monkeypatch,
+        "fp8_pertensor",
+        False,
+        sparse=True,
+        sparse_writes=writes,
+        new_rows=new_rows,
+        tokens_per_request=6,
+    )
+    # A request's write entries are a page table of one-row pages from its first new row.
+    assert seen["tokens_per_block"] == 1
+    assert seen["block_table"].is_contiguous()
+    assert seen["block_table"].tolist() == [list(writes)]
+    assert (seen["start_pos"] == 0).all()
+    assert seen["num_outputs"].tolist() == [expected_outputs]
 
 
 def test_main_compressor_does_not_materialize_postprocess_output(monkeypatch):

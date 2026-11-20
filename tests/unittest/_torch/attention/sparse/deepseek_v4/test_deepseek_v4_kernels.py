@@ -150,6 +150,93 @@ def test_sparse_index_preparation_replays_with_new_watermarks_and_padding():
         )
 
 
+@_requires_cuda
+def test_sparse_index_preparation_reads_each_verify_tokens_segment_and_unit():
+    # MTP1: request 0 feeds two verify tokens from Batch row 2, request 1 one token from
+    # row 0, and a padding token follows. Each token reads its own segment of the
+    # request's fetch, and in-flight unit history_units + i reads write entry i.
+    queries, in_flight = 2, 2
+    requests = _cuda_tensor([0, 0, 1, 2])
+    topk = _cuda_tensor(
+        [
+            [4, 5, 0, -1],  # history 4 and 0, unit 5 in flight at entry 0
+            [6, 1, 4, 99],  # unit 6 at entry 1; 99 is past the request's length
+            [2, 0, 1, -1],  # request 1's unit 2 is in flight at entry 0
+            [0, 1, 2, 3],  # padding
+        ]
+    )
+    # Rows 2 and 0 hold requests 0 and 1: 21 and 8 history tokens, so units 5 and 2
+    # are the first in flight.
+    batch_rows = _cuda_tensor([2, 0, -1, -1])
+    history = _cuda_tensor([8, 0, 21, 0])
+    lengths = _cuda_tensor([7, 3, 0])
+    fetched = _cuda_tensor(
+        [
+            [-1, 300, 301, -1] + [-1] * 4,
+            [-1] * 8,
+            [104, -1, 100, -1] + [-1, 201, 204, -1],
+            [-1] * 8,
+        ]
+    )
+    # A strided view of one buffer's column, as the backend passes it.
+    writes = _cuda_tensor(
+        [[[-1, -1], [60, 61]], [[-1, -1]] * 2, [[-1, -1], [50, 51]], [[-1, -1]] * 2]
+    )[:, 1, :]
+    assert writes.shape == (4, in_flight) and not writes.is_contiguous()
+    out = deepseek_v4_local_to_global_indices(
+        req_id=requests,
+        block_table_swa=_cuda_tensor([[2], [3], [5]]),
+        swa_local_indices=_cuda_tensor([[0, 1, -1, 3]] * 4),
+        swa_pool_base_ptr=4096,
+        swa_buffer_ptr=4096,
+        tokens_per_block=4,
+        token_stride=1024,
+        compress_ratio=4,
+        num_compressed_indices=4,
+        compressed_local_indices=topk,
+        compressed_fetched_indices=fetched,
+        compressed_write_indices=writes,
+        compressed_history_lengths=history,
+        compressed_lengths=lengths,
+        compressed_batch_rows=batch_rows,
+        active_request_count=_cuda_tensor([2]),
+        mask_invalid_pages=True,
+        queries_per_request=queries,
+    )
+    assert out.cpu().tolist() == [
+        [8, 9, -1, 11, 104, 50, 100, -1],
+        [8, 9, -1, 11, 51, 201, 204, -1],
+        [12, 13, -1, 15, 60, 300, 301, -1],
+        [-1] * 8,
+    ]
+
+
+@_requires_cuda
+def test_sparse_index_preparation_rejects_a_fetch_narrower_than_every_query():
+    with pytest.raises(ValueError, match="top-k for each query"):
+        deepseek_v4_local_to_global_indices(
+            req_id=_cuda_tensor([0, 0]),
+            block_table_swa=_cuda_tensor([[2]]),
+            swa_local_indices=_cuda_tensor([[0, 1, -1, 3]] * 2),
+            swa_pool_base_ptr=4096,
+            swa_buffer_ptr=4096,
+            tokens_per_block=4,
+            token_stride=1024,
+            compress_ratio=4,
+            num_compressed_indices=4,
+            compressed_local_indices=_cuda_tensor([[0, 1, 2, 3]] * 2),
+            # One query's top-k per row, for a request that feeds two.
+            compressed_fetched_indices=_cuda_tensor([[-1] * 4] * 2),
+            compressed_write_indices=_cuda_tensor([[-1]] * 2),
+            compressed_history_lengths=_cuda_tensor([0, 0]),
+            compressed_lengths=_cuda_tensor([1]),
+            compressed_batch_rows=_cuda_tensor([0, -1]),
+            active_request_count=_cuda_tensor([1]),
+            mask_invalid_pages=True,
+            queries_per_request=2,
+        )
+
+
 def _cuda_tensor(value: torch.Tensor | list, strided: bool = False) -> torch.Tensor:
     tensor = torch.as_tensor(value, dtype=torch.int32, device="cuda")
     if not strided:

@@ -383,11 +383,18 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         if not self.sparse_metadata_params.enable_kv_cache_offload:
             return
         manager = self.kv_cache_manager
-        # Descriptors include every sparse role in native fetch order.
-        layers = get_sparse_offload_metadata_layers(self)
+        if self.enable_ragged_verification:
+            raise NotImplementedError(
+                "DeepSeek-V4 KV cache offload does not support ragged speculative verification"
+            )
+        # Descriptors include every sparse role in native fetch order. The attention
+        # merge and the compressor address every query token of a request, so one-model
+        # MTP can verify over offloaded history; its draft layers keep no offloaded KV.
+        layers = get_sparse_offload_metadata_layers(self, allow_speculation=True)
         if not layers:
             # This PP stage has no ratio-4 main KV to stage.
             return
+        init_config = manager.impl.init_config
         # Native fetch always processes every Batch row, including for smaller
         # graph profiles. Its selection width is fixed by BufferConfig.
         self.sparse_offload_state = allocate_sparse_offload_state(
@@ -401,11 +408,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             layers,
             max_batch_size=manager.max_batch_size,
             topk=self.sparse_mla_topk,
-            max_in_flight_units=manager._sparse_offload_max_in_flight_units(
-                manager.impl.init_config
-            ),
+            max_in_flight_units=manager._sparse_offload_max_in_flight_units(init_config),
             # The hook the device reservation counts the scratch by.
             nvfp4_head_dim=manager._sparse_offload_nvfp4_head_dim(),
+            # Query tokens a request feeds one forward: the sampled token and its drafts.
+            queries_per_request=init_config.sparse_queries_per_request,
         )
 
     def mla_prepare_fused_q_gen_cu_seqlens(self) -> Optional[torch.Tensor]:
@@ -732,10 +739,10 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     def validate_sparse_offload_batch(self) -> None:
         """Reject batches offload cannot run, on the host before any model writes.
 
-        An offloading worker only decodes, one query token per request, as DSA's
-        does, so the check is DSA's. It runs during prepare(), outside capture and
-        replay; fixed configuration is validated when the offload metadata is
-        initialized.
+        An offloading worker only decodes, each request feeding one query token or,
+        with MTP, its sampled token and drafts, as DSA's does, so the check is DSA's.
+        It runs during prepare(), outside capture and replay; fixed configuration is
+        validated when the offload metadata is initialized.
         """
         if self.sparse_offload_state is not None:
             self._validate_dsa_sparse_offload_batch()

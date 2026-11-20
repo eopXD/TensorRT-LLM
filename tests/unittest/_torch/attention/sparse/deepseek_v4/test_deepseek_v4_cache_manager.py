@@ -104,6 +104,8 @@ class _SparseRuntime:
         self.expansions = {41: tokens_per_block // 4, 19: tokens_per_block // 4}
         self.pool_indices = {}
         self.layers = {}
+        # Query tokens a request feeds a step: one, or with MTP the sampled token and drafts.
+        self.sparse_queries_per_request = 1
         for layer_id in (41, 19):
             self.configure_buffers(layer_id, [(DeepseekV4AttentionType.COMPRESS.role, 0)])
 
@@ -140,6 +142,7 @@ class _SparseRuntime:
                 SimpleNamespace(kv_caches=[None] * 6),
             ],
             sparse_max_in_flight_tokens=1,
+            sparse_queries_per_request=self.sparse_queries_per_request,
         )
 
     @property
@@ -2157,6 +2160,48 @@ def test_sparse_offload_initializes_host_history_and_gpu_arena(
             assert scales is not None and scales.is_cuda
         else:
             assert scales is None
+    finally:
+        manager.shutdown()
+
+
+@skip_pre_blackwell
+def test_sparse_offload_initializes_for_mtp_verify_tokens() -> None:
+    # One-model MTP1: DeepSeek-V4 takes the fixed-length draft, its MTP layer stays
+    # sliding-window only, and each ratio-4 layer's cache holds both verify tokens'
+    # selections.
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        enable_kv_cache_offload=True,
+        compress_ratios=[4, 128, 0],
+        index_topk=8,
+        kv_cache_offload_config={"host_history_size": 64 << 20},
+    )
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=1024, host_cache_size=0),
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
+        num_layers=2,
+        head_dim=512,
+        max_batch_size=1,
+        tokens_per_block=128,
+        max_seq_len=512,
+        max_num_tokens=512,
+        vocab_size=128,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        sparse_attn_config=sparse_config,
+        spec_config=MTPDecodingConfig(max_draft_len=1),
+    )
+    try:
+        config = manager.impl.init_config
+        assert config.sparse_queries_per_request == 2
+        assert set(manager.get_sparse_offload_descriptors()) == {0}
+        caches = {
+            layer.sparse_cache.max_cached_units
+            for layer in config.layers
+            if getattr(layer, "sparse_cache", None) is not None
+        }
+        # The default factor doubles per verify token: four selections of eight units
+        # beside the units in flight, in whole cells of 32 units.
+        assert caches == {64}
     finally:
         manager.shutdown()
 

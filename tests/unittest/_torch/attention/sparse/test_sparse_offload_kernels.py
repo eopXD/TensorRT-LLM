@@ -289,14 +289,32 @@ def test_gather_replays_with_new_rows_and_ignores_rows_past_the_batch():
 
 
 @_requires_cuda
-@pytest.mark.parametrize("invalid", ["dtype", "ndim", "out"])
+@pytest.mark.parametrize("strided", [False, True])
+def test_gather_reads_each_requests_row_of_values(strided):
+    # A row of write destinations per Batch row, one per unit in flight.
+    values = _cuda_tensor([[10, 11, 12], [20, 21, 22], [30, 31, 32], [40, 41, 42]], strided)
+    rows = _cuda_tensor([2, -1, 0, 7], strided)
+    out = _cuda_tensor(torch.full((4, 3), 999, dtype=torch.int32), strided)
+    assert gather_sparse_batch_rows(values, rows, out) is out
+    expected = [[30, 31, 32], [-1, -1, -1], [10, 11, 12], [-1, -1, -1]]
+    assert out.tolist() == expected
+    allocated = gather_sparse_batch_rows(values, rows)
+    assert allocated.shape == (4, 3) and allocated.is_contiguous()
+    assert allocated.tolist() == expected
+
+
+@_requires_cuda
+@pytest.mark.parametrize("invalid", ["dtype", "ndim", "out", "out_width"])
 def test_gather_rejects_invalid_layout(invalid):
     values, rows, out = _cuda_tensor([1, 2]), _cuda_tensor([0, 1]), None
     if invalid == "dtype":
         values = values.to(torch.int64)
     elif invalid == "ndim":
-        values = values.view(1, 2)
-    else:
+        values = values.view(1, 1, 2)
+    elif invalid == "out":
         out = torch.empty(3, dtype=torch.int32, device="cuda")
+    else:
+        values = values.view(2, 1)
+        out = torch.empty((2, 2), dtype=torch.int32, device="cuda")
     with pytest.raises(ValueError):
         gather_sparse_batch_rows(values, rows, out)

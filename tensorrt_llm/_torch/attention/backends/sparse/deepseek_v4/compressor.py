@@ -197,9 +197,9 @@ class Compressor(nn.Module):
         sparse_state = metadata.sparse_offload_state
         sparse_write_indices = None
         if not self.is_indexer and self.compress_ratio == 4 and sparse_state is not None:
-            if num_contexts or metadata.num_gen_tokens_per_seq != 1 or self.footer_scale_cache:
+            if num_contexts or self.footer_scale_cache:
                 raise NotImplementedError(
-                    "Sparse compressor writes require single-token decode without footer scales"
+                    "Sparse compressor writes require decode without footer scales"
                 )
             descriptor = sparse_state.layers[self.layer_idx]
             writes = metadata.kv_cache_manager.prepare_sparse_compressor_write_indices(
@@ -208,10 +208,12 @@ class Compressor(nn.Module):
             # Native write rows are by Batch row; the scatter addresses requests
             # by input position.
             # At the slot: coinciding buffers are resolved once into one slice.
-            # Entry 0 is the unit at the history watermark, the one this step writes.
+            # Entry i is the unit i past the history watermark. A step's first new
+            # compressed row is the unit at the watermark, so a request's entries
+            # are the one-row pages of its new rows, in order.
             data_slot = sparse_state.out_slots[self.layer_idx][descriptor.data_buffer_index]
             sparse_write_indices = gather_sparse_batch_rows(
-                writes[:, data_slot, 0], sparse_state.batch_rows[:bsz]
+                writes[:, data_slot, :], sparse_state.batch_rows[:bsz]
             )
             kv_cache, kv_cache_scale = metadata.kv_cache_manager.get_sparse_compress_buffers(
                 self.layer_idx
@@ -232,7 +234,7 @@ class Compressor(nn.Module):
             block_table = metadata.indexer_k_cache_block_offsets
         else:
             block_table = (
-                sparse_write_indices.view(bsz, 1)
+                sparse_write_indices
                 if sparse_write_indices is not None
                 else metadata.compress_block_tables[self.compress_ratio]
             )
@@ -318,9 +320,13 @@ class Compressor(nn.Module):
         start_pos = metadata.past_kv_lens_cuda[self.compress_ratio][:bsz]
         if sparse_write_indices is not None:
             # One-row page addressing uses zero storage positions; RoPE IDs stay
-            # unchanged. The kernel checks num_outputs before dereferencing a page.
+            # unchanged. The kernel checks num_outputs before dereferencing a page,
+            # so a request writes only the new rows that have a cell, from its first.
             start_pos = sparse_state.scatter_start_positions[:bsz]
-            num_comp_tokens = torch.where(sparse_write_indices >= 0, num_comp_tokens, 0)
+            rows_with_cells = (sparse_write_indices >= 0).cumprod(dim=1, dtype=torch.int32)
+            num_comp_tokens = torch.minimum(
+                num_comp_tokens, rows_with_cells.sum(dim=1, dtype=torch.int32)
+            )
         total_tokens = kv_comp.shape[0]
 
         # Allocate optional returned postprocess buffers for indexer paths.

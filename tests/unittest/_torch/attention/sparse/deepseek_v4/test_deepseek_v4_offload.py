@@ -71,10 +71,7 @@ def _metadata(manager, *, enabled=True, graph=False, buffers=None, initialize=Tr
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("local_csa", [False, True])
-@pytest.mark.parametrize(
-    "unsupported",
-    ["beam", "configured_beam", "draft", "configured_draft", "draft_tree", "draft_cache"],
-)
+@pytest.mark.parametrize("unsupported", ["beam", "configured_beam", "draft_cache"])
 def test_sparse_offload_rejects_configuration_before_allocation(
     unsupported: str, local_csa: bool
 ) -> None:
@@ -86,16 +83,50 @@ def test_sparse_offload_rejects_configuration_before_allocation(
         metadata.beam_width = 2
     elif unsupported == "configured_beam":
         manager.max_beam_width = 2
-    elif unsupported == "draft":
-        metadata.max_draft_tokens = 1
-    elif unsupported == "configured_draft":
-        manager.max_draft_len = 1
-    elif unsupported == "draft_tree":
-        manager.max_total_draft_tokens = 1
     else:
         metadata.draft_kv_cache_manager = object()
     with patch.object(metadata, "get_empty") as allocate:
         with pytest.raises(NotImplementedError, match="single-beam, non-speculative"):
+            metadata._init_sparse_offload_state()
+        allocate.assert_not_called()
+    assert metadata.sparse_offload_state is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("configured", [False, True])
+def test_sparse_offload_takes_the_drafts_its_manager_was_sized_for(configured: bool) -> None:
+    # MTP verifies its drafts beside the sampled token, each selecting its own top-k.
+    manager = _manager()
+    metadata = _metadata(manager, initialize=False)
+    if configured:
+        manager.max_draft_len = manager.max_total_draft_tokens = 1
+    else:
+        metadata.max_draft_tokens = 1
+    with patch.object(metadata, "get_empty") as allocate:
+        with pytest.raises(NotImplementedError, match="sized for 1 query tokens"):
+            metadata._init_sparse_offload_state()
+        allocate.assert_not_called()
+
+    manager.impl.sparse_queries_per_request = 2
+    with patch.object(
+        metadata,
+        "get_empty",
+        side_effect=lambda buffers, shape, **kwargs: torch.empty(shape, dtype=torch.int32),
+    ):
+        metadata._init_sparse_offload_state()
+    state = metadata.sparse_offload_state
+    assert state.queries_per_request == 2
+    # A request's row holds a segment of top-k per verify token.
+    assert state.selected_history_units.shape == (4, 16)
+    assert state.fetched_indices[1].shape == (4, 1, 16)
+
+
+@pytest.mark.cpu_only
+def test_sparse_offload_rejects_ragged_verification() -> None:
+    metadata = _metadata(_manager(), initialize=False)
+    metadata.enable_ragged_verification = True
+    with patch.object(metadata, "get_empty") as allocate:
+        with pytest.raises(NotImplementedError, match="ragged speculative verification"):
             metadata._init_sparse_offload_state()
         allocate.assert_not_called()
     assert metadata.sparse_offload_state is None
@@ -543,6 +574,7 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
         out_slots={2: tuple(range(physical.shape[1]))},
         nvfp4_scratch=torch.empty(1, 8, 512, dtype=torch.float8_e4m3fn) if nvfp4 else None,
         coverage=None,
+        queries_per_request=1,
     )
     descriptor = state.layers[2]
     if nvfp4:
@@ -623,9 +655,11 @@ def test_attention_uses_arena_base_and_physical_indices_without_host_pages(nvfp4
     torch.testing.assert_close(
         converted["compressed_fetched_indices"], physical[:, descriptor.data_buffer_index]
     )
+    # Every in-flight entry of the data column, and the queries a request feeds a step.
     torch.testing.assert_close(
-        converted["compressed_write_indices"], writes[:, descriptor.data_buffer_index, 0]
+        converted["compressed_write_indices"], writes[:, descriptor.data_buffer_index, :]
     )
+    assert converted["queries_per_request"] == 1
     assert converted["compressed_history_lengths"] is state.history_lengths
     assert converted["compressed_batch_rows"] is state.batch_rows
     torch.testing.assert_close(

@@ -198,8 +198,10 @@ The native `Batch` can advance a request's history from MTP verification results
 GPU. With overlap scheduling, the next forward can be enqueued before the host reads
 those results. For example, if a member starts with 100 tokens of history and verification
 accepts two drafts, the current input token and those two drafts extend its history to
-103. The next forward starts writing at position 103. The Python sparse-offload manager
-currently rejects speculative decoding at construction.
+103. The next forward starts writing at position 103. The Python sparse-offload managers
+take one-model MTP-Eagle drafting a linear chain, whose step writes its tokens at
+consecutive positions and keeps a prefix of them, and reject other speculative decoding
+at construction.
 
 `Batch::advanceSparseHistory()` takes the number of input tokens each row kept, including
 the current token and the accepted drafts (three tokens in this example). On the batch's

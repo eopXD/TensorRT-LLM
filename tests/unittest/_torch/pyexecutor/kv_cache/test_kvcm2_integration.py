@@ -6714,6 +6714,44 @@ def test_sparse_kv_offload_rejects_speculative_decoding() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "spec_config",
+    [
+        # Siblings share a position, and the accepted path is not a prefix of the step.
+        pytest.param(
+            lambda: MTPDecodingConfig(
+                max_draft_len=3, use_dynamic_tree=True, dynamic_tree_max_topK=2
+            ),
+            id="mtp_dynamic_tree",
+        ),
+        # Vanilla MTP drafts through its own worker and spec metadata.
+        pytest.param(
+            lambda: MTPDecodingConfig(max_draft_len=1, use_mtp_vanilla=True), id="mtp_vanilla"
+        ),
+        # A step also feeds mask tokens past the drafts.
+        pytest.param(
+            lambda: PARDDecodingConfig(max_draft_len=3, speculative_model="draft"), id="pard"
+        ),
+        pytest.param(
+            lambda: Eagle3DecodingConfig(max_draft_len=3, speculative_model="draft"),
+            id="eagle3",
+        ),
+    ],
+)
+def test_sparse_kv_offload_takes_only_linear_mtp_eagle_drafts(spec_config) -> None:
+    # Offload writes a step's tokens at consecutive positions and keeps the prefix the
+    # step accepts, which one-model MTP-Eagle drafting a linear chain guarantees.
+    with pytest.raises(ValueError, match="only with one-model MTP-Eagle drafting a linear chain"):
+        KVCacheManagerV2._check_sparse_kv_offload_config(
+            SparseKvCacheOffloadConfig(),
+            KvCacheConfig(enable_block_reuse=False),
+            Mapping(),
+            spec_config=spec_config(),
+            allow_speculation=True,
+        )
+
+
+@pytest.mark.cpu_only
 def test_sparse_kv_offload_accepts_block_reuse() -> None:
     # Reuse is on by default. On a decode worker it lets the KV transfer skip a
     # prompt prefix the reuse tree already holds.

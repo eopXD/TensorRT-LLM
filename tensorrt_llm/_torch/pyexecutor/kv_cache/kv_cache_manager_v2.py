@@ -8387,7 +8387,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         Args:
             allow_speculation: The sparse backend reads several query tokens per
-                request, as a fixed-length draft step feeds them.
+                request, as a fixed-length draft step feeds them. Offload then takes
+                one-model MTP-Eagle drafting a linear chain: it writes a step's tokens at
+                consecutive positions and keeps the prefix of them the step accepts.
 
         Raises:
             ValueError: KV pool rebalancing, unsupported speculative decoding or
@@ -8409,6 +8411,18 @@ class KVCacheManagerV2(BaseResourceManager):
             error = ValueError(
                 "Sparse KV cache offload does not support speculative decoding: a sparse cache "
                 "takes one input token per decode step. Remove speculative_config or disable "
+                "sparse_attention_config.enable_kv_cache_offload."
+            )
+        elif spec_config is not None and not (
+            spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+            and spec_config.max_total_draft_tokens == spec_config.max_draft_len
+            and not getattr(spec_config, "use_dynamic_tree", False)
+        ):
+            error = ValueError(
+                "Sparse KV cache offload supports speculative decoding only with one-model "
+                "MTP-Eagle drafting a linear chain: it writes a step's tokens at consecutive "
+                "positions and keeps the prefix of them the step accepts. Use decoding_type "
+                "MTP without use_mtp_vanilla or use_dynamic_tree, or disable "
                 "sparse_attention_config.enable_kv_cache_offload."
             )
         elif spec_config is not None and (

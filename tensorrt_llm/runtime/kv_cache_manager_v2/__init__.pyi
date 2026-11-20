@@ -559,6 +559,12 @@ class PoolRebalanceConfig:
 # Host bytes held by live page slabs in this process.
 def live_slab_bytes() -> int: ...
 
+# The most entries one selection's cache may hold for its resolve to fit the current device's
+# shared memory, and at most the entries the probe can name; 0 when no cache fits beside a row
+# of selection_width selected and max_in_flight_units in-flight units. Asks the device, so a
+# CUDA context must be current.
+def sparse_resolve_max_cache_entries(selection_width: int, max_in_flight_units: int) -> int: ...
+
 # How the manager backs the host cache tier's memory; the tier does not read it.
 @dataclass(slots=True)
 class HostMemBackingConfig:

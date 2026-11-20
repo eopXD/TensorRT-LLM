@@ -15,7 +15,6 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
-from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -832,17 +831,11 @@ class DSACacheManagerV2(SparseOffloadCacheMixin, KVCacheManagerV2):
             # a group and distinct between them; it is not a layer reference.
             return None if leader is None else -(leader + 1)
 
-        cache_factor = self._sparse_offload_cache_factor(config)
-
         def cache_for(local_layer_idx: int):
-            return sparse_cache_config(
-                num_selected_units=self._sparse_offload_topk,
+            return self._sparse_offload_cache_config(
+                config,
                 unit_tokens=DSA_SPARSE_UNIT_TOKENS,
-                tokens_per_block=self.tokens_per_block,
-                gpu_cache_factor=cache_factor,
-                max_in_flight_tokens=config.sparse_max_in_flight_tokens,
                 selection_id=selection_id(local_layer_idx),
-                queries_per_request=config.sparse_queries_per_request,
             )
 
         sparse_roles = self._sparse_latent_roles()

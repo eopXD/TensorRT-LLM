@@ -1823,6 +1823,11 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "set and one resolve. None means the layer selects for itself: it is read as the "
             "layer's own id, so a layer that names nothing never shares, and no explicit id "
             "may name a layer that named nothing.") DEF_COPY(kv::SparseCacheConfig);
+    m.def("sparse_resolve_max_cache_entries", &kv::sparseResolveMaxCacheEntries, nb::arg("selection_width"),
+        nb::arg("max_in_flight_units"),
+        "The most entries one selection's cache may hold for its resolve to fit the current device's "
+        "shared memory, and at most the entries the probe can name; 0 when no cache fits beside the row. "
+        "Asks the device, so a CUDA context must be current.");
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
         .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(),

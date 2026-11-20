@@ -220,6 +220,13 @@ struct SparseResolveArgs
 [[nodiscard]] size_t checkedSparseResolveSharedBytes(
     int32_t entriesPerSelection, int32_t selectionWidth, int32_t maxInFlightUnits);
 
+//! The most entries one selection's cache may hold for its resolve to fit the current
+//! device: the largest count whose sparseResolveSharedBytes stays within the opt-in limit
+//! checkedSparseResolveSharedBytes checks against, and at most
+//! SparseCacheConfig::kMaxCacheEntries. Zero when no cache fits beside a row of
+//! `selectionWidth` selected and `maxInFlightUnits` in-flight units.
+[[nodiscard]] int32_t sparseResolveMaxCacheEntries(int32_t selectionWidth, int32_t maxInFlightUnits);
+
 //! Multiprocessors `device` has, which is the one part of the grid sizing below that costs
 //! a driver call and so the one part worth holding on to.
 [[nodiscard]] int32_t sparseCopyMultiprocessors(CUdevice device);

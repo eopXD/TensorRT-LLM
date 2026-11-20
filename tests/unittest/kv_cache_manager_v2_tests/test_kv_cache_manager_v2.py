@@ -85,6 +85,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         num_live_managers,
         poison_reason,
         sequence_to_blockchain_keys,
+        sparse_resolve_max_cache_entries,
         take_poison,
     )
 
@@ -150,6 +151,7 @@ else:
         num_live_managers,
         poison_reason,
         sequence_to_blockchain_keys,
+        sparse_resolve_max_cache_entries,
         take_poison,
     )
 
@@ -1220,6 +1222,30 @@ class TestSparseCacheReservation(unittest.TestCase):
                     RuntimeError, "exceeds the supported capacity of 16256 units"
                 ):
                     self._manager(max_cached_units, unit_tokens=1)
+
+    def test_the_widest_resolvable_cache_is_the_widest_the_manager_accepts(self) -> None:
+        # GLM-5.2 MTP4: five selections of 2048 token units beside 11 in flight. On SM100 the
+        # widest cache the probe can name overflows the resolve's shared memory, and the
+        # query reports where the manager's own check gives way, in whole 128-unit cells.
+        width, in_flight = 5 * 2048, 11
+        entries = sparse_resolve_max_cache_entries(width, in_flight)
+        self.assertGreaterEqual(entries, width + in_flight)
+        self.assertLess(entries, 16256)
+        config = dict(
+            num_selected_blocks=2048,
+            unit_tokens=1,
+            sparse_queries_per_request=5,
+            sparse_max_in_flight_tokens=in_flight,
+        )
+        widest = entries // 128 * 128
+        self._manager(widest, **config).shutdown()
+        with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
+            self._manager(widest + 128, **config)
+        # A wider row leaves less room for the cache.
+        self.assertLess(sparse_resolve_max_cache_entries(6 * 2048, in_flight), entries)
+        # Sixteen selections need probe positions past the 16 bits a miss is recorded in,
+        # so no cache fits beside them.
+        self.assertEqual(sparse_resolve_max_cache_entries(16 * 2048, 1), 0)
 
     def test_batch_accepts_resolve_shared_memory_that_fits(self) -> None:
         # Three token-sized units round up to a full 128-unit cell.

@@ -43,7 +43,7 @@ from __future__ import annotations
 import math
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Callable, Sequence
 
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig, SparseCacheConfig
@@ -652,6 +652,7 @@ def sparse_cache_config(
     max_in_flight_tokens: int,
     selection_id: int | None = None,
     queries_per_request: int = 1,
+    max_resolvable_entries: Callable[[int, int], int] | None = None,
 ) -> SparseCacheConfig:
     """Return a layer's sparse fetch path whose cache holds ``gpu_cache_factor`` selections.
 
@@ -677,8 +678,13 @@ def sparse_cache_config(
             other argument here. None, the default, means the layer selects for
             itself; a layer that names nothing never shares.
         queries_per_request: Query tokens a request feeds a step, each with its own
-            selection. The cache is capped at the entries the resolve can name, but
-            never below the selections of every query beside the units in flight.
+            selection. The cache is capped at the entries the resolve can name and,
+            with ``max_resolvable_entries``, hold, but never below the selections of
+            every query beside the units in flight.
+        max_resolvable_entries: Returns the most entries a cache may hold for its
+            resolve to fit the device, given the width of a request's selection row and
+            the units in flight; ``sparse_resolve_max_cache_entries`` asks the current
+            device. None caps the cache only where the resolve can name its entries.
     """
     if unit_tokens is not None and (unit_tokens <= 0 or tokens_per_block % unit_tokens):
         raise ValueError(
@@ -693,18 +699,21 @@ def sparse_cache_config(
         gpu_cache_factor, num_selected_units, units_per_page, in_flight_units
     )
     if queries_per_request > 1:
-        # Capped where the resolve can no longer name an entry. Every query's selection
-        # beside the units in flight must still fit, or a step could be unresolvable.
-        max_cells = SPARSE_MAX_CACHE_ENTRIES // units_per_page
-        min_cells = ceil_div(
-            queries_per_request * num_selected_units + in_flight_units, units_per_page
-        )
+        # Capped where the resolve can no longer name an entry or hold the cache in
+        # shared memory. Every query's selection beside the units in flight must still
+        # fit, or a step could be unresolvable.
+        width = queries_per_request * num_selected_units
+        max_entries = SPARSE_MAX_CACHE_ENTRIES
+        if max_resolvable_entries is not None:
+            max_entries = min(max_entries, max_resolvable_entries(width, in_flight_units))
+        max_cells = max_entries // units_per_page
+        min_cells = ceil_div(width + in_flight_units, units_per_page)
         if min_cells > max_cells:
             raise ValueError(
                 f"A sparse cache for {queries_per_request} query tokens of "
                 f"{num_selected_units} selected units needs {min_cells * units_per_page} "
-                f"entries, more than the {max_cells * units_per_page} the resolve can name; "
-                "use fewer draft tokens"
+                f"entries, more than the {max_cells * units_per_page} its resolve can name "
+                "and hold on this device; use fewer draft tokens"
             )
         cells = min(max(cells, min_cells), max_cells)
     return SparseCacheConfig(

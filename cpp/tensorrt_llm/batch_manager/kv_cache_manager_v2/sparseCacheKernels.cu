@@ -1207,13 +1207,51 @@ int resolveThreads(int32_t entriesPerSelection, int32_t selectionWidth, int32_t 
     return threads;
 }
 
+//! A miss is recorded by its 16-bit position in the probe table, which is twice the row
+//! rounded up to a power of two.
+[[nodiscard]] bool probeTableIsIndexable(int32_t selectionWidth, int32_t maxInFlightUnits) noexcept
+{
+    return nextPow2(2 * (maxInFlightUnits + selectionWidth)) <= (1 << 16);
+}
+
 } // namespace
+
+int32_t sparseResolveMaxCacheEntries(int32_t selectionWidth, int32_t maxInFlightUnits)
+{
+    TLLM_CHECK_WITH_INFO(selectionWidth >= 0 && maxInFlightUnits >= 0,
+        "sparseResolveMaxCacheEntries: the selection width and the in-flight span must not be negative");
+    if (!probeTableIsIndexable(selectionWidth, maxInFlightUnits))
+    {
+        return 0;
+    }
+    auto const limit = static_cast<size_t>(sparseResolveSharedLimit());
+    auto const fits
+        = [&](int32_t entries) { return sparseResolveSharedBytes(entries, selectionWidth, maxInFlightUnits) <= limit; };
+    if (!fits(0))
+    {
+        return 0;
+    }
+    // The footprint grows with the entries, so the largest count that fits is bisected.
+    int32_t low = 0;
+    int32_t high = SparseCacheConfig::kMaxCacheEntries;
+    while (low < high)
+    {
+        int32_t const mid = low + (high - low + 1) / 2;
+        if (fits(mid))
+        {
+            low = mid;
+        }
+        else
+        {
+            high = mid - 1;
+        }
+    }
+    return low;
+}
 
 size_t checkedSparseResolveSharedBytes(int32_t entriesPerSelection, int32_t selectionWidth, int32_t maxInFlightUnits)
 {
-    // A miss is recorded by its 16-bit position in the probe table, which is twice the
-    // row rounded up to a power of two.
-    TLLM_CHECK_WITH_INFO(nextPow2(2 * (maxInFlightUnits + selectionWidth)) <= (1 << 16),
+    TLLM_CHECK_WITH_INFO(probeTableIsIndexable(selectionWidth, maxInFlightUnits),
         "Sparse resolve: a row of " + std::to_string(selectionWidth) + " selected and "
             + std::to_string(maxInFlightUnits)
             + " in-flight units is wider than the resolve's probe table can index; reduce "

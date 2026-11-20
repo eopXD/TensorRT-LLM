@@ -30,7 +30,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _get_generation_kv_capacity,
     get_scratch_entry,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import sparse_cache_config
 from tensorrt_llm._torch.pyexecutor.resource_manager import scan_kv_buffer_for_invalid_values
 from tensorrt_llm._utils import (
     TensorWrapper,
@@ -1191,13 +1190,7 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
             if topk is None or topk <= 0:
                 raise ValueError("Sparse compressed KV requires a positive index_topk")
             # A selection names compressed rows of four original tokens each.
-            return sparse_cache_config(
-                num_selected_units=topk,
-                unit_tokens=DEEPSEEK_V4_SPARSE_RATIO,
-                tokens_per_block=self.tokens_per_block,
-                gpu_cache_factor=self._sparse_kv_offload.gpu_cache_factor,
-                max_in_flight_tokens=config.sparse_max_in_flight_tokens,
-            )
+            return self._sparse_offload_cache_config(config, unit_tokens=DEEPSEEK_V4_SPARSE_RATIO)
 
         def _add_layer(
             layer_idx: int,

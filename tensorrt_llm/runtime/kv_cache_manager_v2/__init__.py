@@ -93,6 +93,7 @@ HalfOpenRange = _cpp.HalfOpenRange
 HostCacheTierConfig = _cpp.HostCacheTierConfig
 HostMemBackingConfig = _cpp.HostMemBackingConfig
 live_slab_bytes = _cpp.live_slab_bytes
+sparse_resolve_max_cache_entries = _cpp.sparse_resolve_max_cache_entries
 HostOOMError = _cpp.HostOOMError
 KVCacheDesc = _cpp.KVCacheDesc
 KVCacheCreatedData = _cpp.KVCacheCreatedData
@@ -261,6 +262,7 @@ __all__ = [
     "HostCacheTierConfig",
     "HostMemBackingConfig",
     "live_slab_bytes",
+    "sparse_resolve_max_cache_entries",
     "IKvCacheColdPageCodec",
     "KVCacheDesc",
     "KVCacheCreatedData",

@@ -249,3 +249,40 @@ def test_cache_rejects_queries_whose_selections_exceed_the_probe():
             max_in_flight_tokens=29,
             queries_per_request=8,
         )
+
+
+def test_cache_shrinks_to_the_resolve_the_device_holds():
+    # GLM-5.2 MTP4: the default factor asks for ten selections, which the probe caps at
+    # 16256 units. A device whose resolve holds 15968 entries beside the row gets the
+    # most whole 128-unit cells below that, still above all five queries' selections.
+    asked = []
+
+    def device_limit(width: int, in_flight_units: int) -> int:
+        asked.append((width, in_flight_units))
+        return 15968
+
+    shape = dict(
+        num_selected_units=2048,
+        unit_tokens=1,
+        tokens_per_block=128,
+        max_in_flight_tokens=11,
+        queries_per_request=5,
+    )
+    config = sparse_cache_config(
+        gpu_cache_factor=resolve_sparse_cache_factor(2.0, explicit=False, queries_per_request=5),
+        max_resolvable_entries=device_limit,
+        **shape,
+    )
+    assert asked == [(5 * 2048, 11)]
+    assert config.max_cached_units == 124 * 128
+    # The device bounds an explicit factor the same way.
+    config = sparse_cache_config(gpu_cache_factor=8.0, max_resolvable_entries=device_limit, **shape)
+    assert config.max_cached_units == 124 * 128
+    # A device that cannot hold every query's selection beside the units in flight
+    # cannot run the step at all.
+    with pytest.raises(ValueError, match="name and hold on this device"):
+        sparse_cache_config(
+            gpu_cache_factor=5.0,
+            max_resolvable_entries=lambda width, in_flight_units: width + in_flight_units - 1,
+            **shape,
+        )

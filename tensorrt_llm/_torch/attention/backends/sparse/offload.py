@@ -28,6 +28,7 @@ import torch
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.sparse_offload_memory import (
     resolve_sparse_cache_factor,
+    sparse_cache_config,
     sparse_max_in_flight_units,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -48,6 +49,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerGroupId,
     LayerId,
     _KVCache,
+    sparse_resolve_max_cache_entries,
 )
 
 from .offload_kernels import select_sparse_history_units
@@ -55,7 +57,7 @@ from .offload_kernels import select_sparse_history_units
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor import llm_request
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManagerConfig, SparseCacheConfig
 
 # Attention metadata holding a SparseOffloadState: the eager one, and the CUDA
 # graph metadata, which share theirs through the graph buffer pool.
@@ -468,6 +470,30 @@ class SparseOffloadCacheMixin:
             offload.gpu_cache_factor,
             explicit="gpu_cache_factor" in offload.model_fields_set,
             queries_per_request=config.sparse_queries_per_request,
+        )
+
+    def _sparse_offload_cache_config(
+        self,
+        config: KVCacheManagerConfig,
+        *,
+        unit_tokens: int,
+        selection_id: int | None = None,
+    ) -> SparseCacheConfig:
+        """Return an offloaded layer's sparse fetch path in the manager config ``config``.
+
+        Its GPU cache holds :meth:`_sparse_offload_cache_factor` selections of the
+        configured top-k beside the units in flight, as many as the resolve can name and
+        hold in this device's shared memory when a request feeds a step several queries.
+        """
+        return sparse_cache_config(
+            num_selected_units=self._sparse_offload_topk,
+            unit_tokens=unit_tokens,
+            tokens_per_block=self.tokens_per_block,
+            gpu_cache_factor=self._sparse_offload_cache_factor(config),
+            max_in_flight_tokens=config.sparse_max_in_flight_tokens,
+            selection_id=selection_id,
+            queries_per_request=config.sparse_queries_per_request,
+            max_resolvable_entries=sparse_resolve_max_cache_entries,
         )
 
     def get_sparse_offload_scratch_bytes(self, config: KVCacheManagerConfig) -> int:

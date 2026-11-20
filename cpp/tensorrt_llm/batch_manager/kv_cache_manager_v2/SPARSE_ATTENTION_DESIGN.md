@@ -986,8 +986,11 @@ The Python managers size `N` from `SparseKvCacheOffloadConfig.gpu_cache_factor`,
 selections of one query. Left at its default, the factor is multiplied by `S`, so a step
 always has room for the worst-case row and each query keeps the retention a single query
 has; set explicitly, it must be at least `S`. The result is capped at the largest whole-page
-cache the probe can name (16,256 token units at 128 per page), but never below `S * k + H`.
-A step therefore never meets a row it cannot resolve, which would stop the process.
+cache the probe can name (16,256 token units at 128 per page) and the resolve can hold in the
+device's shared memory beside the row (`sparse_resolve_max_cache_entries`), but never below
+`S * k + H`; a configuration whose floor is above that cap is refused at startup. At GLM-5.2
+MTP4 on SM100, for example, the shared memory holds fewer than the 16,256 entries the probe
+can name. A step therefore never meets a row it cannot resolve, which would stop the process.
 
 The batch reserves `max_batch_size` leases of `N` units per buffer. For measured demand,
 see [Measuring how full the cache gets](#measuring-how-full-the-cache-gets).

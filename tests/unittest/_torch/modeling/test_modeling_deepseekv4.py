@@ -869,6 +869,56 @@ def test_deepseek_v4_routed_moe_quant_config_covers_mtp_layers(tmp_path, monkeyp
         assert layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"].quant_algo == quant_algo
 
 
+@pytest.mark.parametrize("mtp_enabled", [True, False], ids=["mtp", "no-mtp"])
+def test_deepseek_v4_routed_moe_quant_config_keeps_ignored_mtp_experts_mxfp4(
+    tmp_path, monkeypatch, mtp_enabled
+):
+    """An NVFP4 cast that ignores ``mtp.*`` leaves the MTP experts MXFP4 (I8),
+    so the MTP layers get the MXFP4 expert config while the main layers keep NVFP4."""
+    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
+    main_tensor = "layers.0.ffn.experts.0.w1.weight"
+    mtp_tensor = "mtp.0.ffn.experts.0.w1.weight"
+    _write_safetensors_header(
+        tmp_path / "model-00001-of-00002.safetensors", main_tensor, "U8", [2048, 2048]
+    )
+    _write_safetensors_header(
+        tmp_path / "model-00002-of-00002.safetensors", mtp_tensor, "I8", [2048, 2048]
+    )
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    main_tensor: "model-00001-of-00002.safetensors",
+                    mtp_tensor: "model-00002-of-00002.safetensors",
+                }
+            }
+        )
+    )
+    spec_config = MTPDecodingConfig(max_draft_len=1)
+    # ModelConfig.from_pretrained fills this from the checkpoint config.
+    spec_config.num_nextn_predict_layers = 1
+    assert spec_config.spec_dec_mode.is_mtp_one_model()
+
+    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
+        DeepseekV4Config(num_hidden_layers=2, num_nextn_predict_layers=1),
+        str(tmp_path),
+        moe_impl_request("TRTLLM"),
+        None,
+        spec_config if mtp_enabled else None,
+    )
+
+    for layer_idx in range(2):
+        experts = layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"]
+        assert experts.quant_algo == QuantAlgo.NVFP4
+        assert experts.group_size == 16
+    if mtp_enabled:
+        mtp_experts = layer_quant_config["model.layers.2.mlp.experts"]
+        assert mtp_experts.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
+        assert mtp_experts.group_size == 32
+    else:
+        assert "model.layers.2.mlp.experts" not in layer_quant_config
+
+
 def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
     def fake_decoder_layer_init(self, model_config, *_args, **_kwargs):
         torch.nn.Module.__init__(self)

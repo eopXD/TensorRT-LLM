@@ -245,8 +245,8 @@ During decode, it scores retained pages and attends to the selected Top-K
 pages.
 
 RocketKV currently requires CUDA compute capability 10.0 or newer. KV-cache
-block reuse and chunked prefill must be disabled, and disaggregated serving is
-not supported.
+block reuse and chunked prefill must be disabled. Speculative decoding,
+disaggregated serving, KV-cache compression, and beam search are not supported.
 
 ```python
 from tensorrt_llm import LLM, SamplingParams
@@ -279,6 +279,17 @@ enable_chunked_prefill: false
 
 The TRTLLM and Vanilla attention implementations support RocketKV. The
 Vanilla implementation requires a BF16 KT cache.
+
+RocketKV follows `kv_cache_config.use_kv_cache_manager_v2`. With the V2 KV
+cache manager (the default), each KV cache block also stores the KT rows of its
+request, so the KV cache memory budget covers the KT cache. The V2 manager has
+these additional restrictions:
+
+- Sleep mode (`sleep_config`) is not supported; it requires the V1 manager
+  (`kv_cache_config.use_kv_cache_manager_v2: false`).
+- `kv_cache_config.enable_swa_scratch_reuse` must be disabled.
+- Every attention layer must have the same number of KV heads and the same head
+  size on each rank, and all layers must share one attention window.
 
 #### DeepSeek Sparse Attention
 
@@ -440,9 +451,65 @@ scales. Dense target layers and the shared Eagle3 draft layer keep FP8 caches.
 Prefill uses MSA kernels; decode uses TensorRT LLM's Triton sparse kernels
 within the MSA backend. This does not select `implementation: triton`.
 The optional `fuse_qkv_index_projection: true` supports FP8 and NVFP4 main
-caches with an FP8 indexer.
+caches with an FP8 indexer. With `enable_kv_cache_offload: true`, layers with an
+NVFP4 main cache skip the fused producer and run the unfused norm, RoPE and
+cache writes. The MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3`
+family also accept a standalone DSpark drafter; see the deployment guide.
 
-The sparse path has no dense fallback and does not support KV-cache reuse.
+On a disaggregated generation worker, `enable_kv_cache_offload: true` keeps
+sparse main K/V history and its NVFP4 block scales in host memory. Decode
+fetches the union of the blocks selected by the local KV heads into a bounded
+GPU cache; each head still attends to its original selection. Dense attention
+layers and index keys remain resident. The growing 128-token block is restored
+before appending a token and written back after the step, including when a
+transferred prompt ends inside a block.
+
+```yaml
+# Generation worker of a disaggregated deployment.
+cache_transceiver_config:
+  backend: NIXL
+kv_cache_config:
+  dtype: nvfp4  # fp8 is also supported
+  tokens_per_block: 128
+  use_kv_cache_manager_v2: true
+  enable_block_reuse: true
+sparse_attention_config:
+  algorithm: minimax_m3
+  implementation: msa
+  indexer_kv_dtype: fp8
+  enable_kv_cache_offload: true
+  kv_cache_offload_config:
+    gpu_cache_factor: 6.0
+```
+
+Enable offload only on the generation worker and use matching KV precision
+on the context worker. An offloading worker serves only generation requests, so
+it requires a `cache_transceiver_config`. Offload requires single-token,
+single-beam generation, pipeline parallel size 1, and no speculative decoding.
+`gpu_cache_factor` multiplies the maximum union size (`sparse_topk_blocks`, which
+MSA fixes at 16, times local KV heads), with one additional block reserved for
+writing. A larger factor
+holds more of each request's recently selected blocks on the GPU, so fewer
+decode steps wait for host fetches, at the cost of GPU memory per request. In a
+32K-input decode benchmark on two GB300 GPUs, a factor of 6 reached a 95.5%
+sparse cache hit rate and decoded faster than the default 2.0, which reached
+86.4%. `host_history_size` optionally bounds the host history budget in bytes;
+when unset, sizing follows the shared sparse offload memory planner. CUDA graphs
+reuse the same arena and page-table allocations across batch changes.
+
+KV cache manager V2 supports reuse of received prompt blocks on MSA generation
+workers, including with offload enabled. Repeated prompts reuse sparse K/V and
+NVFP4 scales from host pages together with the resident dense K/V and index
+keys. The KV transfer skips reused full blocks and transfers the remaining
+suffix, including any partial block. Offloaded generation history is not
+published to the reuse tree. A resident generation worker publishes its
+generated blocks too unless `block_reuse_config.policy` is `per_request`, which
+gives it the same limit, for example to compare the two modes. The validated
+configuration keeps `enable_block_reuse: false` on the context worker.
+`FORCE_DETERMINISTIC=1` disables block reuse; leave it unset or set it to `0`
+when enabling reuse.
+
+The sparse path has no dense fallback.
 Eagle3 supports one shared draft layer and linear drafting; other MTP/tree
 configurations are unsupported. NVFP4 KV with piecewise CUDA graphs is not
 qualified by the existing FP8-KV PCG tests. See the

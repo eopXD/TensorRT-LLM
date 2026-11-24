@@ -12,7 +12,7 @@ TensorRT LLM supports three checkpoint weight formats for MiniMax-M3:
 * **MXFP8** — weights are stored in MXFP8. The curated configuration uses BF16 KV cache and is the default for this guide.
 * **Mixed MXFP8/NVFP4** — MXFP8 base layers with NVFP4 routed experts. FP8 or NVFP4 KV cache is selected separately at runtime.
 
-The block-sparse attention path requires KV cache reuse to be disabled. The MSA backend supports linear Eagle3 with one shared GQA draft layer; see [Feature Support Notes](#feature-support-notes) for its constraints.
+On the block-sparse attention path, KV cache reuse is limited to received prompt blocks on MSA generation workers with KV cache manager V2; see [Feature Support Notes](#feature-support-notes). The MSA backend supports linear Eagle3 with one shared GQA draft layer; see the same notes for its constraints.
 
 This guide deploys MiniMax-M3 on **8x NVIDIA GB200 GPUs across 2 nodes** (4 GPUs per node) using Slurm and the `trtllm-llmapi-launch` multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see [Recommended Performance Settings](#recommended-performance-settings).
 
@@ -80,11 +80,21 @@ example `trtllm-eval ... gsm8k --apply_chat_template --chat_template_kwargs
 '{"thinking_mode": "disabled"}'`; the raw eight-shot prompts of the `gsm8k`
 default bypass the template the model was trained with.
 
+### MiniMax-M3.1-Flash
+
+* [MiniMaxAI/MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash) — MiniMaxAI-published checkpoint in the mixed MXFP8/NVFP4 packaging, with its DSpark drafter bundled in the `dspark/` subdirectory. See [Serving MiniMax-M3.1-Flash](#serving-minimax-m31-flash).
+
+```bash
+git lfs install
+git clone https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash /models/MiniMax-M3.1-Flash
+```
+
 ## Feature Support Notes
 
 * **Block-sparse attention is required.** MiniMax-M3 runs on the block-sparse attention backend, which must be selected via `sparse_attention_config.algorithm: minimax_m3` in the YAML configuration. There is no dense fallback for the sparse layers.
 * **Weight and KV precision.** BF16, MXFP8, and mixed MXFP8/NVFP4 checkpoints are supported. On SM100/SM103, the MSA backend supports FP8 and NVFP4 KV cache. NVFP4 storage is used in sparse target layers; dense target layers and the shared Eagle3 draft layer use FP8. The curated BF16-KV YAML remains a separate starting configuration.
-* **KV cache reuse must be disabled.** KV cache reuse is not supported on the sparse-attention path, so set `kv_cache_config.enable_block_reuse: false`.
+* **KV cache reuse on generation workers.** With KV cache manager V2 and MSA, set `kv_cache_config.enable_block_reuse: true` on the generation worker to reuse received prompt blocks, including with sparse KV offload. Reuse covers main K/V, NVFP4 scales, and index keys. Offloaded generation history is not published to the reuse tree. The offload configuration keeps reuse disabled on the context worker. Leave `FORCE_DETERMINISTIC` unset or set it to `0`; `1` disables block reuse.
+* **Sparse KV offload.** MSA generation workers can keep sparse main K/V history and NVFP4 block scales in host memory with `sparse_attention_config.enable_kv_cache_offload: true`. Dense layers and index keys remain on the GPU. This requires disaggregated single-token generation, KV cache manager V2, 128-token pages, pipeline parallel size 1, and no beam search or speculative decoding. Keep offload disabled on the context worker and use the same KV dtype on both workers. See the [M3 offload configuration](../features/sparse-attention.md#minimax-m3-block-sparse-gqa) for GPU cache and host history sizing.
 * **Eagle3.** The MSA path supports one shared GQA draft layer with linear Eagle3 drafting. Other MTP and tree-drafting configurations are unsupported. Keep NVFP4 KV and piecewise CUDA graph qualification separate: the existing PCG accuracy cases use FP8 KV.
 * **Rubin (SM107) Eagle3 draft layer.** On SM107 the shared Eagle3 draft layer runs at 128-token pages through FlashInfer's TRTLLM-Gen FMHA, the only FMHA with kernels for that page size there: keep `flashinfer_trtllm_gen` enabled in `TLLM_FMHA_LIBS`. `flashinfer-python` downloads those kernels on first use. On nodes without internet access, or to keep the download off the serving path, pre-populate the cubin directory and serve offline:
   1. On one node with internet access, start the server with the production configuration (same tensor-parallel size and KV cache dtype: the kernels depend on the per-rank head layout and KV dtype), `FLASHINFER_CUBIN_DIR` set to an empty directory, and serve one Eagle3 request with a long prompt (a context and a generation step at 128-token pages).
@@ -95,6 +105,34 @@ default bypass the template the model was trained with.
 * **Size `max_seq_len` for the active attention paths.** On SM100/SM103, supported dense layers with unquantized KV cache in the Triton configuration use native paged attention and do not gather historical KV or expand GQA heads into temporary tensors. The SDPA dense fallback still allocates those buffers when TRTLLM-Gen is unavailable, disabled, ordered after the C++ fallback in `TLLM_FMHA_LIBS`, or the Triton configuration uses FP8/NVFP4 KV. FP8 KV retains SDPA to preserve its existing Q precision. The Triton sparse decode path separately has per-query FP32 temporary buffers that grow with the attended KV length. Keep `max_seq_len` bounded for paths with these allocations: checkpoint defaults (1M for MXFP8, 512K for BF16) can cause OOM or CUDA graph capture failures. The curated YAML sets `max_seq_len` just above ISL+OSL (`2068` for the 1k/1k benchmark); longer-context workloads may require a lower `max_batch_size`. MSA retains its own dense/sparse kernels and cache layout.
 * **Parallelism.** MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via `enable_attention_dp: true`). The overlap scheduler is enabled by default.
 * **Multimodal.** `MiniMaxM3SparseForConditionalGeneration` supports text, image, and video inputs. The text decoder is also usable standalone (text-only) via the `MiniMaxM3SparseForCausalLM` architecture.
+
+## Serving MiniMax-M3.1-Flash
+
+MiniMax-M3.1-Flash is served with the same `MiniMaxM3SparseForConditionalGeneration` architecture, CLI flags, and YAML options as MiniMax-M3. On SM107 (Rubin) it runs on the MiniMax-M3.1-Flash targets of the Modeling V2 `minimax_m3` family. All 60 of its attention layers are sparse (its `sparse_attention_freq` has no dense entries), so there are no dense target layers. The examples use a local copy of the checkpoint at `/models/MiniMax-M3.1-Flash`.
+
+### Checkpoint
+
+The checkpoint ships MXFP8 base layers with NVFP4 routed experts in the compressed-tensors packaging described in [Mixed MXFP8/NVFP4](#mixed-mxfp8nvfp4). The DSpark drafter is bundled in the `dspark/` subdirectory and is loaded only when `speculative_config` selects it.
+
+### MSA kernels
+
+These targets use their own copy of the MSA kernels, which compiles at run time on first use (it needs `nvcc` and the CUTLASS headers packaged with TensorRT LLM, or `CUTLASS_ROOT`).
+
+### Speculative decoding with the DSpark drafter
+
+DSpark is a target-dependent block drafter: it reads hidden states from several target layers and proposes a block of up to 7 draft tokens per step, which the target verifies in one forward. Select it with `decoding_type: DSpark` and point `speculative_model` at the bundled drafter, `MiniMaxAI/MiniMax-M3.1-Flash/dspark` (or the `dspark/` folder of a local checkpoint). The target attention backend must be `TRTLLM`. The drafter attends over a sliding window, so leave chunked prefill off unless a host KV cache is configured, and size `max_num_tokens` to the longest prompt. The TP targets need `moe_expert_parallel_size: 1`, and the DEP target needs `enable_attention_dp: true` with `moe_expert_parallel_size` equal to the world size. For example, the min-latency TP4 configuration (set `max_seq_len` to the longest prompt plus output you serve):
+
+```{literalinclude} ../../../examples/configs/curated/minimax-m3.1-flash-latency.yaml
+:language: yaml
+```
+
+For max throughput, [`minimax-m3.1-flash-throughput.yaml`](source:examples/configs/curated/minimax-m3.1-flash-throughput.yaml) runs the DEP8 target (attention data parallel, MegaMoE expert-parallel MoE) on 2 nodes of 4 GPUs with the same drafter. Launch it with one MPI rank per GPU, for example `srun --mpi=pmix -N 2 --ntasks-per-node 4 trtllm-llmapi-launch trtllm-serve MiniMaxAI/MiniMax-M3.1-Flash --config minimax-m3.1-flash-throughput.yaml`.
+
+`max_draft_len` is the number of draft tokens per step, up to the drafter's native block of 7. Launch the server with the same command as in [Launch the TensorRT LLM Server](#launch-the-tensorrt-llm-server), pointing `$MODEL` at `/models/MiniMax-M3.1-Flash` and `--extra_llm_api_options` at this file.
+
+### Thinking mode and reasoning parsing
+
+The MiniMax-M3.1-Flash chat template has no thinking-mode switch: it ends the prompt at the assistant header without prefilling `<mm:think>`, so the model decides per turn whether to emit a reasoning block. A `thinking_mode` key in `chat_template_kwargs` is ignored by this template; the key it reads is `reasoning_effort` (one of `low`, `medium`, `high`, `xhigh`, or `max`). With `--reasoning_parser minimax_m3` the reasoning block is returned in `reasoning_content` and the answer in `content`.
 
 ## Deployment Steps
 
@@ -217,7 +255,7 @@ The parallelism, batch, KV-cache, sparse-attention, and CUDA-graph settings all 
 
 #### `--extra_llm_api_options` YAML options
 
-The curated config sets all the YAML knobs; this section only documents the two MiniMax-M3-specific constraints. Every other field in the YAML is a standard TensorRT LLM throughput knob — see the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full reference.
+The curated config sets all the YAML knobs; this section documents attention selection and block reuse. Every other field in the YAML is a standard TensorRT LLM throughput knob — see the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full reference.
 
 ##### `sparse_attention_config.algorithm`
 
@@ -225,7 +263,12 @@ Must be set to `minimax_m3`. There is no dense fallback for the MiniMax-M3 spars
 
 ##### `kv_cache_config.enable_block_reuse`
 
-Must be `false`. The sparse-attention path does not support KV cache block reuse across requests with shared prefixes.
+The curated Triton configuration keeps this `false`. With MSA and KV cache
+manager V2, a disaggregated generation worker can set this to `true` to reuse
+received prompt blocks, including with sparse KV offload. The offload recipe
+keeps reuse disabled on the context worker. See the
+[M3 offload configuration](../features/sparse-attention.md#minimax-m3-block-sparse-gqa)
+for the reuse policy and deterministic-mode settings.
 
 ## Testing API Endpoint
 
@@ -289,7 +332,7 @@ The `message` object contains the visible answer in `content` and, when the mode
 ## Troubleshooting Tips
 
 * **Sparse attention not applied:** Ensure `sparse_attention_config.algorithm` is set to `minimax_m3` in the YAML file passed to `--extra_llm_api_options`.
-* **KV cache reuse errors:** Confirm `kv_cache_config.enable_block_reuse` is `false`; KV cache reuse is not supported on the sparse-attention path.
+* **KV cache reuse not taking effect:** For received-prompt reuse on an MSA generation worker, use KV cache manager V2 and set `kv_cache_config.enable_block_reuse: true`. Leave `FORCE_DETERMINISTIC` unset or set it to `0`; `1` disables block reuse.
 * **Model fails to load:** Make sure `--trust_remote_code` is set and that the checkpoint path is correct and fully downloaded (Git LFS).
 * **Multi-node startup hangs or ranks can't find each other:** Verify that the model weights, the curated YAML, and all mounted paths resolve identically on both nodes (shared filesystem), that the total Slurm task count equals `tensor_parallel_size` (`8`), and that the inter-node interconnect (e.g., InfiniBand) is healthy.
 * **Reasoning/tool output not parsed:** Verify `--reasoning_parser minimax_m3`, `--tool_parser minimax_m3`, and `--chat_template $MODEL/chat_template.jinja` are all passed.

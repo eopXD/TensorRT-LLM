@@ -18,7 +18,8 @@ Compression is a separate feature, configured through
 sparse-specific -- see *Compression*.
 
 A separate instance serves prefill. The GPU cache holds one resident set per
-`(request, layer)`, which excludes per-KV-head selection. See *Device-side cache*. Kernel fusion
+`(request, layer)`, not one per KV head; a model whose heads select independently is served
+through the union of its heads' selections. See *Device-side cache*. Kernel fusion
 remains future work; so do multi-beam requests. `ISparseUnitGather` is retired — see
 *Extraction interface*.
 
@@ -247,7 +248,9 @@ units. See [Sizing](#sizing) for requests with several queries.
 ### Unflushed entries carry no state
 
 The resolve kernel derives pinning from a resident entry's ordinal and the row's
-device history.
+device history. With `include_partial_units`, the growing block also receives its host
+prefix once, when it is reserved, before the model appends to it -- see *Writing in-flight
+units*.
 
 ```
 pinned  <=>  entry_ordinal >= floor(device_history / unit_tokens)
@@ -341,11 +344,13 @@ resident set, because a selection unit is the tokens it spans across all of them
 that names a `selection_id` widens the scope rather than narrowing it: the members of a
 selection share one resident set between them, one per `(request, selection)` — see
 *Selection groups*. Their cells stay per layer and mirror. An
-algorithm that lets different heads select different units is not expressible here, and this
-is a real exclusion rather than a hypothetical: Rocket's selection indices are
-`[num_kv_heads, total_tokens]` and MiniMax-M3's are `[tokens, num_kv_heads, topk]` — both
-choose per head. Serving them would need a resident set per `(request, layer, head)`, which
-multiplies the metadata and the reservation by the head count.
+algorithm whose heads select different units keeps this scope by selecting their union:
+MiniMax-M3's indices are `[tokens, num_kv_heads, topk]`, and `merge_head_selections`
+(`attention/backends/sparse/offload_kernels.py`) deduplicates each request's heads into one
+selection of up to `num_kv_heads * topk` units, which the cache is sized for. After the
+fetch, `build_sparse_block_table` publishes each selected unit's cell by its ordinal, so
+every head reads its own selection unchanged. A resident set per `(request, layer, head)`
+remains unsupported: it would multiply the metadata and the reservation by the head count.
 
 **Scope is per request.** Two requests sharing a prefix do not share a cached copy. That
 closes a soundness hole by construction: entries are reachable only through their own
@@ -701,9 +706,8 @@ No host involvement, so the call enqueues and returns. Every shape is static acr
 The selection is not the only thing that needs a cell. The block being written needs one
 too, and needs it before the selection takes any victim. Both are resolved by the same
 probe, over one virtual list: the in-flight ordinals `[history_units, capacity_units)`
-first, then the selection. An in-flight unit differs in exactly one way — a miss allocates
-its cell but never joins the copy list, because its host page holds nothing to fetch until
-the watermark passes it.
+first, then the selection. A missing in-flight unit normally only reserves a cell.
+With `include_partial_units`, a nonempty host prefix is restored on its first reservation.
 
 ### Writing in-flight units
 
@@ -718,6 +722,29 @@ The output shape is `[batch, buffers, max_in_flight_units]`. Set
 slot `i` holds the arena index for unit `history_units + i` if that ordinal is below
 `capacity_units`. All remaining slots hold `BAD_PAGE_INDEX`. With four-token units and
 a one-token step, a new unit becomes writable once every four steps.
+
+With `include_partial_units=False`, the default for the other sparse models, nothing is
+fetched for an in-flight unit. Its host page is not written until the watermark passes
+it, so the resolve excludes in-flight ordinals from the copy list
+(`ordinal < historyUnits`). This serves compressed units produced only when all their
+input tokens are available.
+
+MiniMax-M3 offload always sets `include_partial_units=True`; it is not configurable. Its
+blocks receive a token appended each step, which this mode serves. History units use
+`floor(history / unit_tokens)` and capacity units use
+`ceil(capacity / unit_tokens)`, reserving the growing block on every step. A miss for that
+block restores its host prefix before exposing the write index; a hit leaves live writes
+intact. The fetch work list includes one extra entry per row for that prefix. Write
+preparation has a separate fixed list with one entry per row, overwritten on each call;
+empty entries use `kNoSparseSlot`. It needs no counter or per-call memset and cannot
+clobber a pending selection's fetch list, which is why partial units allow a single
+in-flight unit. Each advancing row flushes through `ceil(new_history / unit_tokens)` before
+resizing, by the token: the host's `flushSparseUnits()` stages the token bounds, and the
+device-side history advance, which ends a flush at the last whole unit, refuses a life
+cycle with partial units. This also keeps host pages current for `commit_min_snapshot` and
+`stopCommitting()`, which can publish partial prefixes while a request is still seated.
+Flushing only on removal would leave those reusable prefixes stale. Layers using partial
+units must have independent selections (`selection_id=None`).
 
 ### One fetch row per request, one selection per query
 
@@ -813,14 +840,14 @@ rather than inferred.
 obvious denominator — rows times selection width, which the host knows for free — counts
 things that are neither. A selection entry may be padded, and padding is negative and lives
 on the device, chosen by whatever selected the units. An in-flight unit is resolved in the
-same pass but is not a fetch: its host page is not written until the watermark passes it,
-so there is nothing to copy and nothing to miss. Counting either as a hit inflates the rate,
+same pass but is excluded from selection hit/miss statistics. Partial-prefix restoration
+is write preparation, not a selected-history lookup. Counting either as a hit inflates the rate,
 and does so worst where histories are short — early decode, short prompts — which is
 exactly the regime someone reads the rate to understand.
 
 So the resolve counts the selection entries that named real history, in the pass that
-already classifies them. The miss half is `claimed`, the run the row takes in the compacted
-list, which it computes anyway. The two are produced together and agree by construction on
+already classifies them. The miss half counts selected-history misses, excluding partial-prefix restores even
+when a selection resolve also restores one. The two are produced together and agree by construction on
 what they count; hits are their difference and are never stored.
 
 **Each row adds its own contribution, rather than anything reading a total afterwards.**

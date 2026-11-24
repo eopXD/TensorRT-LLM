@@ -594,17 +594,30 @@ def _register_fake():
 
     @torch.library.register_fake(
         "trtllm::minimax_m3_fp8_qkv_indexer_norm_rope_kv_insert")
-    def _(packed: torch.Tensor, kv_cache: torch.Tensor,
-          index_k_cache: torch.Tensor, out_cache_loc: torch.Tensor,
-          num_heads_q: int, num_heads_kv: int, num_heads_index: int,
-          head_dim: int, rotary_dim: int, eps: float, q_weight: torch.Tensor,
-          k_weight: torch.Tensor, index_q_weight: torch.Tensor,
-          index_k_weight: torch.Tensor, rotary_cos_sin: torch.Tensor,
-          position_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _(
+        packed: torch.Tensor,
+        kv_cache: torch.Tensor,
+        index_k_cache: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        num_heads_q: int,
+        num_heads_kv: int,
+        num_heads_index: int,
+        head_dim: int,
+        rotary_dim: int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        index_q_weight: torch.Tensor,
+        index_k_weight: torch.Tensor,
+        rotary_cos_sin: torch.Tensor,
+        position_ids: torch.Tensor,
+        index_out_cache_loc: Optional[torch.Tensor] = None,
+        kv_cache_is_arena: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Infer main and index query shapes without mutating either cache."""
         del kv_cache, index_k_cache, out_cache_loc, num_heads_kv, rotary_dim
         del eps, q_weight, k_weight, index_q_weight, index_k_weight
-        del rotary_cos_sin, position_ids
+        del rotary_cos_sin, position_ids, index_out_cache_loc, kv_cache_is_arena
         num_tokens = packed.shape[0]
         return (packed.new_empty((num_tokens, num_heads_q, head_dim),
                                  dtype=torch.float8_e4m3fn),
@@ -1665,7 +1678,8 @@ def _register_fake():
           workspace,
           cp_rank,
           cp_size,
-          zero_kv_mask=None):
+          zero_kv_mask=None,
+          is_lse=False):
         # Returns outputs with same shapes as inputs
         return partial_o.new_empty(partial_o.shape), softmax_stats.new_empty(
             softmax_stats.shape)
@@ -1698,15 +1712,23 @@ def _register_fake():
         return (_mk(), _mk(), _mk())
 
     @torch.library.register_fake("trtllm::helix_post_process")
-    def _(gathered_o, gathered_stats, scale):
+    def _(gathered_o, gathered_stats, scale, is_lse=False):
         return gathered_o.new_empty(*gathered_o.shape[1:])
 
     @torch.library.register_fake("trtllm::helix_post_process_native")
-    def _(gathered_o, gathered_stats, scale, cp_dim):
+    def _(gathered_o, gathered_stats, scale, cp_dim, is_lse=False):
         # Remove the dimension at cp_dim (context parallelism dimension)
         out_shape = list(gathered_o.shape)
         del out_shape[cp_dim]
         return gathered_o.new_empty(*out_shape)
+
+    @torch.library.register_fake("trtllm::lm_head_argmax")
+    def _(input: torch.Tensor, weight: torch.Tensor, vocab_offset: int,
+          round_logits: bool, scratch: torch.Tensor,
+          exchange_epoch: Optional[torch.Tensor], peer_buffers: List[int],
+          exchange_words: int, rank: int, tokens: torch.Tensor):
+        # Writes the greedy tokens into ``tokens`` in place.
+        return None
 
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):

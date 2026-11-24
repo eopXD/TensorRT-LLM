@@ -24,6 +24,7 @@ from ..offload import (
     SparseOffloadState,
     allocate_sparse_offload_state,
     get_sparse_offload_metadata_layers,
+    validate_sparse_offload_batch,
 )
 from ..params import use_self_sampling_gvr
 from .cache_manager import is_dsa_cache_manager
@@ -493,20 +494,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         ``sparse_offload_queries_per_request`` of them.
         """
         self.sparse_offload_state.prepared = False
-        if self.num_contexts:
-            raise NotImplementedError(
-                "Sparse KV cache offload runs decode batches only; context requests reach "
-                "an offloading worker through disaggregated KV transfer"
-            )
-        if self.seq_lens.device.type != "cpu" or self.seq_lens_kv.device.type != "cpu":
-            raise ValueError("Sparse offload batch validation requires host sequence lengths")
-        queries = self.sparse_offload_state.queries_per_request
-        if not torch.equal(self.seq_lens, self.seq_lens_kv) or not torch.all(
-            (self.seq_lens >= 1) & (self.seq_lens <= queries)
-        ):
-            raise NotImplementedError(
-                f"Sparse offload decode requires one to {queries} query tokens per request"
-            )
+        validate_sparse_offload_batch(
+            self.num_contexts,
+            self.seq_lens,
+            self.seq_lens_kv,
+            queries_per_request=self.sparse_offload_state.queries_per_request,
+        )
 
     def _has_mixed_precision_staging(self) -> bool:
         # No staging: attention reads the gather's FP8 scratch.
@@ -1087,7 +1080,32 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         if self._offloads_dsa_latent():
             # Offloaded rows are dequantized into the offload state's scratch instead.
             return
+        from ...fmha.prims_ts_dsa_sparse_mla import prims_ts_reads_nvfp4_mla_records
 
+        if prims_ts_reads_nvfp4_mla_records(self):
+            # PrimTS reads the records in place, so generation gathers no FP8 rows. A layer
+            # that gathers nevertheless calls ensure_nvfp4_mla_generation_buffers().
+            return
+        self._allocate_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+
+    def ensure_nvfp4_mla_generation_buffers(self) -> None:
+        """Allocate the gather outputs for a layer that gathers after creation left them out.
+
+        Creation decides without the attention layers. A layer whose FMHA list lacks the PrimTS
+        record reader (skip-correction, an unsupported head count) gathers although the metadata
+        expected the records to be read in place. The first such step allocates the rows, in
+        eager execution: CUDA graph capture needs their addresses fixed beforehand.
+        """
+        if self.nvfp4_mla_fp8_scratch is not None and self.nvfp4_mla_compact_indices is not None:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "NVFP4 MLA gather buffers must be allocated during eager warmup, not under "
+                "CUDA graph capture"
+            )
+        self._allocate_nvfp4_mla_generation_buffers(capture_graph=self.is_cuda_graph)
+
+    def _allocate_nvfp4_mla_generation_buffers(self, capture_graph=False):
         # MTP verifies the current token and max_draft_tokens draft tokens for
         # every generation request. Each query row has its own TopK selection,
         # so the dequantized FP8 rows and compact offsets must cover the full
@@ -1625,7 +1643,8 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.nvfp4_mla_fp8_scratch is not None
             and self.nvfp4_mla_fp8_scratch.shape[0] != max_gen_tokens
         ):
-            self._create_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
+            # Resize what exists, whether creation or a gathering layer allocated it.
+            self._allocate_nvfp4_mla_generation_buffers(capture_graph=capture_graph)
         previous_cap = int(getattr(self, "_expanded_alloc_draft_cap", -1))
         allocation_cap = max(self._draft_sizing_cap, previous_cap)
         if allocation_cap > previous_cap:

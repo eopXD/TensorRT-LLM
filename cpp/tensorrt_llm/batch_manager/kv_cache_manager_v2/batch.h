@@ -114,6 +114,10 @@ struct SparseStepScratch
     //! selection, each copying the same units into its own cells.
     SparseWorkList fetchWork;
 
+    //! One optional partial-prefix restore per row. A fixed list, independent of a
+    //! pending selection, overwritten by every write-index preparation (no counter).
+    SparseWorkList restoreWork;
+
     //! The write-back's counterpart. A write-back crosses every layer of a row at once and
     //! the copy that consumes it walks buffers, so it takes one list per layer rather than
     //! the one the fetch folds away.
@@ -147,7 +151,8 @@ struct SparseStepScratch
 //!
 //!     num_blocks     = historyLength / tokens_per_block     (valid page table entries)
 //!     history_units  = historyLength / unit_tokens          (selectable units)
-//!     capacity_units = capacity / unit_tokens               (the in-flight span's end)
+//!     capacity_units = capacity / unit_tokens               (the in-flight span's end,
+//!                      rounded up when the sparse cache includes partial units)
 //!
 //! Publishing the source rather than the three derived counts keeps one truth; the divisors
 //! are per-layer-group constants a kernel already has.
@@ -483,10 +488,9 @@ public:
     //! mis-serving them.
     //!
     //! `selected` is [maxBatchSize][selectionWidth] unit ordinals, negative where padded,
-    //! and must name only units below the history watermark -- a unit at or above it has
-    //! not been written back, so fetching it would copy stale bytes. That is a wrong
-    //! answer rather than a memory error, and the call cannot detect it, so it is the
-    //! selector's responsibility.
+    //! and must name only complete history units below the watermark. Partial-prefix
+    //! restoration is managed separately from the selection. The selector owns this
+    //! eligibility check; the fetch cannot distinguish stale or unwritten host bytes.
     //!
     //! `out` is [maxBatchSize][buffers.size()][selectionWidth], written in full, in the
     //! expanded index space getPageIndexConverter() produces: entry k is the index holding
@@ -545,8 +549,10 @@ public:
     //!
     //! The units between the two watermarks are the ones the model is producing. They have
     //! no host copy yet -- a unit reaches its page only when resize() carries the watermark
-    //! past it -- so nothing is fetched here: the call assigns cells and leaves their bytes
-    //! to the model.
+    //! past it -- so the call assigns cells and leaves their bytes to the model. The one
+    //! exception is includePartialUnits, where a newly reserved cell for the growing unit
+    //! restores its host prefix before the write index is exposed; a resident cell is left
+    //! intact. Partial units allow a single in-flight unit.
     //!
     //! Needs only the watermarks, not the selection, so it runs before fetchSparsePages.
     //!
@@ -856,9 +862,10 @@ private:
     //! tables exist, because a descriptor names where in them a buffer's indices sit.
     void _allocateCopyDesc();
 
-    //! Device room for the per-row unit ranges a write-back reads:
-    //! [life cycle][2][maxBatchSize], as [from][to], then each life cycle's unit size.
-    //! Allocated with the fetch scratch, which has the same lifetime.
+    //! Device room for the per-row unit and token ranges a write-back reads:
+    //! [life cycle][kFlushRangeFields][maxBatchSize], as [fromUnit][toUnit][fromToken][toToken],
+    //! then each life cycle's unit size. Allocated with the fetch scratch, which has the same
+    //! lifetime.
     //! Yields the elements both need, then clears the ranges and fills the unit sizes.
     LayoutGenerator _layoutFlushRanges();
 

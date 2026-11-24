@@ -21,12 +21,11 @@ replicated INDEX_KEY cache. V2 storage coalesces buffers purely by (life
 cycle, size), so at TP degrees where K == V == INDEX_KEY bytes per block the
 index-K cache shares the K/V pool and the slot interleaves per layer; at
 other degrees it gets its own pool. The disagg page-table builder splits each
-pool into per-mapper-kind views, so both layouts (and transfers between them)
-are exercised by the topology matrix below.
+pool by mapper kind and dense/sparse layer class. Both layouts and transfers
+between them are exercised by the topology matrix below.
 """
 
 from collections.abc import Sequence
-from types import SimpleNamespace
 from typing import Any
 
 import kv_transfer_harness as transfer_harness
@@ -38,11 +37,16 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3KV
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool, get_pool_bytes
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
+    KVCacheManagerV2,
+    Role,
+)
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MiniMaxM3SparseAttentionConfig
 
 NUM_LAYERS = 4
 NUM_KV_HEADS = 2
@@ -50,6 +54,9 @@ HEAD_DIM = 128
 INDEX_DIM = 128
 TOKENS_PER_BLOCK = transfer_harness.TOKENS_PER_BLOCK
 SPARSE_LAYERS = [3]
+# A DSpark drafter's 4096-token window, scaled down to the harness's 512-token sequences.
+NUM_DRAFT_LAYERS = 2
+DRAFT_WINDOW = 256
 
 
 class _FakeKVCache:
@@ -131,7 +138,7 @@ def test_minimax_disagg_role_mapper_kinds(
         dtype=cache_dtype,
         sparse_layer_ids=[],
         disable_index_value_layer_ids=[],
-        sparse_attention_config=SimpleNamespace(
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(
             implementation=implementation,
             indexer_kv_dtype="bf16",
         ),
@@ -147,7 +154,7 @@ def test_minimax_disagg_role_mapper_kinds(
             dtype=DataType.FP8,
             sparse_layer_ids=[],
             disable_index_value_layer_ids=[],
-            sparse_attention_config=SimpleNamespace(
+            sparse_attention_config=MiniMaxM3SparseAttentionConfig(
                 implementation="triton", indexer_kv_dtype="bf16"
             ),
         )
@@ -208,6 +215,7 @@ def _create_manager(
     dtype: DataType,
     sparse_layers: list[int] | None = None,
     implementation: str = "triton",
+    layer_specs: tuple[KVCacheLayerSpec, ...] | None = None,
 ) -> MiniMaxM3KVCacheManagerV2:
     max_num_tokens = 2048
     kv_cache_dtype = {
@@ -235,63 +243,64 @@ def _create_manager(
         sparse_layer_ids=sparse_layers if sparse_layers is not None else SPARSE_LAYERS,
         disable_index_value_layer_ids=sparse_layers if sparse_layers is not None else SPARSE_LAYERS,
         sparse_index_dim=INDEX_DIM,
-        sparse_attention_config=SimpleNamespace(
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(
             implementation=implementation,
             indexer_kv_dtype="bf16",
         ),
+        layer_specs=layer_specs,
+        is_disagg=layer_specs is not None,
     )
 
 
-def test_minimax_m3_pool_view_scheme_coalesced_vs_separate() -> None:
+@pytest.mark.parametrize("tp", [1, 2])
+def test_minimax_m3_pool_view_scheme_coalesced_vs_separate(tp: int) -> None:
     """Pool composition varies with TP; the view scheme must not.
 
     TP=2 makes kv_heads_per_rank == 1, so K == V == INDEX_KEY bytes per
     block and V2 coalesces all three into one pool whose slot interleaves
     the sparse layer's index-K between K/V regions (non-uniform layer
     stride). TP=1 doubles K/V, so index-K gets its own pool and strides are
-    uniform. Both layouts must yield the same two per-class views.
+    uniform. Both layouts must yield dense K/V, sparse K/V, and index-K views.
     """
     from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
         build_page_table_from_manager,
     )
     from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
 
-    # --- TP=2: coalesced, interleaved slot ---
     manager = _create_manager(
-        Mapping(world_size=2, rank=0, tp_size=2, pp_size=1), DataType.BF16, sparse_layers=[1]
+        Mapping(world_size=tp, rank=0, tp_size=tp, pp_size=1), DataType.BF16, sparse_layers=[1]
     )
     try:
         lg = build_page_table_from_manager(manager).layer_groups[0]
-        assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
+        assert len(lg.pool_views) == 3
+        kv_views = [pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND]
+        assert len(kv_views) == 2
         idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
-        assert kv_view.pool_role == frozenset({str(Role.KEY), str(Role.VALUE)})
+        for kv_view in kv_views:
+            assert kv_view.pool_role == frozenset({str(Role.KEY), str(Role.VALUE)})
         assert idx_view.pool_role == frozenset({str(Role.INDEX_KEY)})
-        # Coalesced: both views address the same physical pool.
-        assert kv_view.pool_idx == idx_view.pool_idx
-        starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
-        unit = bytes_per_layer // 2  # one K or V buffer per block
-        # Slot: L0K L0V L1K L1V L1IDX L2K L2V L3K L3V — the sparse layer's
-        # index-K makes the K/V layer stride non-uniform.
-        assert starts == {0: 0, 1: 2 * unit, 2: 5 * unit, 3: 7 * unit}
-        idx_starts, idx_bytes_per_layer = get_layer_byte_ranges(idx_view)
-        assert idx_starts == {1: 4 * unit}
-        assert idx_bytes_per_layer == unit
-    finally:
-        manager.shutdown()
-
-    # --- TP=1: separate pools, uniform strides ---
-    manager = _create_manager(
-        Mapping(world_size=1, rank=0, tp_size=1, pp_size=1), DataType.BF16, sparse_layers=[1]
-    )
-    try:
-        lg = build_page_table_from_manager(manager).layer_groups[0]
-        assert len(lg.pool_views) == 2
-        kv_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.HND)
-        idx_view = next(pv for pv in lg.pool_views if pv.mapper_kind == MapperKind.REPLICATED)
-        assert kv_view.pool_idx != idx_view.pool_idx
-        starts, bytes_per_layer = get_layer_byte_ranges(kv_view)
-        assert starts == {i: i * bytes_per_layer for i in range(NUM_LAYERS)}
+        kv_ranges = [get_layer_byte_ranges(pv) for pv in kv_views]
+        assert {frozenset(starts) for starts, _ in kv_ranges} == {
+            frozenset({0, 2, 3}),
+            frozenset({1}),
+        }
+        bytes_per_layer = kv_ranges[0][1]
+        assert all(size == bytes_per_layer for _, size in kv_ranges)
+        starts = {layer: offset for ranges, _ in kv_ranges for layer, offset in ranges.items()}
+        assert kv_views[0].pool_idx == kv_views[1].pool_idx
+        if tp == 2:
+            # All three views address the same physical pool.
+            assert kv_views[0].pool_idx == idx_view.pool_idx
+            unit = bytes_per_layer // 2  # one K or V buffer per block
+            # Slot: L0K L0V L1K L1V L1IDX L2K L2V L3K L3V — the sparse layer's
+            # index-K makes the K/V layer stride non-uniform.
+            assert starts == {0: 0, 1: 2 * unit, 2: 5 * unit, 3: 7 * unit}
+            idx_starts, idx_bytes_per_layer = get_layer_byte_ranges(idx_view)
+            assert idx_starts == {1: 4 * unit}
+            assert idx_bytes_per_layer == unit
+        else:
+            assert kv_views[0].pool_idx != idx_view.pool_idx
+            assert starts == {i: i * bytes_per_layer for i in range(NUM_LAYERS)}
     finally:
         manager.shutdown()
 
@@ -477,7 +486,7 @@ def _initialize_cache(
 
         for layer_idx in manager.pp_layers:
             kv = manager.get_buffers(layer_idx, kv_layout=manager._main_kv_layout_name())
-            if manager.dtype == DataType.NVFP4:
+            if manager.dtype == DataType.NVFP4 and layer_idx < NUM_LAYERS:
                 sparse = layer_idx in manager.sparse_layer_ids
                 assert kv.dtype == (torch.int8 if sparse else torch.float8_e4m3fn)
                 assert kv.shape[-1] == (HEAD_DIM // 2 if sparse else HEAD_DIM)
@@ -557,6 +566,13 @@ def _verify_cache(
                         ctx_indices = _valid_indices(
                             ctx_manager, ctx_request_ids[req_idx], layer_idx
                         )
+                        if layer_idx >= NUM_LAYERS:
+                            # A windowed draft lifecycle's receiver holds the trailing blocks
+                            # (at least a window's), which the sender may still keep after more.
+                            window_blocks = DRAFT_WINDOW // TOKENS_PER_BLOCK
+                            assert min(len(ctx_indices), window_blocks) <= len(gen_indices)
+                            assert len(gen_indices) <= len(ctx_indices)
+                            ctx_indices = ctx_indices[len(ctx_indices) - len(gen_indices) :]
                         ctx_kv = ctx_manager.get_buffers(
                             layer_idx, kv_layout=ctx_manager._main_kv_layout_name()
                         )
@@ -765,6 +781,92 @@ def test_minimax_m3_multi_sparse_layer_pp_transfer(
         manager_factory=lambda tp, pp, enable_dp: _create_managers(
             tp, pp, enable_dp, DataType.BF16, sparse_layers=MULTI_SPARSE_LAYERS
         ),
+        init_fn=_initialize_cache,
+        verify_fn=_verify_cache,
+    )
+
+
+def _create_unified_draft_managers(
+    tp: int, pp: int, enable_dp: bool
+) -> list[MiniMaxM3KVCacheManagerV2]:
+    """Hybrid NVFP4 MSA managers hosting a windowed BF16 drafter's layers as draft layer specs."""
+    assert pp == 1, "draft layer specs here cover every layer of one PP rank"
+    heads = NUM_KV_HEADS if enable_dp else NUM_KV_HEADS // tp
+    specs = tuple(
+        KVCacheLayerSpec(
+            global_layer_id=layer,
+            owner=KVCacheLayerOwner.TARGET,
+            dtype=DataType.NVFP4,
+            num_kv_heads=heads,
+            head_dim=HEAD_DIM,
+            buffer_roles=(Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE),
+        )
+        for layer in range(NUM_LAYERS)
+    ) + tuple(
+        KVCacheLayerSpec(
+            global_layer_id=NUM_LAYERS + layer,
+            owner=KVCacheLayerOwner.DRAFT,
+            dtype=DataType.BF16,
+            num_kv_heads=heads,
+            head_dim=HEAD_DIM,
+            buffer_roles=(Role.KEY, Role.VALUE),
+            sliding_window_size=DRAFT_WINDOW,
+        )
+        for layer in range(NUM_DRAFT_LAYERS)
+    )
+    managers = [
+        _create_manager(
+            Mapping(world_size=tp, rank=rank, tp_size=tp, pp_size=1, enable_attention_dp=enable_dp),
+            DataType.NVFP4,
+            implementation="msa",
+            layer_specs=specs,
+        )
+        for rank in range(tp)
+    ]
+    for manager in managers:
+        assert manager.draft_layer_ids == tuple(range(NUM_LAYERS, NUM_LAYERS + NUM_DRAFT_LAYERS))
+    return managers
+
+
+@pytest.mark.cuda
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_enable_dp,gen_tp,gen_enable_dp",
+    [
+        (1, False, 1, False),
+        (2, False, 2, False),
+        (2, True, 2, True),
+        (1, False, 2, False),
+        (2, False, 2, True),
+    ],
+    ids=["tp1_to_tp1", "tp2_to_tp2", "dep2_to_dep2", "tp1_to_tp2", "tp2_to_dep2"],
+)
+@pytest.mark.parametrize(
+    "update_before_transfer",
+    [True, False],
+    ids=["update_before", "update_after"],
+)
+def test_minimax_m3_unified_draft_layer_transfer(
+    ctx_tp: int,
+    ctx_enable_dp: bool,
+    gen_tp: int,
+    gen_enable_dp: bool,
+    update_before_transfer: bool,
+) -> None:
+    """Windowed BF16 draft layers of the NVFP4 manager reach the same pages as the target's.
+
+    Draft layers reshard across TP and attention DP like the target's, and are verified byte for
+    byte with the target's K/V, block scales and index-K.
+    """
+    transfer_harness.run_kv_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=1,
+        gen_tp=gen_tp,
+        gen_pp=1,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
+        update_before_transfer=update_before_transfer,
+        manager_factory=_create_unified_draft_managers,
         init_fn=_initialize_cache,
         verify_fn=_verify_cache,
     )

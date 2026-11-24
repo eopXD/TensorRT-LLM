@@ -651,7 +651,7 @@ The FMHA package is split by role:
   size of the FP8 context scratch. The cached-KV path
   (`forward_context_with_cached_kv`) rejects FP4 MLA layers. Reuse must also
   resume on a full FP4 tile. Hybrid linear-attention models resume on a
-  recurrent-state snapshot that the hybrid manager aligns to a cache block,
+  recurrent-state snapshot that the FP4 MLA layout aligns to a cache block,
   and keep block reuse tied to chunked prefill. The dense manager claims
   whole cache blocks only, without the reuse-match backoff of one-model
   drafts, and keeps its HP ring request-private
@@ -669,12 +669,17 @@ The FMHA package is split by role:
   only K, K scales, and the HP ring, runs context attention only, and skips
   generation warmup shapes. A one-model MTP drafter on such a worker must
   draft a single token (`max_draft_len: 1`), because its later draft steps
-  are generation steps; the generation worker fills in the drafts it lacks. Hybrid
-  linear-attention models (Kimi K3)
-  keep their MLA latent cache in `MambaHybridCacheManagerV2`, which composes
-  `Fp4MlaV2CacheLayoutPolicy` with the recurrent-state lifecycle: the policy
-  owns the MLA layers' roles and HP-ring virtual layers, and the hybrid
-  manager keeps the SSM, convolution, and KDA replay state. For disaggregated
+  are generation steps; the generation worker fills in the drafts it lacks. The hybrid
+  linear-attention model Kimi K3
+  keeps its MLA latent cache in `KimiK3HybridCacheManager`, which selects
+  `Fp4MlaV2CacheLayoutPolicy` through the hybrid manager's
+  `_configure_attention_cache_layout` hook; `MambaHybridCacheManagerV2`
+  composes the policy with the recurrent-state lifecycle and forwards the
+  attention-layout operations to it: the policy owns the MLA layers' roles,
+  HP-ring virtual layers and snapshot-point alignment, and the hybrid
+  manager keeps the SSM, convolution, and KDA replay state. No other hybrid
+  linear-attention family has an FP4 MLA layout, so `get_kv_cache_manager_cls`
+  rejects one with an NVFP4 MLA cache. For disaggregated
   serving the hybrid manager owns the transfer declarations and merges the
   policy's MLA roles into them: K and K scales map to `NHD` and the HP ring to
   `REPLICATED` per role, so SSM state keeps the `INDEXED` `Role.ALL` fallback
@@ -719,6 +724,31 @@ The FMHA package is split by role:
   it is in the default library set and `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`
   removes it. For compress-ratio-4 layers under KV-cache offload, its extra
   source is the layer's sparse cache arena (§3.2.5).
+- `fmha/prims_ts_dsa_sparse_mla.py` runs DSA generation on the vendored PrimTS
+  D576 sparse MLA kernel (SM100/SM103, and SM107 with the Rubin helpers of the
+  CuTe DSL), which reads the NVFP4 KV records of the
+  `fp8rope` layout in place. Its `prims_ts_reads_nvfp4_mla_records()` is the
+  one decision behind both gather skips:
+  `DSATrtllmAttention.sparse_attn_predict` skips the NVFP4-to-FP8 gather and
+  DSA metadata leaves out the gather's FP8 rows. Where it does not hold (Helix,
+  beam search, a layer without the library, e.g. with skip-correction), the
+  layer gathers and TRTLLM-Gen serves generation. It is in the default library
+  set and `TLLM_FMHA_LIBS=-prims_ts_dsa_sparse_mla` removes it.
+  The cache manager settles the layout of an NVFP4 DSA cache and publishes it
+  as `mla_kv_cache_layout`. `TRTLLM_NVFP4_MLA_KV_CACHE_LAYOUT` defaults to
+  `auto`: `DSACacheManagerV2` stores `fp8rope` records where generation reads
+  them in place. It keeps the `residual` layout, as `DSACacheManager` always
+  does, when the cache cannot hold records (a latent other than 512 + 64, a
+  mixed-precision KV cache, or KV-cache offload, whose arena reads NVFP4
+  latents with a block-scale pool) and when
+  `get_nvfp4_mla_record_reader_unsupported_reason()` names a reason known
+  before the layers exist: the library is disabled, the GPU or the CuTe DSL
+  toolchain cannot run it, or the mapping uses Helix. `fp8rope` stores records
+  whether or not they are read in place and raises for a cache that cannot
+  hold them; `residual` selects that layout everywhere. Records carry no
+  global scale: the native cache ops take the
+  layer's NVFP4 scale for the `residual` layout only, so a layer needs no
+  knowledge of the layout.
 - `fmha/prims_ts_block_sparse.py` adapts generic block-sparse requests to the
   vendored PrimTS contiguous and paged wrappers. Paged generation passes a
   live, zero-copy 2D K-page-table view with its TRT-LLM padded row stride; it
@@ -783,7 +813,8 @@ for details.
 #### 3.2.5 Sparse KV cache offload
 
 With `enable_kv_cache_offload`, DSA layers and DeepSeek-V4 compress-ratio-4
-layers keep their sparse latent history in host-backed KVCacheManagerV2 pools.
+layers keep their sparse latent history, and MiniMax-M3 sparse layers their main
+K/V and NVFP4 block scales, in host-backed KVCacheManagerV2 pools.
 Each request reads it through a fixed-size GPU cache in the sparse cell arena,
 whose layout is described in
 [`SPARSE_ATTENTION_DESIGN.md`](../../../cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/SPARSE_ATTENTION_DESIGN.md).
@@ -814,6 +845,27 @@ Each offloaded layer runs three steps in a generation step:
    so the scratch ends in `NVFP4_SCRATCH_TAIL_ROWS` zeroed rows and every
    arena pool ends in a matching zeroed tail.
 
+MiniMax-M3 selects blocks per KV head and caches whole 128-token blocks,
+including the growing one, so its MSA backend runs the same three steps on
+blocks:
+
+1. **Write.** `prepare_write_slots` turns the layer's write indices into token
+   slots in the arena, and the cache writers or the fused FP8 producer store
+   the new K/V there. Index keys stay paged, so the producer takes separate
+   slot maps for the two caches. The growing block's host prefix is restored
+   into its cell before the first write.
+2. **Fetch.** `merge_head_selections` deduplicates the heads' selections into
+   one selection per request, and `build_sparse_block_table` publishes each
+   selected block's arena cell at the block's ordinal, so each head still reads
+   its own selection through an ordinary block table.
+3. **Attend.** The Triton sparse decode reads the arena view that
+   `MiniMaxM3KVCacheManagerV2.get_sparse_arena_buffers` returns, through that
+   table. `get_buffers` and `get_block_scale_buffers` return None for an
+   offloaded layer, as page-indexed consumers expect of host-backed layers.
+   The table gives CUDA-graph padding queries cell 0 for the blocks their
+   selection names, so the decode, which does not mask -1 entries, stays in
+   the arena.
+
 For an offloaded layer, the KV-cache manager's block tables and pool pointers
 do not describe where the history is. The arena-row indices are relative to
 the base of the layer's data arena, and a library must read through that base.
@@ -831,8 +883,8 @@ def _reads_sparse_arena(self, metadata) -> bool:
     )
 ```
 
-Read the attribute with `getattr`: only the DSA and DeepSeek-V4 metadata
-define it. Scope the check to the layers that actually offload. For
+Read the attribute with `getattr`: only the DSA, DeepSeek-V4 and MiniMax-M3
+MSA metadata define it. Scope the check to the layers that actually offload. For
 DeepSeek-V4, that is compress ratio 4 only; its other layers keep their
 compress pool. A library that reads offloaded layers must also mask -1 holes
 inside the live prefix, which offload produces, and over-read by no more than

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import os
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any, Optional, Tuple
 from unittest.mock import Mock, create_autospec
 
@@ -59,6 +59,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_backend import
     MiniMaxM3MsaSparseAttentionMetadata,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.msa_indexer import _group_max_reduce
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from tensorrt_llm._torch.compilation.remove_copy_pass import remove_copy_for_mutates_args
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.minimaxm3_weight_mapper import (
@@ -74,6 +75,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
     MiniMaxM3Model,
     MiniMaxM3MoE,
     MiniMaxM3QKVIndexerLinear,
+    MiniMaxM3VLForConditionalGeneration,
     _build_swiglu_oai_dense_mlp,
     _dispatch_attention_over_live_tokens,
     _load_index_qk_proj_weights,
@@ -96,6 +98,7 @@ from tensorrt_llm._torch.models.modeling_utils import (
     apply_layerwise_quant_config,
     apply_quant_config_exclude_modules,
     fused_checkpoint_names,
+    get_registered_model_class,
 )
 from tensorrt_llm._torch.modules.linear import _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -118,6 +121,129 @@ _NUM_HIDDEN_LAYERS = 7
 _SPARSE_FREQ = [0, 0, 0, 1, 1, 1, 1]
 _DISABLE_INDEX_VALUE = [0, 0, 0, 1, 1, 1, 1]
 _MOE_LAYER_FREQ = [0, 0, 0, 1, 1, 1, 1]
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@torch.inference_mode()
+def test_registered_conditional_generation_text_forward():
+    architecture = "MiniMaxM3SparseForConditionalGeneration"
+    model_class = get_registered_model_class(architecture)
+    assert model_class is MiniMaxM3VLForConditionalGeneration
+
+    # The wrapper explicitly supports text-only checkpoints without a vision config.
+    config = SimpleNamespace(
+        model_type="minimax_m3",
+        architectures=[architecture],
+        hidden_size=512,
+        intermediate_size=256,
+        dense_intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,
+        vocab_size=64,
+        pad_token_id=None,
+        image_token_index=62,
+        video_token_index=63,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        use_gemma_norm=False,
+        attention_output_gate=False,
+        rope_theta=5000000,
+        rotary_dim=64,
+        partial_rotary_factor=0.5,
+        hidden_act="swigluoai",
+        use_qk_norm=True,
+        qk_norm_type="per_head",
+        tie_word_embeddings=False,
+        shared_intermediate_size=3072,
+        num_local_experts=128,
+        num_experts_per_tok=4,
+        n_shared_experts=1,
+        scoring_func="sigmoid",
+        use_routing_bias=True,
+        moe_layer_freq=[0],
+        num_mtp_modules=0,
+        swiglu_alpha=1.702,
+        swiglu_limit=7.0,
+        routed_scaling_factor=2.0,
+        sparse_attention_config={
+            "use_sparse_attention": True,
+            "sparse_index_dim": 128,
+            "sparse_num_index_heads": 4,
+            "sparse_topk_blocks": 16,
+            "sparse_block_size": 128,
+            "sparse_init_block": 0,
+            "sparse_local_block": 1,
+            "sparse_score_type": "max",
+            "sparse_disable_index_value": [0],
+            "sparse_attention_freq": [0],
+        },
+        torch_dtype=torch.bfloat16,
+    )
+    model_config = ModelConfig(
+        pretrained_config=config,
+        sparse_attention_config=MiniMaxM3SparseAttentionConfig(implementation="triton"),
+        max_num_tokens=3,
+        max_seq_len=3,
+    )
+    model = model_class(model_config).cuda().eval()
+    assert isinstance(model, MiniMaxM3VLForConditionalGeneration)
+    assert model.vision_tower is None
+    assert len(model.model.layers) == 1
+    assert isinstance(model.model.layers[0], MiniMaxM3DecoderLayer)
+    assert type(model.model.layers[0].self_attn.attn) is TrtllmAttention
+    torch.testing.assert_close(
+        model.mm_token_ids,
+        torch.tensor([62, 63], dtype=torch.int32, device="cuda"),
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(153)
+    for parameter in model.parameters():
+        if parameter.ndim == 1:
+            parameter.fill_(1)
+        else:
+            parameter.normal_(mean=0, std=0.02, generator=generator)
+
+    metadata = TrtllmAttentionMetadata(
+        max_num_requests=1,
+        max_num_tokens=3,
+        mapping=model_config.mapping,
+        num_contexts=1,
+        seq_lens=torch.tensor([3], dtype=torch.int32),
+        request_ids=[0],
+    )
+    metadata.max_seq_len = 3
+    metadata.prepare()
+    assert metadata.kv_cache_manager is None
+    assert not metadata.kv_cache_params.use_cache
+
+    input_ids = torch.tensor([1, 2, 3], dtype=torch.long, device="cuda")
+    embeddings = model.model.embed_tokens(input_ids)
+    logits = model(attn_metadata=metadata, input_ids=input_ids, return_context_logits=True)
+    embedded_logits = model(
+        attn_metadata=metadata,
+        input_ids=None,
+        inputs_embeds=embeddings.clone(),
+        return_context_logits=True,
+    )
+    assert logits.shape == (3, config.vocab_size)
+    assert logits.dtype == torch.float32
+    assert logits.is_cuda
+    assert torch.isfinite(logits).all()
+    torch.testing.assert_close(logits, embedded_logits, atol=1e-2, rtol=1e-2)
+
+    bypassed_logits = model.lm_head(model.model.norm(embeddings)).float()
+    assert not torch.allclose(logits, bypassed_logits, atol=1e-2, rtol=1e-2)
+
+    changed_ids = input_ids.clone()
+    changed_ids[0] = 4
+    changed_logits = model(
+        attn_metadata=metadata, input_ids=changed_ids, return_context_logits=True
+    )
+    assert torch.isfinite(changed_logits).all()
+    assert not torch.allclose(logits[-1], changed_logits[-1], atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.cpu_only
@@ -571,10 +697,19 @@ def test_eagle_capture_precedes_next_layer_norm() -> None:
 
 
 @pytest.mark.cpu_only
-def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> None:
+@pytest.mark.parametrize("case", ["horizontal", "offload_fallback", "resident_declined"])
+def test_piecewise_attention_boundary_runs_horizontal_producer(
+    monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    """The packed boundary runs the producer; only an offloaded layer may fall back without it."""
+    horizontal_available = case == "horizontal"
+
     class FakeAttentionLayer:
         def __init__(self) -> None:
             self.producer_shapes = None
+            self.layer_idx = 3
+            self.q_size, self.kv_size = 3, 1
+            self.index_q_size = self.index_k_size = 1
 
         def _fused_fp8_qkv_indexer_norm_rope_kv_insert(self, packed, position_ids, attn_metadata):
             self.producer_shapes = (
@@ -582,38 +717,57 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> N
                 tuple(position_ids.shape),
                 attn_metadata.num_tokens,
             )
-            return packed[:, :3].clone(), packed[:, :1].clone()
+            return (packed[:, :3].clone(), packed[:, :1].clone()) if horizontal_available else None
+
+        def _sparse_projection_norm_rope(self, positions, hidden, metadata, main, index):
+            assert hidden is None
+            assert positions.shape == (1, metadata.num_tokens)
+            return (*main.split([3, 1, 1], dim=-1), *index.split([1, 1], dim=-1))
 
         def _dispatch_attention_backend(self, q, k, v, idx_q, idx_k, attn_metadata, output) -> None:
-            assert k is None and v is None and idx_k is None
+            if horizontal_available:
+                assert k is None and v is None and idx_k is None
+            else:
+                assert k.shape == v.shape == idx_k.shape == (attn_metadata.num_tokens, 1)
             assert idx_q.shape == (attn_metadata.num_tokens, 1)
             output.copy_(q)
 
     metadata = AttentionMetadata(max_num_requests=1, max_num_tokens=4)
     metadata._num_tokens = 2
+    if case == "offload_fallback":
+        # An offloaded layer the producer declines, such as one with an NVFP4 cache.
+        metadata.sparse_offload_state = object()
+        metadata.kv_cache_manager = SimpleNamespace(offloads_layer=lambda layer_idx: layer_idx == 3)
     layer = FakeAttentionLayer()
     monkeypatch.setattr(
         modeling_minimaxm3,
         "_extract_minimax_m3_attention_extra_attrs",
         lambda layer_idx: (metadata, layer),
     )
-    packed = torch.arange(20, dtype=torch.float32).reshape(4, 5)
+    packed = torch.arange(28, dtype=torch.float32).reshape(4, 7)
     position_ids = torch.arange(4, dtype=torch.int32).reshape(1, 4)
     output = torch.full((4, 3), -1.0)
 
-    modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
-        None,
-        None,
-        None,
-        None,
-        None,
-        packed,
-        position_ids,
-        "3",
-        output,
-    )
+    def run() -> None:
+        modeling_minimaxm3.minimax_m3_attn_custom_op_inplace(
+            None,
+            None,
+            None,
+            None,
+            None,
+            packed,
+            position_ids,
+            "3",
+            output,
+        )
 
-    assert layer.producer_shapes == ((2, 5), (1, 2), 2)
+    if case == "resident_declined":
+        with pytest.raises(RuntimeError, match="fused horizontal producer is required"):
+            run()
+        return
+    run()
+
+    assert layer.producer_shapes == ((2, 7), (1, 2), 2)
     torch.testing.assert_close(output[:2], packed[:2, :3])
     # The dispatch clips to the live tokens and leaves the pad rows as they came.
     torch.testing.assert_close(output[2:], torch.full((2, 3), -1.0))
@@ -744,6 +898,7 @@ def test_piecewise_captures_horizontal_producer_before_attention(
         kv_cache_manager=None,
         msa_layer_cache_tensors={3: (kv_cache, index_cache, scale_cache)},
         msa_out_cache_loc=slots,
+        sparse_offload_state=None,
     )
     layer = SimpleNamespace(
         enable_fused_qkv_index_projection=True,
@@ -958,6 +1113,9 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
         aux_stream=None,
         _forward_attention_core=Mock(return_value=torch.empty((4, 128), dtype=torch.bfloat16)),
         o_proj=lambda output, all_reduce_params: output,
+    )
+    layer._sparse_projection_norm_rope = MethodType(
+        MiniMaxM3Attention._sparse_projection_norm_rope, layer
     )
     monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(
@@ -2224,6 +2382,7 @@ def test_horizontal_producer_explicit_caches_match_manager(
         spec_set=MiniMaxM3MsaSparseAttentionMetadata,
         kv_cache_manager=manager,
         msa_out_cache_loc=slots,
+        sparse_offload_state=None,
     )
     metadata.msa_idx_k_cache.return_value = index
 
@@ -2267,6 +2426,186 @@ def test_horizontal_producer_explicit_caches_match_manager(
     eager = snapshot(op(*args))
     for actual, reference in zip(replay, eager):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    offload_slots = torch.empty_like(slots)
+    offload_state = object()
+    offload_metadata = SimpleNamespace(
+        kv_cache_manager=manager,
+        msa_out_cache_loc=slots,
+        msa_sparse_write_slots=offload_slots,
+        msa_idx_k_cache=lambda _: index,
+        sparse_offload_state=offload_state,
+    )
+    manager.offloads_layer.return_value = True
+    if nvfp4:
+        assert (
+            layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(packed, positions, offload_metadata)
+            is None
+        )
+        manager.prepare_sparse_write_indices.assert_not_called()
+        return
+
+    arena = torch.zeros((2, 3, 2, 128, 128), dtype=torch.float8_e4m3fn, device="cuda")
+    arena_view = arena.permute(1, 0, 2, 3, 4)
+    expected_arena = torch.zeros_like(arena)
+    expected_arena[:, 2, :, 1].copy_(main[0, :, :, 0])
+    expected_arena[:, 0, :, 5].copy_(main[1, :, :, 1])
+    expected_index = index.view(torch.uint8).clone()
+    index.zero_()
+    manager.get_sparse_arena_buffers.return_value = arena_view
+    prepared_slots = torch.tensor([257, 5, -1, -1], dtype=torch.int32, device="cuda")
+
+    def prepare_slots(state, layer_idx, output):
+        assert state is offload_state and layer_idx == 3
+        output.copy_(prepared_slots)
+
+    monkeypatch.setattr(modeling_minimaxm3, "prepare_write_slots", prepare_slots)
+    resolutions = _count_plan_resolutions(monkeypatch, layer)
+    offload_outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        packed, positions, offload_metadata
+    )
+    assert offload_outputs is not None
+    manager.prepare_sparse_write_indices.assert_called_once_with(offload_state, 3)
+    for actual, reference in zip(offload_outputs, eager[:2]):
+        torch.testing.assert_close(actual.view(torch.uint8), reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        arena.view(torch.uint8), expected_arena.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(index.view(torch.uint8), expected_index, rtol=0, atol=0)
+    assert resolutions[0] == 1
+
+    # Resident validation must not reuse the plan that accepts the offload arena.
+    assert layer._fused_producer_plan(arena_view, index, None, slots) is None
+    assert resolutions[0] == 2
+
+    # A plan hit still reserves and converts this step's main-KV write slots.
+    arena.zero_()
+    index.zero_()
+    prepared_slots.copy_(torch.tensor([6, 258, -1, -1], dtype=torch.int32, device="cuda"))
+    expected_arena.zero_()
+    expected_arena[:, 0, :, 6].copy_(main[0, :, :, 0])
+    expected_arena[:, 2, :, 2].copy_(main[1, :, :, 1])
+    repeated_outputs = layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(
+        packed, positions, offload_metadata
+    )
+    assert repeated_outputs is not None
+    assert resolutions[0] == 2
+    assert manager.prepare_sparse_write_indices.call_count == 2
+    for actual, reference in zip(repeated_outputs, eager[:2]):
+        torch.testing.assert_close(actual.view(torch.uint8), reference, rtol=0, atol=0)
+    torch.testing.assert_close(
+        arena.view(torch.uint8), expected_arena.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(index.view(torch.uint8), expected_index, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 offload producer needs CUDA")
+@torch.inference_mode()
+def test_piecewise_offload_packed_projection_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Compile the packed attention boundary with real norm/RoPE and index-cache writes.
+
+    An offloaded NVFP4 cache has no fused producer, so its packed projection takes this
+    fallback even with a cache manager present.
+    """
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("MiniMax-M3 MSA requires SM100 or SM103")
+    layer, _, index, _ = _make_horizontal_producer_layer("nvfp4")
+    packed = torch.randn((4, 11 * 128), dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(4, dtype=torch.int32, device="cuda")
+    manager = create_autospec(MiniMaxM3KVCacheManagerV2, instance=True, spec_set=True)
+    manager.offloads_layer.return_value = True
+    metadata = SimpleNamespace(
+        num_tokens=2,
+        kv_cache_manager=manager,
+        sparse_offload_state=object(),
+        msa_idx_k_cache=lambda _: index,
+        msa_out_cache_loc=torch.tensor([0, 129, -1, -1], dtype=torch.int32, device="cuda"),
+    )
+    assert layer._fused_fp8_qkv_indexer_norm_rope_kv_insert(packed, positions, metadata) is None
+    # The offload guard declined before the producer looked up any cache view or slot.
+    for producer_call in (
+        manager.get_buffers,
+        manager.get_sparse_arena_buffers,
+        manager.prepare_sparse_write_indices,
+    ):
+        producer_call.assert_not_called()
+    main, idx = packed[:2].split([8 * 128, 3 * 128], dim=-1)
+    expected = layer._sparse_projection_norm_rope(positions[:2], None, metadata, main, idx)[0]
+    expected_index = index.view(torch.uint8).clone()
+    index.zero_()
+
+    def attention(q, k, v, idx_q, idx_k, meta, output):
+        assert k is not None and v is not None and idx_q is not None
+        output.copy_(q)
+
+    monkeypatch.setattr(layer, "_dispatch_attention_backend", attention)
+    monkeypatch.setattr(
+        modeling_minimaxm3, "_extract_minimax_m3_attention_extra_attrs", lambda _: (metadata, layer)
+    )
+
+    @torch.compile(fullgraph=True)
+    def run(projection, positions):
+        output = projection.new_full((4, 4 * 128), -1)
+        torch.ops.trtllm.minimax_m3_attn_custom_op_inplace(
+            None, None, None, None, None, projection, positions, "3", output
+        )
+        return output
+
+    actual = run(packed, positions)
+    torch.testing.assert_close(actual[:2], expected.to(actual.dtype), rtol=0, atol=0)
+    assert (actual[2:] == -1).all()
+    torch.testing.assert_close(index.view(torch.uint8), expected_index, rtol=0, atol=0)
+
+
+class _PassThroughProjection(nn.Module):
+    """o_proj stand-in that returns the attention output unchanged."""
+
+    def forward(self, x: torch.Tensor, all_reduce_params: object = None) -> torch.Tensor:
+        return x
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 producer layer needs CUDA")
+@torch.inference_mode()
+def test_compiled_offload_keeps_the_captured_producer_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """While compiling, an offloaded layer routes its packed projection to the eager boundary.
+
+    The captured producer writes the paged cache views staged before compilation. An
+    offloaded layer writes its new tokens into sparse cache arena cells reserved each step.
+    """
+    layer, _, _, _ = _make_horizontal_producer_layer("fp8")
+    layer.register_to_config = True
+    layer.o_proj = _PassThroughProjection()
+    hidden = torch.randn((2, 11 * 128), dtype=torch.bfloat16, device="cuda")
+    positions = torch.arange(2, dtype=torch.int32, device="cuda")
+    # No staged cache views: the captured producer would read them.
+    metadata = SimpleNamespace(sparse_offload_state=object())
+    boundary_calls = []
+
+    def captured_producer(*args: object) -> None:
+        raise AssertionError("the captured producer must not write an offloaded layer")
+
+    def attention_boundary(*args: object) -> None:
+        boundary_calls.append(args)
+        args[-1].zero_()
+
+    monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
+    monkeypatch.setattr(torch.ops.trtllm, "minimax_m3_fused_sparse_qkv_producer", captured_producer)
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "minimax_m3_qkv_index_proj",
+        lambda hidden_states, position_ids, layer_idx: layer.qkv_proj(hidden_states),
+    )
+    monkeypatch.setattr(
+        modeling_minimaxm3, "maybe_bcg_minimax_m3_attn_custom_op_inplace", attention_boundary
+    )
+    output = layer._sparse_forward(positions, hidden, metadata)
+    assert len(boundary_calls) == 1
+    packed, position_ids, layer_idx = boundary_calls[0][5:8]
+    assert packed is not None and position_ids is positions and layer_idx == layer.layer_idx_str
+    torch.testing.assert_close(packed, hidden, rtol=0, atol=0)
+    assert output.shape == (2, layer.num_heads * layer.head_dim)
 
 
 class _ReachedProducerLaunch(Exception):

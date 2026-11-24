@@ -1719,7 +1719,18 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "What this pool's pages actually are. The same as the group's tier except for a sparse "
             "pool of the GPU tier, which is host-backed while the group still reports GPU_MEM. Ask "
             "per pool, not per group, when the medium of an address matters -- registering it for "
-            "transfer, or picking a copy implementation.");
+            "transfer, or picking a copy implementation.")
+        .def_prop_ro("mapped_ranges",
+            [](kv::PoolDesc const& self)
+            {
+                std::vector<std::pair<size_t, size_t>> ranges;
+                ranges.reserve(self.mappedRanges.size());
+                for (auto const& range : self.mappedRanges)
+                {
+                    ranges.emplace_back(range.beg, range.end);
+                }
+                return ranges;
+            });
 
     nb::class_<kv::PoolGroupDesc>(m, "PoolGroupDesc")
         .def_prop_ro("pool_group_index", [](kv::PoolGroupDesc const& self) { return self.poolGroupIndex.value(); })
@@ -1750,8 +1761,14 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "__deepcopy__", [](cls const& self, nb::dict) { return cls(self); }, nb::arg("memo"))
 
     nb::class_<kv::GpuCacheTierConfig>(m, "GpuCacheTierConfig")
-        .def(nb::init<size_t>(), nb::arg("quota"))
+        .def(
+            "__init__",
+            [](kv::GpuCacheTierConfig* self, size_t quota, bool enableLocalityDomains) {
+                new (self) kv::GpuCacheTierConfig{quota, enableLocalityDomains};
+            },
+            nb::arg("quota"), nb::arg("enable_locality_domains") = false)
         .def_rw("quota", &kv::GpuCacheTierConfig::quota)
+        .def_rw("enable_locality_domains", &kv::GpuCacheTierConfig::enableLocalityDomains)
         .def_prop_ro("tier", &kv::GpuCacheTierConfig::tier)
         .def("validate", &kv::GpuCacheTierConfig::validate) DEF_COPY(kv::GpuCacheTierConfig);
 
@@ -1810,11 +1827,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::RemoteCacheTierConfig::validate) DEF_COPY(kv::RemoteCacheTierConfig);
 
     nb::class_<kv::SparseCacheConfig>(m, "SparseCacheConfig")
-        .def(nb::init<int, int, int, std::optional<int>>(), nb::arg("num_selected_blocks"), nb::arg("max_cached_units"),
-            nb::arg("unit_tokens"), nb::arg("selection_id").none() = nb::none())
+        .def(nb::init<int, int, int, std::optional<int>, bool>(), nb::arg("num_selected_blocks"),
+            nb::arg("max_cached_units"), nb::arg("unit_tokens"), nb::arg("selection_id").none() = nb::none(),
+            nb::arg("include_partial_units") = false)
         .def_rw("num_selected_blocks", &kv::SparseCacheConfig::numSelectedBlocks)
         .def_rw("max_cached_units", &kv::SparseCacheConfig::maxCachedUnits)
         .def_rw("unit_tokens", &kv::SparseCacheConfig::unitTokens)
+        .def_rw("include_partial_units", &kv::SparseCacheConfig::includePartialUnits)
         .def_prop_ro(
             "max_unit_ordinal", [](kv::SparseCacheConfig const&) { return kv::SparseCacheConfig::kMaxUnitOrdinal; },
             "Largest zero-based unit ordinal supported by the sparse probe index.")
@@ -1830,16 +1849,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         "Asks the device, so a CUDA context must be current.");
 
     nb::class_<kv::BufferConfig>(m, "BufferConfig")
-        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>>(),
+        .def(nb::init<kv::DataRole, size_t, std::optional<int>, bool, int, int, std::optional<kv::ReusePolicy>, int>(),
             nb::arg("role"), nb::arg("size"), nb::arg("tokens_per_block_override") = std::nullopt,
             nb::arg("is_sparse") = false, nb::arg("coalescing_group") = 0, nb::arg("sparse_unit_chunks") = 1,
-            nb::arg("reuse_policy") = std::nullopt)
+            nb::arg("reuse_policy") = std::nullopt, nb::arg("sparse_write_back_granularity") = 0)
         .def_rw("role", &kv::BufferConfig::role)
         .def_rw("size", &kv::BufferConfig::size)
         .def_rw("tokens_per_block_override", &kv::BufferConfig::tokensPerBlockOverride)
         .def_rw("is_sparse", &kv::BufferConfig::isSparse)
         .def_rw("coalescing_group", &kv::BufferConfig::coalescingGroup)
         .def_rw("sparse_unit_chunks", &kv::BufferConfig::sparseUnitChunks)
+        .def_rw("sparse_write_back_granularity", &kv::BufferConfig::sparseWriteBackGranularity)
         .def_rw("reuse_policy", &kv::BufferConfig::reusePolicy) DEF_COPY(kv::BufferConfig);
 
     nb::class_<kv::AttentionLayerConfig>(m, "AttentionLayerConfig")
@@ -2350,6 +2370,12 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                 return nb::bytes(reinterpret_cast<char const*>(key->data()), key->size());
             })
         .def_prop_ro("reuse_scope", &kv::KvCache::reuseScope)
+        .def_prop_ro("locality_domain_id",
+            [](kv::KvCache const& self)
+            {
+                auto const localityDomainId = self.localityDomainId();
+                return localityDomainId ? std::optional<int>{localityDomainId->value()} : std::nullopt;
+            })
         .def(
             "plan_committed_block_drop", [](kv::KvCache& self) { return self.planCommittedBlockDrop(); },
             nb::call_guard<nb::gil_scoped_release>())
@@ -2937,6 +2963,25 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"));
     mIntrospection.def(
+        "locality_domain_free_slots",
+        [](kv::KvCacheManager& manager)
+        {
+            auto const& storage = manager.storage();
+            std::vector<kv::SlotCount> freeSlots;
+            for (kv::LocalityDomainId localityDomainId{0}; localityDomainId < storage.numLocalityDomains();
+                 ++localityDomainId)
+            {
+                kv::SlotCount free = 0;
+                for (kv::PoolGroupIndex pgIdx{0}; pgIdx < storage.numPoolGroups(kv::kHotLevel); ++pgIdx)
+                {
+                    free += storage.getStatistics(kv::kHotLevel, pgIdx, localityDomainId).free;
+                }
+                freeSlots.push_back(free);
+            }
+            return freeSlots;
+        },
+        nb::arg("manager"), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity,
             std::optional<std::vector<int32_t>> const& pools)
@@ -3297,7 +3342,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             "Give every in-flight unit of each request a cell, and report where to write it.\n\n"
             "The units between the two watermarks are the ones the model is producing. They have no "
             "host copy yet -- a unit reaches its page only when resize() carries the watermark past "
-            "it -- so nothing is fetched: the call assigns cells and leaves their bytes to the model.\n\n"
+            "it -- so the call assigns cells and leaves their bytes to the model. With "
+            "include_partial_units, a newly reserved cell for the growing unit restores its host "
+            "prefix before the write index is exposed; resident cells remain intact.\n\n"
             "Separate from fetch_sparse_pages because the orders differ. A fetch needs the selection, "
             "which the indexer produces from the previous layer; a write needs only the watermarks, so "
             "it can run first, which is the order the model requires.\n\n"
@@ -3680,15 +3727,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens,
                 std::optional<kv::RequestIdType> id, nb::object customPriorityCallback,
                 std::optional<int> expectedPromptLength, std::optional<bool> textOnly, bool enableRequestStats,
-                std::optional<executor::KvCacheRetentionConfig> retentionConfig)
+                std::optional<executor::KvCacheRetentionConfig> retentionConfig, std::optional<int> localityDomainId)
             {
                 kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
                 kv::KvCache::PriorityCb priorityCb = castPriorityCallback(*self, std::move(customPriorityCallback));
+                std::optional<kv::LocalityDomainId> const domain(localityDomainId);
                 if (inputTokens.is_none())
                 {
                     nb::gil_scoped_release release;
                     return self->createKvCache(std::move(reuseScope), kv::TokenSpan{}, id, std::move(priorityCb),
-                        expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig));
+                        expectedPromptLength, textOnly, enableRequestStats, std::move(retentionConfig),
+                        /*inputKnownNoDigest=*/false, domain);
                 }
                 return withTokens(inputTokens,
                     [&](kv::TokenSpan view, bool knownNoDigest)
@@ -3705,13 +3754,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                         }
                         nb::gil_scoped_release release;
                         return self->createKvCache(std::move(reuseScope), view, id, std::move(priorityCb), promptLen,
-                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest);
+                            textOnly, enableRequestStats, std::move(retentionConfig), knownNoDigest, domain);
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none(), nb::arg("id") = std::nullopt,
             nb::arg("custom_priority_callback") = nb::none(), nb::arg("expected_prompt_length") = std::nullopt,
             nb::arg("text_only") = std::nullopt, nb::arg("enable_request_stats") = false,
-            nb::arg("kv_cache_retention_config") = std::nullopt)
+            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("locality_domain_id").none() = std::nullopt)
         .def(
             "probe_reuse",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
@@ -3730,6 +3779,20 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
                     });
             },
             nb::arg("reuse_scope") = nb::none(), nb::arg("input_tokens") = nb::none())
+        .def(
+            "probe_reuse_domains",
+            [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens)
+            {
+                kv::ReuseScope reuseScope = castReuseScope(std::move(reuseScopeObj));
+                return withTokens(inputTokens,
+                    [&](kv::TokenSpan view, bool knownNoDigest)
+                    {
+                        nb::gil_scoped_release release;
+                        return self->probeReuseDomains(std::move(reuseScope), view, knownNoDigest);
+                    });
+            },
+            nb::arg("reuse_scope"), nb::arg("input_tokens"),
+            "GPU-resident pages of the reuse match for input_tokens, counted per locality domain.")
         .def(
             "probe_first_new_block_key",
             [](std::shared_ptr<kv::KvCacheManager> self, nb::object reuseScopeObj, nb::object inputTokens) -> nb::object
@@ -3928,6 +3991,9 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("is_stats_excluded", &kv::KvCacheManager::isStatsExcluded, nb::arg("kv_cache_id").none(),
             nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("tokens_per_block", &kv::KvCacheManager::tokensPerBlock)
+        .def_prop_ro("num_locality_domains", &kv::KvCacheManager::numLocalityDomains)
+        .def("get_mapped_buffer_views", &kv::KvCacheManager::getMappedBufferViews, nb::arg("layer_id"), nb::arg("role"),
+            nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("event_manager",
             [](kv::KvCacheManager const& self)
             { return std::dynamic_pointer_cast<kv::EventManager>(self.eventSink()); })

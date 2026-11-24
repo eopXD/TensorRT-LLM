@@ -75,6 +75,35 @@ SPARSE_OFFLOAD_DEBUG_ASSERT = os.environ.get("TLLM_SPARSE_OFFLOAD_DEBUG_ASSERT",
 NVFP4_SCRATCH_TAIL_ROWS = 128
 
 
+def validate_sparse_offload_batch(
+    num_contexts: int,
+    seq_lens: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
+    *,
+    queries_per_request: int = 1,
+) -> None:
+    """Reject unsupported rows on the host before any model or cache writes.
+
+    Each request feeds one to ``queries_per_request`` query tokens: its sampled token
+    and, with speculative decoding, its drafts.
+    """
+    if num_contexts:
+        raise NotImplementedError(
+            "Sparse KV cache offload runs decode batches only; context requests reach "
+            "an offloading worker through disaggregated KV transfer"
+        )
+    if seq_lens.device.type != "cpu" or seq_lens_kv.device.type != "cpu":
+        raise ValueError("Sparse offload batch validation requires host sequence lengths")
+    if not torch.equal(seq_lens, seq_lens_kv) or not torch.all(
+        (seq_lens >= 1) & (seq_lens <= queries_per_request)
+    ):
+        if queries_per_request == 1:
+            raise NotImplementedError("Sparse offload decode requires one query per request")
+        raise NotImplementedError(
+            f"Sparse offload decode requires one to {queries_per_request} query tokens per request"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class SparseOffloadPaddingRegion:
     """Unused buffer bytes across arena leases, initialized during manager construction."""
@@ -292,7 +321,7 @@ def allocate_sparse_offload_state(
 
 
 def get_sparse_offload_metadata_layers(
-    metadata, *, allow_speculation: bool = False
+    metadata, *, allow_speculation: bool = False, topk: int | None = None
 ) -> dict[int, SparseOffloadLayerDescriptor]:
     """Validate an attention metadata's fixed offload configuration and return its layers.
 
@@ -306,9 +335,11 @@ def get_sparse_offload_metadata_layers(
     batch. An empty result means this pipeline stage has no offloaded layer.
     """
     manager = metadata.kv_cache_manager
-    speculative = bool(
-        metadata.max_draft_tokens or manager.max_draft_len or manager.max_total_draft_tokens
+    # Either count may be unset (None) on a metadata built without speculative decoding.
+    draft_tokens = max(
+        getattr(metadata, "max_draft_tokens", 0) or 0, metadata.max_total_draft_tokens or 0
     )
+    speculative = bool(draft_tokens or manager.max_draft_len or manager.max_total_draft_tokens)
     if (
         metadata.beam_width != 1
         or manager.max_beam_width != 1
@@ -318,16 +349,16 @@ def get_sparse_offload_metadata_layers(
         raise NotImplementedError("Sparse offload requires single-beam, non-speculative execution")
     if speculative:
         queries = manager.impl.init_config.sparse_queries_per_request
-        if max(metadata.max_draft_tokens, manager.max_total_draft_tokens) + 1 > queries:
+        if max(draft_tokens, manager.max_total_draft_tokens) + 1 > queries:
             raise NotImplementedError(
                 f"Sparse offload was sized for {queries} query tokens per request, fewer "
                 "than the sampled token and drafts this speculative decoding feeds a step"
             )
     manager._validate_sparse_history_policy()
     layers = manager.get_sparse_offload_descriptors()
-    if layers and (
-        metadata.sparse_mla_topk <= 0 or metadata.sparse_mla_topk != manager._sparse_offload_topk
-    ):
+    if topk is None:
+        topk = metadata.sparse_mla_topk
+    if layers and (topk <= 0 or topk != manager._sparse_offload_topk):
         raise ValueError("Sparse offload metadata must match the configured positive top-k")
     return layers
 
@@ -1372,7 +1403,8 @@ class SparseOffloadCacheMixin:
         before this call. Reservation must finish before either the writer or
         the history fetch; they may run concurrently because fetch excludes the
         protected in-flight rows. Both must finish before attention or a history
-        update. No KV is fetched here.
+        update. Layers with ``include_partial_units`` restore a growing block's
+        host prefix here when the block is not already resident.
 
         Data and scale buffers use the same column when their arena indices coincide;
         the output-slot mapping follows the arena geometry and requires no device read.

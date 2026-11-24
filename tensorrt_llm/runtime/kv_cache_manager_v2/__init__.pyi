@@ -269,6 +269,7 @@ class CacheTierConfig(Protocol):
 @dataclass(slots=True)
 class GpuCacheTierConfig:
     quota: int
+    enable_locality_domains: bool = False
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...
@@ -388,6 +389,14 @@ class BufferConfig:
     """
     reuse_policy: ReusePolicy | None = None
 
+    sparse_write_back_granularity: int = 0
+    """Contiguous token group copied by partial sparse writeback, or zero for whole units.
+
+    A positive value declares that each chunk stores groups of this many tokens
+    consecutively. Dirty token ranges round outward to group boundaries. Use one
+    for token-major chunks and the swizzle group size for grouped scale buffers.
+    """
+
 @dataclass(slots=True)
 class SparseCacheConfig:
     """One layer's sparse fetch path.
@@ -452,6 +461,16 @@ class SparseCacheConfig:
     layer that names nothing never shares, and an explicit id that names such a layer is
     rejected. Layers that do share must agree on ``num_selected_blocks``,
     ``max_cached_units`` and ``unit_tokens``.
+    """
+
+    include_partial_units: bool = False
+    """Cache a growing block before its last token is written.
+
+    On reservation, the block's host prefix is restored into its cell; each flush writes
+    back only the tokens appended since the previous one, in the buffer's
+    ``sparse_write_back_granularity`` groups. False for compressed units that are produced
+    only when complete. Partial units
+    require an independent selection per layer (``selection_id=None``).
     """
 
 class ReusePolicy(enum.IntEnum):
@@ -939,6 +958,8 @@ class _KVCache:
     def committed_tokens(self) -> list[TokenIdExt]: ...
     @property
     def reuse_scope(self) -> ReuseScope: ...
+    @property
+    def locality_domain_id(self) -> int | None: ...
     def plan_committed_block_drop(self) -> PlannedDropHandle | None: ...
     def stop_committing(self) -> None: ...
     def suspend(self) -> None:
@@ -1002,6 +1023,7 @@ class PoolDesc:
     pool_index: PoolIndex
     base_address: MemAddress
     slot_bytes: int
+    mapped_ranges: list[tuple[int, int]]
 
     storage_medium: CacheTier
     """What this pool's pages actually are.
@@ -1528,10 +1550,13 @@ class Batch:
         """Give every in-flight unit of each request a cell, and report where to write it.
 
         The units between the two watermarks are the ones the model is producing. They
-        have no host copy yet -- a unit reaches its page only when :meth:`_KVCache.resize`
-        carries the watermark past it -- so nothing is fetched here. The call assigns
-        cells and leaves their bytes to the model; reading one before the model writes it
-        yields whatever the cell last held.
+        have no complete host copy yet -- a unit reaches its page only when
+        :meth:`_KVCache.resize` carries the watermark past it -- so by default the call
+        assigns cells and leaves their bytes to the model; reading one before the model
+        writes it yields whatever the cell last held. With
+        ``SparseCacheConfig.include_partial_units=True``, a newly reserved partial block
+        restores its host prefix before the write index is returned. A block already
+        resident keeps its live writes.
 
         Separate from :meth:`fetch_sparse_pages` because the orders differ. A fetch needs
         the selection, which the indexer produces from the previous layer's output; a write
@@ -1543,9 +1568,8 @@ class Batch:
         finds a unit's entry and reuses it rather than assigning a second. An entry is
         pinned from the call that assigns it until history passes its unit, whether or not
         capacity still covers the unit in between. So no fetch can evict it, a unit that
-        capacity drops and later covers again is reported at the same cell, and a fetch
-        never copies over it: a unit at or above the watermark has no written-back host
-        page, so there is nothing it could be refilled from.
+        capacity drops and later covers again is reported at the same cell, and later
+        fetches see it as a hit and never copy over the model's writes.
 
         The Batch's published rows own the arena leases; each seated cache uses its row's
         lease until it leaves the Batch.
@@ -1565,9 +1589,10 @@ class Batch:
                 :attr:`_KVCache.max_input_length` tokens of each other.
 
                 ``BAD_PAGE_INDEX`` is an ordinary outcome, not an error. A unit is in flight
-                only once it is whole: with ``SparseCacheConfig.unit_tokens`` of 4, that is one
+                only once it is whole by default: with ``SparseCacheConfig.unit_tokens`` of 4, that is one
                 step in four, which is also the only step on which a ratio-4 compressor has
-                produced anything to write. With one token per unit it is every step.
+                produced anything to write. With one token per unit or with
+                ``include_partial_units=True`` it is every step.
             stream: the CUDA stream to enqueue on.
 
         Indices are in the same expanded index space :meth:`fetch_sparse_pages` produces
@@ -1994,6 +2019,7 @@ class KVCacheManager:
         text_only: bool | None = None,
         enable_request_stats: bool = False,
         kv_cache_retention_config: KvCacheRetentionConfig | None = None,
+        locality_domain_id: int | None = None,
     ) -> _KVCache:
         """Create a suspended cache with a prefill-to-generation boundary.
 
@@ -2015,6 +2041,10 @@ class KVCacheManager:
         reuse_scope: ReuseScope | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
     ) -> int: ...
+    def probe_reuse_domains(
+        self, reuse_scope: ReuseScope, input_tokens: Sequence[TokenIdExt]
+    ) -> list[int]:
+        """GPU-resident pages of the reuse match for input_tokens, counted per locality domain."""
     def probe_first_new_block_key(
         self,
         reuse_scope: ReuseScope | None = None,
@@ -2061,6 +2091,11 @@ class KVCacheManager:
         ...
     @property
     def tokens_per_block(self) -> int: ...
+    @property
+    def num_locality_domains(self) -> int: ...
+    def get_mapped_buffer_views(
+        self, layer_id: LayerId, role: DataRole
+    ) -> list[tuple[MemAddress, int]]: ...
     @property
     def event_manager(self) -> Any | None: ...
     @property

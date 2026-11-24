@@ -298,15 +298,23 @@ __device__ inline uint32_t victimKey(uint32_t staleness, int32_t slot) noexcept
 __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResolveArgs args)
 {
     int32_t const row = static_cast<int32_t>(blockIdx.x);
+    gridDependencyWait();
+    if (args.includePartialUnits && threadIdx.x == 0)
+    {
+        args.work.row[row] = row;
+        args.work.ordinal[row] = 0;
+        args.work.slot[row] = kNoSparseSlot;
+    }
     SparseLeaseIndex const lease = args.leases[row];
     if (lease == kNoSparseLease)
     {
         return;
     }
 
-    gridDependencyWait();
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
-    int32_t const inFlight = args.capacityTokens[row] / args.unitTokens - historyUnits;
+    int32_t const capacityUnits
+        = sparseUnitsReached(args.capacityTokens[row], args.unitTokens, args.includePartialUnits);
+    int32_t const inFlight = capacityUnits - historyUnits;
     KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= 1);
     // The same bound the resolve's probe index imposes, since this ordinal is resolved
     // through it on every later step.
@@ -368,6 +376,14 @@ __global__ __launch_bounds__(kThreads) void sparsePrepareWriteKernel(SparseResol
         entry[slot]
             = SparseEntry::pack(SparseEntry::usedByte(stepAge, matched != 0), static_cast<uint32_t>(historyUnits));
         args.inFlightSlot[row] = slot;
+        // A newly reserved growing unit restores the host prefix its history already reached.
+        if (matched == 0
+            && sparseUnitsReached(args.historyTokens[row], args.unitTokens, args.includePartialUnits) > historyUnits)
+        {
+            args.work.ordinal[row] = historyUnits;
+            args.work.slot[row] = slot;
+            args.missCount[row] = 1;
+        }
     }
 }
 
@@ -403,7 +419,11 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     bool const rebase = SparseEntry::rebaseDue(stepAge);
 
     int32_t const historyUnits = args.historyTokens[row] / args.unitTokens;
-    int32_t const inFlight = args.capacityTokens[row] / args.unitTokens - historyUnits;
+    int32_t const capacityUnits
+        = sparseUnitsReached(args.capacityTokens[row], args.unitTokens, args.includePartialUnits);
+    int32_t const copyableUnits
+        = sparseUnitsReached(args.historyTokens[row], args.unitTokens, args.includePartialUnits);
+    int32_t const inFlight = capacityUnits - historyUnits;
     // resize() rejects a gap wider than the cache can pin, so the check cannot fire.
     KVCM2_SPARSE_REQUIRE(inFlight >= 0 && inFlight <= args.maxInFlightUnits);
     // The probe walks one virtual list: the in-flight units, which must be resident before
@@ -421,6 +441,8 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     __shared__ int32_t numMiss;
     __shared__ int32_t numCopy;
     __shared__ int32_t numResolved;
+    // Misses of the write unit's restored prefix, which the hit/miss statistics leave out.
+    __shared__ int32_t numRestoreMisses;
     __shared__ int32_t copyBase;
     // The staleness at which the misses run out, and how many of the entries holding
     // exactly that staleness are wanted. A threshold past the histogram evicts nothing.
@@ -445,6 +467,7 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         numMiss = 0;
         numCopy = 0;
         numResolved = 0;
+        numRestoreMisses = 0;
         thresholdStaleness = kAgeBuckets;
         neededAtThreshold = 0;
         takenAtThreshold = 0;
@@ -534,6 +557,12 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         {
             int32_t const j = atomicAdd(&numMiss, 1);
             missPosition[j] = static_cast<uint16_t>(position);
+            // A selection names only complete history, so an in-flight position is the
+            // only one that can name a unit whose prefix is restored.
+            if (i < inFlight && ord < copyableUnits)
+            {
+                atomicAdd(&numRestoreMisses, 1);
+            }
         }
     }
     if (resolvedMine > 0)
@@ -543,14 +572,14 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     __syncthreads();
 
     // Claim this row's run in the compacted list now that the miss set is final, so the
-    // eviction loop below can write straight into it. Only a miss below the watermark is
-    // copied, which is the same test the loop applies, so counting it here costs one pass
-    // over a list already in shared memory and saves staging the entries anywhere.
+    // eviction loop below can write straight into it. Copyable misses include a partial
+    // host prefix when configured. Hit/miss statistics count only selected entries,
+    // excluding the write unit's restore, and are added once per row.
     {
         int32_t mine = 0;
         for (int32_t j = tid; j < numMiss; j += kResolveThreads)
         {
-            mine += table.ordinalAt(missPosition[j]) < historyUnits ? 1 : 0;
+            mine += table.ordinalAt(missPosition[j]) < copyableUnits ? 1 : 0;
         }
         int32_t scanned = 0;
         int32_t claimed = 0;
@@ -558,13 +587,18 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         if (tid == 0)
         {
             copyBase = claimed > 0 ? atomicAdd(args.work.total, claimed) : 0;
-            // The list is sized for every row missing its whole selection, so a claim can
-            // only run past it if the caller sized it from a different width.
+            // The list is sized for every row missing its whole selection and, with partial
+            // units, the growing unit's prefix, so a claim can only run past it if the caller
+            // sized it from a different width.
             KVCM2_SPARSE_REQUIRE(copyBase + claimed <= args.work.capacity);
             if (args.hitMiss != nullptr)
             {
                 atomicAdd(&args.hitMiss->resolved, static_cast<unsigned long long>(numResolved));
-                atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(claimed));
+                int32_t const selectedMisses = claimed - numRestoreMisses;
+                if (selectedMisses > 0)
+                {
+                    atomicAdd(&args.hitMiss->misses, static_cast<unsigned long long>(selectedMisses));
+                }
             }
         }
     }
@@ -628,10 +662,10 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
         int32_t const ordinal = table.ordinalAt(position);
         entry[s] = SparseEntry::pack(SparseEntry::usedByte(stepAge, false), static_cast<uint32_t>(ordinal));
         table.setSlot(position, ordinal, s);
-        // Only history has anything to fetch. An in-flight unit's host page is not
-        // written until the watermark passes it, so copying from it would read stale
-        // bytes over the data the model is about to write.
-        if (ordinal < historyUnits)
+        // Fetch complete history and, when configured, the host prefix of a newly
+        // reserved partial unit. Resident units are hits, so a fetch never overwrites
+        // the token the model has just appended to its reserved cell.
+        if (ordinal < copyableUnits)
         {
             auto const c = copyBase + atomicAdd(&numCopy, 1);
             args.work.row[c] = row;
@@ -670,18 +704,18 @@ __global__ __launch_bounds__(kResolveThreads) void sparseResolveKernel(SparseRes
     }
 }
 
-//! Copy `bytes` from `src` to `dst` with one warp, `sizeof(Vec)` at a time.
+//! Copy `bytes` cooperatively, `sizeof(Vec)` per thread at a time.
 //!
 //! The width is the launcher's choice, made from the layout and the addresses it produces,
 //! so there is no alignment test here and no tail: `bytes` divides by `sizeof(Vec)` and both
 //! pointers are aligned to it.
-template <typename Vec>
-__device__ inline void copyChunkWarp(char* dst, char const* src, uint32_t bytes, uint32_t lane)
+template <typename Vec, uint32_t kCopyThreads>
+__device__ inline void copyChunk(char* dst, char const* src, uint32_t bytes, uint32_t lane)
 {
     auto* out = reinterpret_cast<Vec*>(dst);
     auto const* in = reinterpret_cast<Vec const*>(src);
     uint32_t const count = bytes / static_cast<uint32_t>(sizeof(Vec));
-    for (uint32_t i = lane; i < count; i += kWarpSize)
+    for (uint32_t i = lane; i < count; i += kCopyThreads)
     {
         out[i] = in[i];
     }
@@ -691,13 +725,15 @@ __device__ inline void copyChunkWarp(char* dst, char const* src, uint32_t bytes,
 //!
 //! Split from the kernel so the width is switched on once per block: one launch covers
 //! every pool, so there is no per-pool launch to template.
-template <typename Vec>
-__device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t first)
+template <typename Vec, uint32_t kCopyThreads>
+__device__ void copySparseUnitsImpl(
+    SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t globalWarp)
 {
-    uint32_t const lane = threadIdx.x % kWarpSize;
-    int32_t const stride = static_cast<int32_t>(gridDim.x) * kWarpsPerCopyCta;
+    int32_t const first = globalWarp / static_cast<int32_t>(kCopyThreads / kWarpSize);
+    uint32_t const lane = threadIdx.x % kCopyThreads;
+    int32_t const stride = static_cast<int32_t>(gridDim.x) * static_cast<int32_t>(kThreads / kCopyThreads);
     auto const listBase = static_cast<ptrdiff_t>(list) * args.work.capacity;
-    int32_t const count = args.work.total[list];
+    int32_t const count = args.work.total != nullptr ? args.work.total[list] : args.work.capacity;
 
     for (int32_t j = first; j < count; j += stride)
     {
@@ -705,6 +741,10 @@ __device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc c
         int32_t const row = args.work.row[index];
         int32_t const ordinal = args.work.ordinal[index];
         int32_t const slot = args.work.slot[index];
+        if (slot == kNoSparseSlot)
+        {
+            continue;
+        }
 
         // Read per item rather than per warp: the list is dense across rows, so consecutive
         // entries need not share one. A producer's CTA claims a contiguous run, so in
@@ -733,23 +773,58 @@ __device__ void copySparseUnits(SparseUnitCopyArgs const& args, SparseCopyDesc c
         // Direction only chooses which of the two is read.
         auto* cold = reinterpret_cast<char*>(
             desc.hostBase + hostPage * desc.hostPageStride + static_cast<uint64_t>(srcUnit) * desc.layout.unitStride);
-        auto* hot = reinterpret_cast<char*>(desc.deviceBase + static_cast<uint64_t>(lease.value()) * desc.leaseStride
-            + static_cast<uint64_t>(slot / args.unitsPerPage) * desc.cellBytes
-            + static_cast<uint64_t>(dstUnit) * desc.layout.unitStride);
+        auto const cell = static_cast<uint64_t>(lease.value()) * desc.cellsPerLease
+            + static_cast<uint64_t>(slot / args.unitsPerPage);
+        auto* hot = reinterpret_cast<char*>(
+            desc.deviceBase + cell * desc.cellBytes + static_cast<uint64_t>(dstUnit) * desc.layout.unitStride);
         bool const fetching = args.direction == SparseCopyDirection::kFetch;
         char const* src = fetching ? cold : hot;
         char* dst = fetching ? hot : cold;
 
+        uint32_t firstByte = 0;
+        uint32_t bytes = desc.layout.chunkBytes;
+        if (!fetching && args.fromTokens != nullptr && desc.writeBackGranularity != 0)
+        {
+            int32_t const unitStart = ordinal * args.unitTokens;
+            int32_t const firstToken = max(0, args.fromTokens[row] - unitStart);
+            int32_t const lastToken = min(args.unitTokens, args.toTokens[row] - unitStart);
+            if (firstToken >= lastToken)
+            {
+                continue;
+            }
+            int32_t const grain = desc.writeBackGranularity;
+            int32_t const firstGroup = firstToken / grain;
+            int32_t const lastGroup = (lastToken + grain - 1) / grain;
+            uint32_t const groupBytes = desc.layout.chunkBytes / args.unitTokens * grain;
+            firstByte = static_cast<uint32_t>(firstGroup) * groupBytes;
+            bytes = static_cast<uint32_t>(lastGroup - firstGroup) * groupBytes;
+        }
         for (uint32_t c = 0; c < desc.layout.numChunks; ++c)
         {
-            auto const offset = static_cast<uint64_t>(c) * desc.layout.chunkStride;
-            copyChunkWarp<Vec>(dst + offset, src + offset, desc.layout.chunkBytes, lane);
+            auto const offset = static_cast<uint64_t>(c) * desc.layout.chunkStride + firstByte;
+            copyChunk<Vec, kCopyThreads>(dst + offset, src + offset, bytes, lane);
         }
     }
 }
 
-//! One warp per work item, walking the compacted list with a grid-stride loop. `blockIdx.y`
-//! is the buffer, `blockIdx.x` the work.
+template <typename Vec>
+__device__ void copySparseUnits(
+    SparseUnitCopyArgs const& args, SparseCopyDesc const& desc, int32_t list, int32_t globalWarp)
+{
+    // Large host reads need enough independent loads to cover link latency. Small
+    // units and dirty-token writes keep a warp per item for batch parallelism.
+    if (args.direction == SparseCopyDirection::kFetch && desc.layout.chunkBytes >= 16 * 1024)
+    {
+        copySparseUnitsImpl<Vec, kThreads>(args, desc, list, globalWarp);
+    }
+    else
+    {
+        copySparseUnitsImpl<Vec, kWarpSize>(args, desc, list, globalWarp);
+    }
+}
+
+//! A warp or CTA per work item, walking the compacted list with a grid-stride loop.
+//! `blockIdx.y` is the buffer, `blockIdx.x` the work.
 __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyArgs args)
 {
     // Broadcast from lane zero before anything can diverge: threadIdx.x varies within the
@@ -777,10 +852,10 @@ __global__ __launch_bounds__(kThreads) void sparseUnitCopyKernel(SparseUnitCopyA
     // before the kernel that fills them has run.
     gridDependencyWait();
 
-    // Nothing launched after this reads a cell, so a successor need not wait for the copy
-    // itself -- only for the block to have got this far. Releasing here is what keeps the
-    // index kernel that follows on the stream from being ordered behind a copy it does not
-    // depend on.
+    // Released before the copy: a PDL-enrolled successor may start once every block gets
+    // here. The out-index kernel that follows a fetch or a restore is launched without PDL,
+    // so it, and every later kernel that touches a cell -- attention over fetched units, or
+    // the writer appending to a restored partial unit -- is ordered after this grid completes.
     gridDependencyRelease();
 
     switch (desc.width)
@@ -950,9 +1025,13 @@ __global__ __launch_bounds__(kThreads) void sparseHistoryAdvanceKernel(SparseHis
         {
             continue;
         }
-        auto* const fromUnits = args.flushRanges + static_cast<ptrdiff_t>(2) * lifeCycle * args.numRows;
-        fromUnits[row] = history / unitTokens;
-        fromUnits[args.numRows + row] = advanced / unitTokens;
+        auto* const ranges
+            = args.flushRanges + static_cast<ptrdiff_t>(kFlushRangeFields) * lifeCycle * args.numRows + row;
+        auto const field = [&](size_t index) -> int32_t& { return ranges[index * args.numRows]; };
+        field(kFlushFromUnit) = history / unitTokens;
+        field(kFlushToUnit) = advanced / unitTokens;
+        field(kFlushFromToken) = history;
+        field(kFlushToToken) = advanced;
     }
     args.historyTokens[row] = advanced;
 }
@@ -975,10 +1054,10 @@ __global__ __launch_bounds__(kThreads) void sparseHistoryPublishKernel(SparseHis
 } // namespace
 
 //! Throw unless the work list is fully described.
-void checkWorkList(SparseWorkList const& work, char const* api)
+void checkWorkList(SparseWorkList const& work, char const* api, bool allowFixed = false)
 {
-    TLLM_CHECK_WITH_INFO(
-        work.row != nullptr && work.ordinal != nullptr && work.slot != nullptr && work.total != nullptr,
+    TLLM_CHECK_WITH_INFO(work.row != nullptr && work.ordinal != nullptr && work.slot != nullptr
+            && (work.total != nullptr || (allowFixed && work.numLists == 1)),
         std::string(api) + ": the work list's device arrays must be provided");
     TLLM_CHECK_WITH_INFO(work.capacity > 0 && work.numLists > 0,
         std::string(api) + ": the work list's capacity and list count must be positive");
@@ -1089,7 +1168,9 @@ void launchSparseUnitCopy(SparseUnitCopyArgs const& args, CUstream stream)
         "launchSparseUnitCopy: rows, buffers, grid CTAs and units-per-page must be positive");
     TLLM_CHECK_WITH_INFO(args.copyDesc != nullptr && args.leases != nullptr,
         "launchSparseUnitCopy: every device array must be provided");
-    checkWorkList(args.work, "launchSparseUnitCopy");
+    TLLM_CHECK_WITH_INFO(args.unitTokens > 0 && (args.fromTokens == nullptr) == (args.toTokens == nullptr),
+        "launchSparseUnitCopy: partial write-back requires paired token bounds and positive unit size");
+    checkWorkList(args.work, "launchSparseUnitCopy", /*allowFixed=*/true);
     TLLM_CHECK_WITH_INFO(args.work.numLists <= 1 || args.arena.bufferLayer != nullptr,
         "launchSparseUnitCopy: a per-layer work list needs the buffer-to-layer map");
 
@@ -1271,8 +1352,8 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     TLLM_CHECK_WITH_INFO(args.arena.numSelections > 0 && args.arena.entriesPerSelection > 0 && args.selectionWidth >= 0
             && args.numRows > 0,
         "launchSparseResolve: rows, selections and entries must be positive");
-    // A zero-width resolve is the write-index path: it makes the in-flight unit resident and
-    // nothing else, so it needs neither a selection to read nor a miss list to fill.
+    // A zero-width resolve reserves the write unit without reading a selection. Partial
+    // units also produce a fixed, row-indexed list of host prefixes to restore.
     TLLM_CHECK_WITH_INFO(args.selectionWidth != 0 || args.maxInFlightUnits != 0,
         "launchSparseResolve: a resolve with no selection must have an in-flight span");
     TLLM_CHECK_WITH_INFO(args.selectionSlot >= 0 && args.selectionSlot < args.arena.numSelections,
@@ -1285,9 +1366,16 @@ void launchSparseResolve(SparseResolveArgs const& args, CUstream stream)
     TLLM_CHECK_WITH_INFO(args.maxInFlightUnits >= 0, "launchSparseResolve: maxInFlightUnits must not be negative");
     TLLM_CHECK_WITH_INFO(args.stepAge != nullptr,
         "launchSparseResolve: the eviction clock is device-resident, so a captured graph reads the step's own value");
-    if (args.selectionWidth > 0)
+    if (args.selectionWidth > 0 || args.includePartialUnits)
     {
-        checkWorkList(args.work, "launchSparseResolve");
+        bool const fixedRestore = args.selectionWidth == 0 && args.includePartialUnits;
+        checkWorkList(args.work, "launchSparseResolve", fixedRestore);
+        if (fixedRestore)
+        {
+            TLLM_CHECK_WITH_INFO(
+                args.work.total == nullptr && args.work.capacity == args.numRows && args.maxInFlightUnits == 1,
+                "launchSparseResolve: partial write preparation needs one fixed restore entry per row");
+        }
         TLLM_CHECK_WITH_INFO(
             args.work.numLists == 1, "launchSparseResolve: a fetch resolves one selection, so it fills one list");
     }

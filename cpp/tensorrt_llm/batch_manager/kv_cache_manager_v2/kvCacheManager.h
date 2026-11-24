@@ -98,6 +98,8 @@ struct SparseCacheShape
     //! Sub-slots one page divides into. One when the life cycle has no fetch path, so the
     //! page and the unit coincide.
     int unitsPerPage = 1;
+    //! Whether a partially written unit is resident and written back each step.
+    bool includePartialUnits = false;
     //! Sparse buffers this life cycle has.
     int buffers = 0;
     //! Units one query selects per buffer.
@@ -191,7 +193,7 @@ public:
         std::optional<RequestIdType> id = std::nullopt, KvCache::PriorityCb priorityCb = {},
         std::optional<int> expectedPromptLength = std::nullopt, std::optional<bool> textOnly = std::nullopt,
         bool enableRequestStats = false, std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt,
-        bool inputKnownNoDigest = false);
+        bool inputKnownNoDigest = false, std::optional<LocalityDomainId> localityDomainId = std::nullopt);
 
     //! Restore expired, unreferenced pages to the default retention priority.
     void refreshRetention();
@@ -206,6 +208,9 @@ public:
     // Matches under the shared lock. Once a remote level has failed, the first probe after it takes the exclusive lock
     // to unlink that level's pages, as createKvCache does, so that no probe counts them.
     int probeReuse(ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false);
+    // GPU-resident pages of the same match, counted per locality domain.
+    std::vector<int> probeReuseDomains(
+        ReuseScope reuseScope = {}, TokenSpan inputTokens = {}, bool knownNoDigest = false) const;
 
     // Read-only, advisory key of the first full block past the reusable prefix.
     // Uses the same fresh, window-aware match as probeReuse without acquiring pages.
@@ -251,6 +256,10 @@ public:
     // ---- Query / info ------------------------------------------------------
 
     int tokensPerBlock() const noexcept;
+    int numLocalityDomains() const noexcept;
+    // Contiguous mapped extents of a buffer as (address, page count) pairs. A single pair unless
+    // the GPU tier is localized, whose pools are mapped in interleaved per-domain chunks.
+    std::vector<std::pair<MemAddress, size_t>> getMappedBufferViews(LayerId layerId, DataRole role) const;
     bool enablePartialMatch() const noexcept;
 
     // Partial commit is independent of partial matching so beam search can
@@ -467,6 +476,20 @@ public:
     //! array, the write indices and the write-back's flush list are bounded by the same
     //! headroom. Zero when the life cycle has no fetch path.
     [[nodiscard]] int sparseCacheMaxInFlightUnits(LifeCycleId lifeCycle) const noexcept;
+
+    //! Tokens in one selection unit of this life cycle's sparse cache: tokens_per_block
+    //! divided by sparseCacheUnitsPerPage.
+    [[nodiscard]] int sparseCacheUnitTokens(LifeCycleId lifeCycle) const noexcept
+    {
+        return config().tokensPerBlock / sparseCacheUnitsPerPage(lifeCycle);
+    }
+
+    //! Whether this life cycle's sparse cache holds a growing unit before it is complete,
+    //! restoring its prefix on reservation and writing back appended tokens on flush.
+    [[nodiscard]] bool sparseCacheIncludesPartialUnits(LifeCycleId lifeCycle) const noexcept
+    {
+        return _sparseCacheShape(lifeCycle).includePartialUnits;
+    }
 
     //! Sparse buffers this life cycle has, one per (layer, role). Cells and cold-page
     //! offsets are per buffer, so this is what the copy walks.

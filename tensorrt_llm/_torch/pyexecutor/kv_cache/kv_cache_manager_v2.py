@@ -2904,13 +2904,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._sparse_history_follows_acceptance = spec_config is not None
 
         # Bound the gap between reserved capacity and the history length known to the host.
-        # Disaggregated decode can reserve draft slots on arrival. With overlap, the next
-        # step can also reserve slots before the host updates the previous step's history.
+        # A step holds the generation headroom: its input tokens and the extra KV positions
+        # the drafter writes past them. With overlap, the next step reserves its input
+        # tokens before the host updates the previous step's history.
         self._sparse_max_in_flight_tokens = 1
         if spec_config is not None:
-            self._sparse_max_in_flight_tokens = (
-                self._generation_kv_capacity_headroom + self.max_total_draft_tokens
-            )
+            self._sparse_max_in_flight_tokens = self._generation_kv_capacity_headroom
             if not disable_overlap_scheduler:
                 self._sparse_max_in_flight_tokens += spec_config.tokens_per_gen_step
 
@@ -7487,8 +7486,11 @@ class KVCacheManagerV2(BaseResourceManager):
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
         """Prepare KV cache for a disagg generation init request.
 
-        Allocates capacity for the full prompt (+ draft) and sets
-        ``kv_cache.history_length`` to ``prompt_len``. Returns True on
+        Allocates capacity for the full prompt and the extra KV positions a
+        drafter writes past it, and sets ``kv_cache.history_length`` to
+        ``prompt_len``. Draft tokens get no capacity here: the first generation
+        step reserves its own input tokens, drafts included, like every step
+        after it, and only that step's unused slots are given back. Returns True on
         success, False if preparation or resize failed (cache is suspended
         on resize failure).
 
@@ -7553,7 +7555,7 @@ class KVCacheManagerV2(BaseResourceManager):
             else (req.total_input_len_cp if self._has_cp_helix else req.prompt_len)
         )
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-        target = prompt_len + get_draft_token_length(req) + self._kv_alloc_extra_tokens
+        target = prompt_len + self._kv_alloc_extra_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 

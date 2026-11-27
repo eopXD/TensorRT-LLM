@@ -2206,6 +2206,74 @@ def test_sparse_offload_initializes_for_mtp_verify_tokens() -> None:
         manager.shutdown()
 
 
+@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
+def test_mtp_offload_disagg_request_stays_within_the_in_flight_bound(
+    disable_overlap_scheduler: bool,
+) -> None:
+    # MTP3 on a disaggregated decode worker. A step reserves its 1 + D input tokens on
+    # top of the D - 1 extra KV positions, so capacity leads history by 2D during a step,
+    # and by 3D + 1 when the overlap scheduler reserves the next step first. Admission
+    # reserves no draft slots of its own, so the first step starts from the same gap as
+    # every later one.
+    draft_len = 3
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        enable_kv_cache_offload=True,
+        compress_ratios=[4, 128, 0],
+        index_topk=8,
+        kv_cache_offload_config={"host_history_size": 64 << 20},
+    )
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=1024, host_cache_size=0),
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
+        num_layers=2,
+        head_dim=512,
+        max_batch_size=1,
+        tokens_per_block=128,
+        max_seq_len=512,
+        max_num_tokens=512,
+        vocab_size=128,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        sparse_attn_config=sparse_config,
+        spec_config=MTPDecodingConfig(max_draft_len=draft_len),
+        disable_overlap_scheduler=disable_overlap_scheduler,
+    )
+    step_span = 2 * draft_len
+    bound = step_span if disable_overlap_scheduler else step_span + 1 + draft_len
+    prompt_len = 200
+    request = LlmRequest(
+        request_id=0,
+        max_new_tokens=16,
+        input_tokens=list(range(prompt_len)),
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    request.state = LlmRequestState.DISAGG_GENERATION_INIT
+    # The executor gives a generation-init request placeholder drafts before scheduling.
+    request.py_draft_tokens = [0] * draft_len
+    admitted = False
+    try:
+        assert manager.impl.init_config.sparse_max_in_flight_tokens == bound
+        assert manager.prepare_disagg_gen_init(request)
+        admitted = True
+        cache = manager.kv_cache_map[request.py_request_id]
+        assert cache.history_length == prompt_len
+        assert cache.capacity == prompt_len + draft_len - 1
+
+        request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        assert manager.try_allocate_generation(request)
+        assert cache.capacity - cache.history_length == step_span
+        if not disable_overlap_scheduler:
+            assert manager.try_allocate_generation(request)
+        assert cache.capacity - cache.history_length == bound
+        with pytest.raises(RuntimeError, match="can hold in flight"):
+            cache.resize(cache.capacity + 1)
+    finally:
+        if admitted:
+            manager.free_resources(request)
+        manager.shutdown()
+
+
 @pytest.mark.parametrize(("avg_seq_len", "expected"), [(None, 1024), (256, 256)])
 def test_typical_seq_len_preserves_deepseek_v4_fallback(
     avg_seq_len: int | None, expected: int
